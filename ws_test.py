@@ -3,46 +3,17 @@ import threading
 import websocket
 
 URL = "wss://lbkperpws.lbank.com/ws"
-TOPICS = ["11", "12", "13"]
 
-def test_topic(topic_id):
-received = []
-
-def on_open(ws):
-    print("CONNECTED")
-    message = {
-        "SendTopicAction": {
-            "Action": "1",
-            "LocalNo": 1,
-            "TopicID": topic_id,
-            "FilterValue": "Exchange_BTCUSDT",
-            "ResumeNo": -1
-        }
-    }
-    print("SENDING TOPIC:", topic_id)
-    ws.send(json.dumps(message))
-    threading.Timer(8, ws.close).start()
-
-def on_message(ws, message):
-    received.append(message)
-    print("SERVER MESSAGE:", repr(message))
-
-def on_error(ws, error):
-    print("ERROR:", repr(error))
-
-def on_close(ws, code, reason):
-    print("CLOSED:", code, reason)
-
-print("TESTING TOPIC:", topic_id)
-ws = websocket.WebSocketApp(
-    URL,
-    on_open=on_open,
-    on_message=on_message,
-    on_error=on_error,
-    on_close=on_close
-)
+print("TESTING TOPIC 11")
+ws = websocket.WebSocketApp(URL, on_open=lambda w: (print("CONNECTED 11"), w.send(json.dumps({"SendTopicAction":{"Action":"1","LocalNo":1,"TopicID":"11","FilterValue":"Exchange_BTCUSDT","ResumeNo":-1}})), threading.Timer(8,w.close).start()), on_message=lambda w,m: print("TOPIC 11 MESSAGE:",repr(m)), on_error=lambda w,e: print("TOPIC 11 ERROR:",repr(e)), on_close=lambda w,c,r: print("TOPIC 11 CLOSED:",c,r))
 ws.run_forever()
-print("MESSAGE COUNT:", len(received))
 
-for topic_id in TOPICS:
-test_topic(topic_id)
+print("TESTING TOPIC 12")
+ws = websocket.WebSocketApp(URL, on_open=lambda w: (print("CONNECTED 12"), w.send(json.dumps({"SendTopicAction":{"Action":"1","LocalNo":1,"TopicID":"12","FilterValue":"Exchange_BTCUSDT","ResumeNo":-1}})), threading.Timer(8,w.close).start()), on_message=lambda w,m: print("TOPIC 12 MESSAGE:",repr(m)), on_error=lambda w,e: print("TOPIC 12 ERROR:",repr(e)), on_close=lambda w,c,r: print("TOPIC 12 CLOSED:",c,r))
+ws.run_forever()
+
+print("TESTING TOPIC 13")
+ws = websocket.WebSocketApp(URL, on_open=lambda w: (print("CONNECTED 13"), w.send(json.dumps({"SendTopicAction":{"Action":"1","LocalNo":1,"TopicID":"13","FilterValue":"Exchange_BTCUSDT","ResumeNo":-1}})), threading.Timer(8,w.close).start()), on_message=lambda w,m: print("TOPIC 13 MESSAGE:",repr(m)), on_error=lambda w,e: print("TOPIC 13 ERROR:",repr(e)), on_close=lambda w,c,r: print("TOPIC 13 CLOSED:",c,r))
+ws.run_forever()
+
+print("ALL TESTS FINISHED")
