@@ -11,7 +11,7 @@ def on_open(ws):
         "SendTopicAction": {
             "Action": "1",
             "LocalNo": 1,
-            "TopicID": "7",
+            "TopicID": "11",
             "FilterValue": "Exchange_BTCUSDT",
             "ResumeNo": -1
         }
