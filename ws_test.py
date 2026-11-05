@@ -1,6 +1,5 @@
-import websocket
 import json
-import time
+import websocket
 
 URL = "wss://lbkperpws.lbank.com/ws"
 
@@ -8,22 +7,26 @@ def on_open(ws):
     print("CONNECTED")
 
     message = {
-        "action": "subscribe",
-        "subscribe": "1",
-        "channel": "market_btcusdt_kline_15min"
+        "SendTopicAction": {
+            "Action": "1",
+            "LocalNo": 1,
+            "TopicID": "2",
+            "FilterValue": "Exchange_BTCUSDT",
+            "ResumeNo": -1
+        }
     }
 
     ws.send(json.dumps(message))
     print("SUBSCRIBE SENT")
 
 def on_message(ws, message):
-    print("MARKET DATA:", message)
+    print("MARKET DATA:", message[:2000])
 
 def on_error(ws, error):
     print("ERROR:", error)
 
-def on_close(ws, code, msg):
-    print("CONNECTION CLOSED")
+def on_close(ws, code, reason):
+    print("CLOSED:", code, reason)
 
 ws = websocket.WebSocketApp(
     URL,
@@ -33,4 +36,4 @@ ws = websocket.WebSocketApp(
     on_close=on_close
 )
 
-ws.run_forever()
+ws.run_forever(ping_interval=20, ping_timeout=10)
