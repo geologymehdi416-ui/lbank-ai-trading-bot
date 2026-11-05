@@ -21,5 +21,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Test Futures WebSocket
+        run: python ws_test.py
+
       - name: Run scanner
         run: python main.py
