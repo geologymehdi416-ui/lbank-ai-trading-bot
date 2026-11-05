@@ -1,14 +1,20 @@
-name: LBank Futures Scanner
+name: LBank Futures Price Collector
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lbank-price-collector
+  cancel-in-progress: false
 
 jobs:
-  scan:
+  collect:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,13 +25,19 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install requests
 
-      - name: Test Futures WebSocket
-        run: python ws_test.py
+      - name: Collect Futures prices
+        run: python collector.py
 
-      - name: Test Futures Instruments
-        run: python futures_probe.py
-
-      - name: Run scanner
-        run: python main.py
+      - name: Save history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/prices.jsonl
+          if ! git diff --cached --quiet; then
+            git commit -m "Update LBank Futures price history"
+            git push
+          else
+            echo "No new data"
+          fi
