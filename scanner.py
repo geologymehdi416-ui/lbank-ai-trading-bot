@@ -8,7 +8,6 @@ PRODUCT_GROUP = "SwapU"
 DEPTH = 5
 
 SESSION = requests.Session()
-
 def check_response(result, name):
 if not isinstance(result, dict):
 raise Exception(f"{name}: Invalid response format")
@@ -41,7 +40,6 @@ if not isinstance(data, list):
     raise Exception(f"Unexpected market data: {result}")
 
 return data
-
 def get_order_book(symbol):
 url = f"{BASE_URL}/marketOrder"
 
@@ -69,16 +67,12 @@ return asks, bids
 
 def get_price_level(level):
 if isinstance(level, dict):
-return (
-float(level["price"]),
-float(level["volume"])
-)
+return float(level["price"]), float(level["volume"])
 
 if isinstance(level, (list, tuple)) and len(level) >= 2:
     return float(level[0]), float(level[1])
 
 raise ValueError(f"Unknown order book level: {level}")
-
 def analyze_order_book(asks, bids):
 if not asks or not bids:
 print("ORDER BOOK EMPTY")
@@ -124,7 +118,6 @@ elif imbalance < -10:
     print("Book Pressure: SELL SIDE")
 else:
     print("Book Pressure: BALANCED")
-
 def scan_market():
 print("=" * 55)
 print("LBANK USDT FUTURES SCANNER")
