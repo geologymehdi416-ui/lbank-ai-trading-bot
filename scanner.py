@@ -1,39 +1,66 @@
 import requests
-import time
 from datetime import datetime
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+API_URL = (
+    "https://lbkperp.lbank.com/"
+    "cfd/openApi/v1/pub/marketData"
+)
 
-API_URL = "https://api.lbkex.com/v2/ticker/24hr.do"
+WATCHLIST = ["BTC", "ETH", "SOL"]
 
 def scan_market():
-    print("=" * 40)
-    print("LBANK FUTURES SCANNER")
-    print(datetime.now())
-    print("=" * 40)
 
-    for symbol in SYMBOLS:
-        try:
-            response = requests.get(
-                API_URL,
-                params={"symbol": symbol.lower()},
-                timeout=15
-            )
+    print("=" * 45)
+    print("LBANK USDT FUTURES SCANNER")
+    print(datetime.utcnow())
+    print("=" * 45)
 
-            data = response.json()
+    try:
+        response = requests.get(
+            API_URL,
+            params={"productGroup": "SwapU"},
+            timeout=20
+        )
 
-            if data.get("result") != "true":
-                print(symbol, "API response:", data)
-                continue
+        response.raise_for_status()
+        result = response.json()
 
-            ticker = data["data"]
-            price = float(ticker["ticker"]["latest"])
-            change = float(ticker["ticker"]["change"])
+        if str(result.get("result")).lower() == "false":
+            print("API ERROR:", result)
+            return
 
-            print(f"{symbol} | Price: {price} | Change: {change}%")
+        data = result.get("data", [])
 
-        except Exception as error:
-            print(f"{symbol} ERROR: {error}")
+        if not isinstance(data, list):
+            print("Unexpected API response:", result)
+            return
+
+        found = 0
+
+        for item in data:
+            symbol = str(item.get("symbol", "")).upper()
+
+            if any(coin in symbol for coin in WATCHLIST):
+
+                print(
+                    f"{symbol} | "
+                    f"Price: {item.get('lastPrice')} | "
+                    f"Volume: {item.get('volume')} | "
+                    f"Turnover: {item.get('turnover')}"
+                )
+
+                found += 1
+
+        if found == 0:
+            print("No matching contracts found.")
+            print("Available symbols:")
+
+            for item in data[:10]:
+                print(item.get("symbol"))
+
+    except Exception as error:
+        print("FUTURES API ERROR:", error)
+
 
 if __name__ == "__main__":
     scan_market()
