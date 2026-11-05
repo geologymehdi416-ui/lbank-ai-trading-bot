@@ -24,5 +24,8 @@ jobs:
       - name: Test Futures WebSocket
         run: python ws_test.py
 
+      - name: Test Futures Instruments
+        run: python futures_probe.py
+
       - name: Run scanner
         run: python main.py
