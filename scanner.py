@@ -80,12 +80,11 @@ if isinstance(level, (list, tuple)) and len(level) >= 2:
 raise ValueError(f"Unknown order book level: {level}")
 
 def analyze_order_book(asks, bids):
-
 if not asks or not bids:
-    print("ORDER BOOK EMPTY")
-    print("Asks received:", len(asks))
-    print("Bids received:", len(bids))
-    return
+print("ORDER BOOK EMPTY")
+print("Asks received:", len(asks))
+print("Bids received:", len(bids))
+return
 
 ask_levels = [get_price_level(x) for x in asks]
 bid_levels = [get_price_level(x) for x in bids]
@@ -127,7 +126,6 @@ else:
     print("Book Pressure: BALANCED")
 
 def scan_market():
-
 print("=" * 55)
 print("LBANK USDT FUTURES SCANNER")
 print(datetime.now(timezone.utc).isoformat())
@@ -142,7 +140,6 @@ try:
     }
 
     for symbol in WATCHLIST:
-
         print("\n" + "-" * 50)
         print("SYMBOL:", symbol)
 
