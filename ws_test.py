@@ -1,10 +1,9 @@
 import json
 import websocket
 import threading
+import time
 
 URL = "wss://lbkperpws.lbank.com/ws"
-
-message_count = 0
 
 def on_open(ws):
     print("CONNECTED")
@@ -19,31 +18,35 @@ def on_open(ws):
         }
     }
 
-    ws.send(json.dumps(message))
-    print("SUBSCRIBE SENT: BTCUSDT trades")
+    payload = json.dumps(message)
+    print("SENDING:", payload)
+    ws.send(payload)
 
-    # Close connection after 15 seconds
-    threading.Timer(15, ws.close).start()
+    threading.Timer(20, ws.close).start()
 
 def on_message(ws, message):
-    global message_count
-    message_count += 1
+    print("RAW SERVER MESSAGE:", repr(message))
 
-    print("MARKET DATA:", message[:2000])
+def on_data(ws, data, data_type, continue_flag):
+    print("RAW DATA TYPE:", data_type)
+    print("RAW DATA:", repr(data))
 
 def on_error(ws, error):
-    print("ERROR:", error)
+    print("WEBSOCKET ERROR:", repr(error))
 
 def on_close(ws, code, reason):
-    print("CLOSED:", code, reason)
-    print("TOTAL MESSAGES:", message_count)
+    print("CONNECTION CLOSED:", code, reason)
 
 ws = websocket.WebSocketApp(
     URL,
     on_open=on_open,
     on_message=on_message,
+    on_data=on_data,
     on_error=on_error,
     on_close=on_close
 )
 
-ws.run_forever(ping_interval=20, ping_timeout=10)
+ws.run_forever(
+    ping_interval=10,
+    ping_timeout=5
+)
