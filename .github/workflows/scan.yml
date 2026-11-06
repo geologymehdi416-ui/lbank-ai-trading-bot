@@ -1,3 +1,35 @@
+name: LBank Futures Smart Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Collect Futures prices
+        run: python collector.py
+
+      - name: Technical Analysis
+        run: python signal_scanner.py
+
       - name: Send Telegram Test
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -20,3 +52,15 @@
           print(response.text)
           response.raise_for_status()
           PY
+
+      - name: Save history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/prices.jsonl
+          if ! git diff --cached --quiet; then
+            git commit -m "Update LBank Futures price history"
+            git push
+          else
+            echo "No new data"
+          fi
