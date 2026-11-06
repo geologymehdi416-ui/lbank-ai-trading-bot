@@ -94,3 +94,6 @@
 {"timestamp": "2026-11-06T19:18:04.402922+00:00", "symbol": "BTCUSDT", "lastPrice": "75703.8", "volume24h": "3314.0863", "turnover24h": "251248258.5583"}
 {"timestamp": "2026-11-06T19:18:04.402922+00:00", "symbol": "ETHUSDT", "lastPrice": "2228.05", "volume24h": "65203.462", "turnover24h": "145601106.075"}
 {"timestamp": "2026-11-06T19:18:04.402922+00:00", "symbol": "SOLUSDT", "lastPrice": "90.17", "volume24h": "429030.84", "turnover24h": "38635873.24"}
+{"timestamp": "2026-11-06T20:02:02.149522+00:00", "symbol": "BTCUSDT", "lastPrice": "75915.6", "volume24h": "3193.6824", "turnover24h": "242033107.7418"}
+{"timestamp": "2026-11-06T20:02:02.149522+00:00", "symbol": "ETHUSDT", "lastPrice": "2236.39", "volume24h": "66277.654", "turnover24h": "147922138.410"}
+{"timestamp": "2026-11-06T20:02:02.149522+00:00", "symbol": "SOLUSDT", "lastPrice": "90.41", "volume24h": "521160.60", "turnover24h": "46938784.95"}
