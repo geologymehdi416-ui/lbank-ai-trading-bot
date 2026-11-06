@@ -27,7 +27,23 @@ jobs:
 
       - name: Install dependencies
         run: pip install requests
+      - name: Get Telegram Channel ID
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
 
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          url = f"https://api.telegram.org/bot{token}/getUpdates"
+          data = requests.get(url, timeout=20).json()
+
+          for update in data.get("result", []):
+              post = update.get("channel_post")
+              if post:
+                  print("CHANNEL ID:", post["chat"]["id"])
+          PY
       - name: Collect Futures prices
         run: python collector.py
 
