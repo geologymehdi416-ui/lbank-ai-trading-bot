@@ -1,58 +1,34 @@
 import json
-from pathlib import Path
 
-WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+prices = {s: [] for s in symbols}
 
-def ema(prices, period):
-alpha = 2 / (period + 1)
-result = prices[0]
-for price in prices[1:]:
-result = alpha * price + (1 - alpha) * result
-return result
-
-def main():
-history = Path("data/prices.jsonl")
-
-if not history.exists():
-    print("No price history")
-    return
-
-records = {symbol: [] for symbol in WATCHLIST}
-
-with history.open(encoding="utf-8") as file:
-    for line in file:
-        try:
+try:
+    with open("data/prices.jsonl") as f:
+        for line in f:
             item = json.loads(line)
-            symbol = item["symbol"]
-            price = float(item["lastPrice"])
-            if symbol in records and price > 0:
-                records[symbol].append(price)
-        except (ValueError, KeyError, TypeError):
+            s = item["symbol"]
+            if s in prices:
+                prices[s].append(float(item["lastPrice"]))
+
+    for s in symbols:
+        p = prices[s]
+        print("\n", s)
+
+        if len(p) < 50:
+            print("WAIT: Not enough data")
             continue
 
-for symbol, prices in records.items():
-    print("\n--------------------")
-    print("SYMBOL:", symbol)
+        avg = sum(p[-20:]) / 20
+        print("Price:", p[-1])
+        print("Average:", round(avg, 4))
 
-    if len(prices) < 50:
-        print("DECISION: WAIT")
-        continue
+        if p[-1] > avg:
+            print("BIAS: LONG")
+        elif p[-1] < avg:
+            print("BIAS: SHORT")
+        else:
+            print("NO TRADE")
 
-    fast = ema(prices[-50:], 12)
-    slow = ema(prices[-50:], 26)
-
-    print("PRICE:", prices[-1])
-    print("EMA12:", round(fast, 4))
-    print("EMA26:", round(slow, 4))
-
-    if fast > slow and prices[-1] > fast:
-        print("BIAS: LONG")
-    elif fast < slow and prices[-1] < fast:
-        print("BIAS: SHORT")
-    else:
-        print("DECISION: NO TRADE")
-
-print("\nSCAN COMPLETED")
-
-if name == "main":
-main()
+except Exception as e:
+    print("ERROR:", e)
