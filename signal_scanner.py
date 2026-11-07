@@ -30,6 +30,12 @@ MIN_VOLUME_RATIO = 1.2
 MIN_RISK_PERCENT = 0.15
 MAX_RISK_PERCENT = 3.0
 
+# حداقل امتیاز برای نمایش در واچ‌لیست
+MIN_WATCH_SCORE = 45
+
+# تعداد فرصت‌های هر سمت در گزارش
+MAX_WATCH_PER_SIDE = 8
+
 INTERVALS = {
     "5m": "5m",
     "15m": "15m",
@@ -38,7 +44,7 @@ INTERVALS = {
 }
 
 HEADERS = {
-    "User-Agent": "LBank-Futures-Signal-Bot/6.0"
+    "User-Agent": "LBank-Futures-Signal-Bot/7.0"
 }
 
 
@@ -66,6 +72,10 @@ def fmt(value):
     if value is None:
         return "ناموجود"
     return f"{float(value):,.8g}"
+
+
+def clamp(value, minimum=0, maximum=100):
+    return max(minimum, min(maximum, value))
 
 
 # ==========================================
@@ -466,7 +476,88 @@ def timeframe_analysis(candles):
 
 
 # ==========================================
-# SIGNAL GENERATION
+# WATCHLIST SCORING
+# ==========================================
+
+def calculate_watch_scores(data):
+
+    """
+    امتیاز واچ‌لیست مستقل از سیگنال قطعی است.
+    امتیاز بالا به معنی تضمین سود یا سیگنال ورود نیست.
+    """
+
+    long_score = 0
+    short_score = 0
+
+    weights = {
+        "4h": 20,
+        "1h": 20,
+        "15m": 15,
+        "5m": 10
+    }
+
+    for timeframe, weight in weights.items():
+
+        item = data[timeframe]
+
+        if (
+            item["ema20"] > item["ema50"]
+            and item["ema50"] > item["ema200"]
+        ):
+            long_score += weight
+
+        elif (
+            item["ema20"] < item["ema50"]
+            and item["ema50"] < item["ema200"]
+        ):
+            short_score += weight
+
+        elif item["ema20"] > item["ema50"]:
+            long_score += weight * 0.5
+
+        elif item["ema20"] < item["ema50"]:
+            short_score += weight * 0.5
+
+    m5 = data["5m"]
+    m15 = data["15m"]
+
+    # مومنتوم MACD
+    if m15["histogram"] > 0:
+        long_score += 8
+    elif m15["histogram"] < 0:
+        short_score += 8
+
+    if m5["histogram"] > 0:
+        long_score += 5
+    elif m5["histogram"] < 0:
+        short_score += 5
+
+    # RSI؛ از امتیازدهی به وضعیت اشباع شدید پرهیز می‌شود
+    if 50 <= m15["rsi"] <= 68:
+        long_score += 8
+    elif 32 <= m15["rsi"] <= 50:
+        short_score += 8
+
+    if 50 <= m5["rsi"] <= 70:
+        long_score += 5
+    elif 30 <= m5["rsi"] <= 50:
+        short_score += 5
+
+    # حجم نسبی
+    if m5["volume_ratio"] >= MIN_VOLUME_RATIO:
+        if m5["histogram"] > 0:
+            long_score += 8
+        elif m5["histogram"] < 0:
+            short_score += 8
+
+    return (
+        round(clamp(long_score)),
+        round(clamp(short_score))
+    )
+
+
+# ==========================================
+# TRADE PLAN
 # ==========================================
 
 def make_trade(side, entry, data):
@@ -497,7 +588,6 @@ def make_trade(side, entry, data):
             entry + 3 * risk
         ]
 
-        # مقاومت نزدیک نباید مانع تارگت اول باشد
         if m15["resistance"] < targets[0]:
             return None
 
@@ -539,6 +629,10 @@ def make_trade(side, entry, data):
     }
 
 
+# ==========================================
+# SIGNAL ANALYSIS
+# ==========================================
+
 def analyze_symbol(symbol, lbank):
 
     data = {}
@@ -573,10 +667,9 @@ def analyze_symbol(symbol, lbank):
             f"اختلاف قیمت {difference:.3f}%"
         )
 
-    # قیمت مرجع ورود از LBank گرفته می‌شود
+    # قیمت مرجع برنامه از LBank
     entry = lbank_price
 
-    # روند تایم‌فریم بالاتر
     bullish_htf = (
         h4["ema20"] > h4["ema50"]
         and h1["ema20"] > h1["ema50"]
@@ -587,7 +680,6 @@ def analyze_symbol(symbol, lbank):
         and h1["ema20"] < h1["ema50"]
     )
 
-    # تأیید تایم‌فریم پایین‌تر
     bullish_ltf = (
         m5["ema20"] > m5["ema50"]
         and m15["ema20"] > m15["ema50"]
@@ -616,6 +708,8 @@ def analyze_symbol(symbol, lbank):
         m5["volume_ratio"] >= MIN_VOLUME_RATIO
     )
 
+    long_score, short_score = calculate_watch_scores(data)
+
     side = None
     reasons = []
 
@@ -625,7 +719,6 @@ def analyze_symbol(symbol, lbank):
         and bullish_momentum
         and volume_confirmed
     ):
-
         side = "LONG"
 
     elif (
@@ -634,7 +727,6 @@ def analyze_symbol(symbol, lbank):
         and bearish_momentum
         and volume_confirmed
     ):
-
         side = "SHORT"
 
     else:
@@ -671,9 +763,42 @@ def analyze_symbol(symbol, lbank):
 
         if trade is None:
             reasons.append(
-                "نسبت ریسک به بازده یا ساختار حمایت/مقاومت مناسب نیست"
+                "ریسک یا ساختار حمایت/مقاومت مناسب نیست"
             )
             side = None
+
+    # انتخاب سمت برتر برای واچ‌لیست
+    watch_side = (
+        "LONG" if long_score >= short_score
+        else "SHORT"
+    )
+
+    watch_score = max(long_score, short_score)
+
+    watch_trade = None
+
+    if watch_score >= MIN_WATCH_SCORE:
+
+        watch_trade = make_trade(
+            watch_side,
+            entry,
+            data
+        )
+
+    # شرط فعال‌سازی؛ هنوز به معنی ورود قطعی نیست
+    if watch_side == "LONG":
+
+        activation = (
+            "بسته‌شدن کندل 5m بالای EMA20، "
+            "حفظ EMA20 و حجم نسبی حداقل 1.2x"
+        )
+
+    else:
+
+        activation = (
+            "بسته‌شدن کندل 5m زیر EMA20، "
+            "حفظ فشار نزولی و حجم نسبی حداقل 1.2x"
+        )
 
     return {
         "symbol": symbol,
@@ -684,8 +809,86 @@ def analyze_symbol(symbol, lbank):
         "difference": difference,
         "turnover": lbank["_turnover"],
         "trade": trade,
-        "reasons": reasons
+        "reasons": reasons,
+        "long_score": long_score,
+        "short_score": short_score,
+        "watch_side": watch_side,
+        "watch_score": watch_score,
+        "watch_trade": watch_trade,
+        "activation": activation
     }
+# ==========================================
+# REPORT HELPERS
+# ==========================================
+
+def trend_text(item):
+
+    if (
+        item["ema20"] > item["ema50"]
+        and item["ema50"] > item["ema200"]
+    ):
+        return "صعودی قوی"
+
+    if (
+        item["ema20"] < item["ema50"]
+        and item["ema50"] < item["ema200"]
+    ):
+        return "نزولی قوی"
+
+    if item["ema20"] > item["ema50"]:
+        return "تمایل صعودی"
+
+    if item["ema20"] < item["ema50"]:
+        return "تمایل نزولی"
+
+    return "خنثی"
+
+
+def indicator_lines(data):
+
+    lines = []
+
+    for timeframe in ("4h", "1h", "15m", "5m"):
+
+        item = data[timeframe]
+
+        lines.extend([
+            f"--- تایم‌فریم {timeframe} ---",
+            f"روند EMA: {trend_text(item)}",
+            f"قیمت کندل: {fmt(item['price'])}",
+            f"EMA20: {fmt(item['ema20'])}",
+            f"EMA50: {fmt(item['ema50'])}",
+            f"EMA200: {fmt(item['ema200'])}",
+            f"RSI: {item['rsi']:.1f}",
+            f"MACD: {fmt(item['macd'])}",
+            f"MACD Signal: {fmt(item['macd_signal'])}",
+            f"MACD Histogram: {fmt(item['histogram'])}",
+            f"ATR: {fmt(item['atr'])}",
+            f"حجم نسبی: {item['volume_ratio']:.2f}x",
+            f"حمایت: {fmt(item['support'])}",
+            f"مقاومت: {fmt(item['resistance'])}",
+            ""
+        ])
+
+    return lines
+
+
+def append_trade_plan(lines, trade):
+
+    if not trade:
+        lines.append(
+            "پلن Entry/SL/TP معتبر نیست؛ فعلاً ورود نکن."
+        )
+        return
+
+    lines.extend([
+        f"Entry پیشنهادی: {fmt(trade['entry'])}",
+        f"Stop Loss: {fmt(trade['stop'])}",
+        f"Take Profit 1: {fmt(trade['targets'][0])}",
+        f"Take Profit 2: {fmt(trade['targets'][1])}",
+        f"Take Profit 3: {fmt(trade['targets'][2])}",
+        f"فاصله ریسک تا SL: {trade['risk_percent']:.2f}%",
+    ])
 
 
 # ==========================================
@@ -717,49 +920,76 @@ def build_report(
         if x["side"] == "SHORT"
     ]
 
+    watch_longs = sorted(
+        [
+            x for x in results
+            if (
+                x["side"] is None
+                and x["watch_side"] == "LONG"
+                and x["watch_score"] >= MIN_WATCH_SCORE
+            )
+        ],
+        key=lambda x: x["watch_score"],
+        reverse=True
+    )[:MAX_WATCH_PER_SIDE]
+
+    watch_shorts = sorted(
+        [
+            x for x in results
+            if (
+                x["side"] is None
+                and x["watch_side"] == "SHORT"
+                and x["watch_score"] >= MIN_WATCH_SCORE
+            )
+        ],
+        key=lambda x: x["watch_score"],
+        reverse=True
+    )[:MAX_WATCH_PER_SIDE]
+
     lines = [
 
-        "🚨 LBank FUTURES AI SIGNALS",
+        "🚨 LBank FUTURES AI SCANNER",
 
         f"زمان: {now.strftime('%Y-%m-%d %H:%M UTC')}",
 
-        f"بازارهای LBank: {market_count}",
+        f"کل بازارهای LBank: {market_count}",
 
-        f"نمادهای منتخب: {len(candidates)}",
+        f"نمادهای منتخب: {len(candidates)} از حداکثر {MAX_SYMBOLS}",
 
         f"تحلیل موفق: {len(results)}",
 
-        f"سیگنال LONG: {len(longs)}",
+        f"سیگنال قطعی LONG: {len(longs)}",
 
-        f"سیگنال SHORT: {len(shorts)}",
+        f"سیگنال قطعی SHORT: {len(shorts)}",
+
+        f"واچ‌لیست LONG: {len(watch_longs)}",
+
+        f"واچ‌لیست SHORT: {len(watch_shorts)}",
 
         f"نمادهای ردشده: {len(skipped)}",
 
         f"خطاهای واقعی: {len(failures)}",
 
+        f"داده‌های قدیمی یا نامعتبر: {stale_count}",
+
         "",
-        "==============================",
-        "🎯 سیگنال‌های معاملاتی تأییدشده",
-        "=============================="
+        "================================",
+        "🎯 سیگنال‌های قطعی معاملاتی",
+        "================================"
     ]
 
     if not signals:
 
         lines.extend([
             "",
-            "⛔ هیچ سیگنال معتبری پیدا نشد.",
+            "⛔ هیچ سیگنال قطعی پیدا نشد.",
             "ورود نکن؛ منتظر تأیید شرایط بمان."
         ])
 
     for item in signals:
 
         trade = item["trade"]
-        d = item["data"]
-
-        m5 = d["5m"]
-        m15 = d["15m"]
-        h1 = d["1h"]
-        h4 = d["4h"]
+        data = item["data"]
 
         icon = (
             "🟢" if item["side"] == "LONG"
@@ -767,66 +997,116 @@ def build_report(
         )
 
         lines.extend([
-
             "",
             "━━━━━━━━━━━━━━━━",
             f"{icon} {item['side']} | {item['symbol']}",
             "━━━━━━━━━━━━━━━━",
-
             f"قیمت LBank: {fmt(item['lbank_price'])}",
-
             f"قیمت OKX: {fmt(item['okx_price'])}",
-
             f"اختلاف قیمت: {item['difference']:.3f}%",
-
-            f"ورود: {fmt(trade['entry'])}",
-
-            f"حد ضرر: {fmt(trade['stop'])}",
-
-            f"تارگت 1: {fmt(trade['targets'][0])}",
-
-            f"تارگت 2: {fmt(trade['targets'][1])}",
-
-            f"تارگت 3: {fmt(trade['targets'][2])}",
-
-            f"ریسک تا حد ضرر: {trade['risk_percent']:.2f}%",
-
-            "",
-            "📊 تحلیل تکنیکال:",
-
-            (
-                f"روند 4H: "
-                f"{'صعودی' if h4['ema20'] > h4['ema50'] else 'نزولی'}"
-            ),
-
-            (
-                f"روند 1H: "
-                f"{'صعودی' if h1['ema20'] > h1['ema50'] else 'نزولی'}"
-            ),
-
-            f"RSI 15m: {m15['rsi']:.1f}",
-
-            f"RSI 5m: {m5['rsi']:.1f}",
-
-            f"MACD 15m: {fmt(m15['histogram'])}",
-
-            f"MACD 5m: {fmt(m5['histogram'])}",
-
-            f"حجم نسبی 5m: {m5['volume_ratio']:.2f}x",
-
-            f"حمایت 15m: {fmt(m15['support'])}",
-
-            f"مقاومت 15m: {fmt(m15['resistance'])}",
-
-            "",
-            "شرط اعتبار: حفظ ساختار و تأیید حجم."
+            f"امتیاز LONG: {item['long_score']}/100",
+            f"امتیاز SHORT: {item['short_score']}/100",
         ])
+
+        append_trade_plan(lines, trade)
+
+        lines.extend([
+            "",
+            "📊 شاخص‌های تکنیکال:",
+            *indicator_lines(data),
+            "وضعیت: سیگنال قطعی طبق فیلترهای فعلی.",
+            "قبل از ورود، قیمت و نقدشوندگی قرارداد LBank را بررسی کن."
+        ])
+
+    # ======================================
+    # LONG WATCHLIST
+    # ======================================
 
     lines.extend([
         "",
-        "==============================",
-        "📋 وضعیت سایر نمادها",
-        "=============================="
+        "================================",
+        "🟢 فرصت‌های تحت‌نظر LONG",
+        "================================",
+        "این موارد سیگنال قطعی نیستند."
+    ])
+
+    if not watch_longs:
+        lines.append(
+            "فرصت LONG با امتیاز کافی پیدا نشد."
+        )
+
+    for rank, item in enumerate(watch_longs, 1):
+
+        lines.extend([
+            "",
+            f"#{rank} | {item['symbol']}",
+            f"امتیاز LONG: {item['long_score']}/100",
+            f"امتیاز SHORT: {item['short_score']}/100",
+            f"قیمت LBank: {fmt(item['lbank_price'])}",
+            f"اختلاف قیمت: {item['difference']:.3f}%",
+        ])
+
+        append_trade_plan(
+            lines,
+            item["watch_trade"]
+        )
+
+        lines.extend([
+            f"شرط فعال‌سازی LONG: {item['activation']}",
+            "وضعیت: فقط تحت‌نظر؛ تا تحقق شرط ورود نکن.",
+            "",
+            *indicator_lines(item["data"])
+        ])
+
+    # ======================================
+    # SHORT WATCHLIST
+    # ======================================
+
+    lines.extend([
+        "",
+        "================================",
+        "🔴 فرصت‌های تحت‌نظر SHORT",
+        "================================",
+        "این موارد سیگنال قطعی نیستند."
+    ])
+
+    if not watch_shorts:
+        lines.append(
+            "فرصت SHORT با امتیاز کافی پیدا نشد."
+        )
+
+    for rank, item in enumerate(watch_shorts, 1):
+
+        lines.extend([
+            "",
+            f"#{rank} | {item['symbol']}",
+            f"امتیاز SHORT: {item['short_score']}/100",
+            f"امتیاز LONG: {item['long_score']}/100",
+            f"قیمت LBank: {fmt(item['lbank_price'])}",
+            f"اختلاف قیمت: {item['difference']:.3f}%",
+        ])
+
+        append_trade_plan(
+            lines,
+            item["watch_trade"]
+        )
+
+        lines.extend([
+            f"شرط فعال‌سازی SHORT: {item['activation']}",
+            "وضعیت: فقط تحت‌نظر؛ تا تحقق شرط ورود نکن.",
+            "",
+            *indicator_lines(item["data"])
+        ])
+
+    # ======================================
+    # OTHER SYMBOLS
+    # ======================================
+
+    lines.extend([
+        "",
+        "================================",
+        "📋 سایر نمادهای تحلیل‌شده",
+        "================================"
     ])
 
     for item in results:
@@ -834,8 +1114,14 @@ def build_report(
         if item["side"]:
             continue
 
+        if item["watch_score"] >= MIN_WATCH_SCORE:
+            continue
+
         lines.append(
-            f"⚪ {item['symbol']}: بدون ورود"
+            f"⚪ {item['symbol']} | "
+            f"LONG {item['long_score']} | "
+            f"SHORT {item['short_score']} | "
+            f"بدون ورود"
         )
 
         if item["reasons"]:
@@ -843,6 +1129,10 @@ def build_report(
                 "دلیل: "
                 + "؛ ".join(item["reasons"][:3])
             )
+
+    # ======================================
+    # SKIPPED AND ERRORS
+    # ======================================
 
     if skipped:
 
@@ -868,20 +1158,38 @@ def build_report(
                 f"- {symbol}: {reason[:120]}"
             )
 
+    # ======================================
+    # DISCLAIMERS
+    # ======================================
+
     lines.extend([
 
         "",
-        "⚠️ کندل‌ها از OKX Futures هستند.",
+        "================================",
+        "⚠️ توضیحات و مدیریت ریسک",
+        "================================",
 
-        "⚠️ قیمت ورود بر اساس قیمت LBank محاسبه شده است.",
+        "امتیاز واچ‌لیست، احتمال موفقیت یا تضمین سود نیست.",
 
-        "⚠️ دفتر سفارش و Funding Rate بررسی نشده‌اند.",
+        "پلن Entry/SL/TP در واچ‌لیست مشروط است و به معنی ورود نیست.",
 
-        "⚠️ سیگنال‌ها مشروط به حفظ شرایط بازار هستند.",
+        "شرط فعال‌سازی باید در کندل بسته‌شده بررسی شود.",
 
-        "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
+        "کندل‌ها و اندیکاتورها از OKX Futures دریافت شده‌اند.",
 
-        "ربات هیچ سفارشی ثبت نمی‌کند."
+        "قیمت مرجع پلن از آخرین قیمت ثبت‌شده LBank گرفته شده است.",
+
+        "اختلاف قیمت و نقدشوندگی را پیش از معامله دوباره بررسی کن.",
+
+        "دفتر سفارش و Funding Rate در این نسخه بررسی نمی‌شوند.",
+
+        "ربات هیچ سفارشی ثبت نمی‌کند.",
+
+        "حد ضرر تضمین اجرای دقیق در قیمت تعیین‌شده نیست.",
+
+        "اهرم بالا ریسک لیکوییدشدن را به‌شدت افزایش می‌دهد.",
+
+        "در صورت نبود تأیید معتبر: ورود نکن."
     ])
 
     return "\n".join(lines)
@@ -955,7 +1263,9 @@ def main():
 
                 print(
                     f"ANALYZED {symbol}: "
-                    f"{result['side'] or 'NO SIGNAL'}"
+                    f"{result['side'] or 'NO SIGNAL'} | "
+                    f"LONG {result['long_score']} | "
+                    f"SHORT {result['short_score']}"
                 )
 
             except SkipSymbol as error:
