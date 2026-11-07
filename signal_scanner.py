@@ -18,7 +18,7 @@ REPORT_FILE = Path("report.txt")
 
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 
-MAX_SYMBOLS = 100
+MAX_SYMBOLS = 30
 MIN_TURNOVER = 100000
 PRICE_DIFF_LIMIT = 0.75
 MAX_SNAPSHOT_AGE_MINUTES = 20
