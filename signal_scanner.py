@@ -11,10 +11,14 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ----------------------------- CONFIG -----------------------------
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
+
 OKX_URL = "https://www.okx.com/api/v5/market/candles"
 
 CORE_SYMBOLS = [
@@ -24,6 +28,7 @@ CORE_SYMBOLS = [
 
 MAX_SYMBOLS = 10
 MIN_TURNOVER = 100000
+
 MAX_SNAPSHOT_AGE_MINUTES = 20
 PRICE_DIFF_LIMIT = 0.75
 
@@ -56,7 +61,7 @@ BLOCKED_SYMBOLS = {
 }
 
 HEADERS = {
-    "User-Agent": "LBank-Futures-Signal-Bot/11.0"
+    "User-Agent": "LBank-Futures-Signal-Bot/12.0"
 }
 
 SESSION = requests.Session()
@@ -67,28 +72,54 @@ class SkipSymbol(Exception):
     pass
 
 
-# ----------------------------- HELPERS -----------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-def number(value):
+def number(value, default=None):
+    """Safely convert values to finite floats."""
     try:
-        x = float(value)
-        return x if math.isfinite(x) else None
-    except (TypeError, ValueError):
-        return None
+        if value is None:
+            return default
+
+        result = float(value)
+
+        if not math.isfinite(result):
+            return default
+
+        return result
+
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def fmt(value):
-    return "N/A" if value is None else f"{float(value):,.8g}"
+    value = number(value)
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:,.8g}"
 
 
 def safe_div(a, b):
-    return None if a is None or b in (None, 0) else a / b
+    a = number(a)
+    b = number(b)
+
+    if a is None or b is None or b == 0:
+        return None
+
+    return a / b
 
 
 def get_first(row, keys):
+    if not isinstance(row, dict):
+        return None
+
     for key in keys:
         if row.get(key) is not None:
             return row[key]
+
     return None
 
 
@@ -119,7 +150,18 @@ def parse_timestamp(value):
         return None
 
 
-# ----------------------------- INDICATORS -----------------------------
+def safe_float_text(value):
+    value = number(value)
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.1f}"
+
+
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
 
 def ema_series(values, period):
     out = [None] * len(values)
@@ -129,6 +171,7 @@ def ema_series(values, period):
 
     current = sum(values[:period]) / period
     out[period - 1] = current
+
     alpha = 2 / (period + 1)
 
     for i in range(period, len(values)):
@@ -136,6 +179,7 @@ def ema_series(values, period):
             values[i] * alpha
             + current * (1 - alpha)
         )
+
         out[i] = current
 
     return out
@@ -184,12 +228,13 @@ def macd(values):
     if len(line) < 9:
         return None, None, None
 
-    sig = ema_series(line, 9)[-1]
+    signal_series = ema_series(line, 9)
+    signal = signal_series[-1]
 
-    if sig is None:
+    if signal is None:
         return None, None, None
 
-    return line[-1], sig, line[-1] - sig
+    return line[-1], signal, line[-1] - signal
 
 
 def atr(candles, period=14):
@@ -201,18 +246,20 @@ def atr(candles, period=14):
     for i in range(1, len(candles)):
         high = candles[i][2]
         low = candles[i][3]
-        prev = candles[i - 1][4]
+        previous_close = candles[i - 1][4]
 
         trs.append(max(
             high - low,
-            abs(high - prev),
-            abs(low - prev)
+            abs(high - previous_close),
+            abs(low - previous_close)
         ))
 
     return sum(trs[-period:]) / period
 
 
-# ----------------------------- LBANK SNAPSHOT -----------------------------
+# ============================================================
+# LOAD LBANK SNAPSHOTS
+# ============================================================
 
 def load_latest_lbank():
     if not DATA_FILE.exists():
@@ -224,6 +271,7 @@ def load_latest_lbank():
 
     with DATA_FILE.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, 1):
+
             if not line.strip():
                 continue
 
@@ -242,46 +290,70 @@ def load_latest_lbank():
 
                 price = number(get_first(
                     row,
-                    ["lastPrice", "price", "last", "close", "last_price"]
+                    [
+                        "lastPrice",
+                        "price",
+                        "last",
+                        "close",
+                        "last_price"
+                    ]
                 ))
 
                 turnover = number(get_first(
                     row,
                     [
-                        "turnover24h", "turnover",
-                        "quoteVolume", "quote_volume",
-                        "volValue", "amount", "volume_usdt"
+                        "turnover24h",
+                        "turnover",
+                        "quoteVolume",
+                        "quote_volume",
+                        "volValue",
+                        "amount",
+                        "volume_usdt"
                     ]
                 ))
 
-                ts = parse_timestamp(get_first(
+                timestamp = parse_timestamp(get_first(
                     row,
-                    ["timestamp", "ts", "time", "updated_at", "updateTime"]
+                    [
+                        "timestamp",
+                        "ts",
+                        "time",
+                        "updated_at",
+                        "updateTime"
+                    ]
                 ))
 
-                if not symbol or price is None or price <= 0 or ts is None:
+                if (
+                    not symbol
+                    or price is None
+                    or price <= 0
+                    or timestamp is None
+                ):
                     continue
 
                 item = {
                     "symbol": symbol,
                     "price": price,
                     "turnover": turnover or 0,
-                    "timestamp": ts,
+                    "timestamp": timestamp,
                 }
 
                 if (
                     symbol not in latest
-                    or ts >= latest[symbol]["timestamp"]
+                    or timestamp >= latest[symbol]["timestamp"]
                 ):
                     latest[symbol] = item
 
             except Exception as exc:
-                print(f"Invalid JSONL line {line_no}: {exc}")
+                print(
+                    f"Invalid JSONL line {line_no}: {exc}"
+                )
 
     now = time.time()
     valid = {}
 
     for symbol, item in latest.items():
+
         age = (now - item["timestamp"]) / 60
 
         if (
@@ -292,12 +364,13 @@ def load_latest_lbank():
             valid[symbol] = item
 
     print(
-        f"Fresh core snapshots: {len(valid)}/{len(CORE_SYMBOLS)}"
+        f"Fresh core snapshots: "
+        f"{len(valid)}/{len(CORE_SYMBOLS)}"
     )
 
     missing = [
-        s for s in CORE_SYMBOLS
-        if s not in valid
+        symbol for symbol in CORE_SYMBOLS
+        if symbol not in valid
     ]
 
     if missing:
@@ -309,16 +382,21 @@ def load_latest_lbank():
     return valid
 
 
-# ----------------------------- OKX DATA -----------------------------
+# ============================================================
+# OKX CANDLE DATA
+# ============================================================
 
 def convert_symbol(symbol):
     if not symbol.endswith("USDT"):
-        raise SkipSymbol(f"Unsupported symbol: {symbol}")
+        raise SkipSymbol(
+            f"Unsupported symbol: {symbol}"
+        )
 
     return f"{symbol[:-4]}-USDT-SWAP"
 
 
 def get_candles(symbol, timeframe):
+
     params = {
         "instId": convert_symbol(symbol),
         "bar": INTERVALS[timeframe],
@@ -328,6 +406,7 @@ def get_candles(symbol, timeframe):
     last_error = None
 
     for attempt in range(MAX_RETRIES):
+
         try:
             response = SESSION.get(
                 OKX_URL,
@@ -336,6 +415,7 @@ def get_candles(symbol, timeframe):
             )
 
             response.raise_for_status()
+
             payload = response.json()
 
             if payload.get("code") != "0":
@@ -346,7 +426,12 @@ def get_candles(symbol, timeframe):
             candles = []
 
             for row in reversed(payload.get("data", [])):
-                if len(row) < 9 or str(row[8]) != "1":
+
+                if len(row) < 9:
+                    continue
+
+                # Only completed candles.
+                if str(row[8]) != "1":
                     continue
 
                 candle = [
@@ -363,8 +448,8 @@ def get_candles(symbol, timeframe):
 
             if len(candles) < 205:
                 raise SkipSymbol(
-                    f"Not enough completed {timeframe} candles "
-                    f"({len(candles)})"
+                    f"Not enough completed {timeframe} candles: "
+                    f"{len(candles)}"
                 )
 
             return candles
@@ -379,9 +464,14 @@ def get_candles(symbol, timeframe):
     raise SkipSymbol(
         f"OKX data unavailable: {last_error}"
     )
-# ----------------------------- TIMEFRAME ANALYSIS -----------------------------
+
+
+# ============================================================
+# TIMEFRAME ANALYSIS
+# ============================================================
 
 def timeframe_analysis(candles):
+
     closes = [c[4] for c in candles]
     volumes = [c[5] for c in candles]
 
@@ -392,34 +482,43 @@ def timeframe_analysis(candles):
     current = closes[-1]
 
     rsi_value = rsi(closes)
+
     macd_value, macd_signal, macd_hist = macd(closes)
 
     avg_volume = (
         sum(volumes[-21:-1]) / 20
-        if len(volumes) >= 21 else None
+        if len(volumes) >= 21
+        else None
     )
 
     volume_ratio = (
         safe_div(volumes[-1], avg_volume)
-        if avg_volume else None
+        if avg_volume
+        else None
     )
 
     current_atr = atr(candles)
 
     bullish = (
-        current > ema20[-1]
+        ema20[-1] is not None
+        and ema50[-1] is not None
+        and ema200[-1] is not None
+        and current > ema20[-1]
         and ema20[-1] > ema50[-1]
         and ema50[-1] > ema200[-1]
     )
 
     bearish = (
-        current < ema20[-1]
+        ema20[-1] is not None
+        and ema50[-1] is not None
+        and ema200[-1] is not None
+        and current < ema20[-1]
         and ema20[-1] < ema50[-1]
         and ema50[-1] < ema200[-1]
     )
 
-    # Recent support and resistance
     recent = candles[-50:]
+
     support = min(c[3] for c in recent)
     resistance = max(c[2] for c in recent)
 
@@ -441,9 +540,12 @@ def timeframe_analysis(candles):
     }
 
 
-# ----------------------------- SCORING -----------------------------
+# ============================================================
+# DIRECTION SCORING
+# ============================================================
 
 def score_direction(data, direction):
+
     score = 0
     reasons = []
 
@@ -455,9 +557,14 @@ def score_direction(data, direction):
     is_long = direction == "LONG"
 
     def trend_ok(item):
-        return item["bullish"] if is_long else item["bearish"]
+        return (
+            item["bullish"]
+            if is_long
+            else item["bearish"]
+        )
 
     def macd_ok(item):
+
         value = item["macd_hist"]
 
         if value is None:
@@ -465,7 +572,8 @@ def score_direction(data, direction):
 
         return value > 0 if is_long else value < 0
 
-    # Higher timeframe trend
+    # Higher timeframe trend.
+
     if trend_ok(h4):
         score += 25
         reasons.append("روند 4H هم‌جهت")
@@ -480,34 +588,42 @@ def score_direction(data, direction):
         score -= 15
         reasons.append("روند 1H مخالف")
 
-    # MACD confirmation
+    # MACD confirmation.
+
     for item, points in [
         (h4, 10),
         (h1, 10),
         (m15, 8),
         (m5, 7),
     ]:
+
         if macd_ok(item):
             score += points
         else:
             score -= points * 0.6
 
-    # RSI
+    # RSI.
+
     rsi4 = h4["rsi"]
     rsi1 = h1["rsi"]
     rsi15 = m15["rsi"]
 
     if is_long:
+
         if rsi4 is not None:
+
             if rsi4 > 75:
                 score -= 15
                 reasons.append("اشباع خرید 4H")
+
             elif 50 <= rsi4 <= 70:
                 score += 8
 
         if rsi1 is not None:
+
             if rsi1 > 75:
                 score -= 10
+
             elif 50 <= rsi1 <= 70:
                 score += 5
 
@@ -515,34 +631,46 @@ def score_direction(data, direction):
             score -= 5
 
     else:
+
         if rsi4 is not None:
+
             if rsi4 < 25:
                 score -= 15
                 reasons.append("اشباع فروش 4H")
+
             elif 30 <= rsi4 <= 50:
                 score += 8
 
         if rsi1 is not None:
+
             if rsi1 < 25:
                 score -= 10
+
             elif 30 <= rsi1 <= 50:
                 score += 5
 
         if rsi15 is not None and rsi15 > 60:
             score -= 5
 
-    # Volume
+    # Volume confirmation.
+
     volume5 = m5["volume_ratio"]
     volume15 = m15["volume_ratio"]
 
-    if volume5 is not None and volume5 >= MIN_VOLUME_RATIO:
+    if (
+        volume5 is not None
+        and volume5 >= MIN_VOLUME_RATIO
+    ):
         score += 10
         reasons.append("حجم 5m مناسب")
     else:
         score -= 12
         reasons.append("حجم 5m ضعیف")
 
-    if volume15 is not None and volume15 >= MIN_15M_VOLUME_RATIO:
+    if (
+        volume15 is not None
+        and volume15 >= MIN_15M_VOLUME_RATIO
+    ):
         score += 5
     else:
         score -= 5
@@ -550,9 +678,12 @@ def score_direction(data, direction):
     return max(0, min(100, score)), reasons
 
 
-# ----------------------------- TRADE PLAN -----------------------------
+# ============================================================
+# TRADE PLAN
+# ============================================================
 
 def make_trade(symbol, price, data, direction, score):
+
     atr_value = data["1h"]["atr"]
 
     if atr_value is None or price <= 0:
@@ -572,24 +703,22 @@ def make_trade(symbol, price, data, direction, score):
         return None
 
     if direction == "LONG":
+
         stop = price - risk_distance
         risk = price - stop
 
-        targets = [
-            price + risk,
-            price + risk * 2,
-            price + risk * 3,
-        ]
+        tp1 = price + risk
+        tp2 = price + risk * 2
+        tp3 = price + risk * 3
 
     else:
+
         stop = price + risk_distance
         risk = stop - price
 
-        targets = [
-            price - risk,
-            price - risk * 2,
-            price - risk * 3,
-        ]
+        tp1 = price - risk
+        tp2 = price - risk * 2
+        tp3 = price - risk * 3
 
     return {
         "symbol": symbol,
@@ -597,15 +726,24 @@ def make_trade(symbol, price, data, direction, score):
         "score": score,
         "entry": price,
         "stop": stop,
-        "targets": targets,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rr1": 1.0,
+        "rr2": 2.0,
+        "rr3": 3.0,
         "risk_percent": risk_percent,
-        "leverage": 1 if risk_percent > 2 else MAX_LEVERAGE,
+        "leverage": MAX_LEVERAGE,
+        "margin_mode": "ISOLATED",
     }
 
 
-# ----------------------------- SYMBOL ANALYSIS -----------------------------
+# ============================================================
+# SYMBOL ANALYSIS
+# ============================================================
 
 def analyze_symbol(item):
+
     symbol = item["symbol"]
     lbank_price = item["price"]
 
@@ -617,9 +755,11 @@ def analyze_symbol(item):
     }
 
     try:
+
         candles = {}
 
         for timeframe in INTERVALS:
+
             candles[timeframe] = get_candles(
                 symbol,
                 timeframe
@@ -638,25 +778,32 @@ def analyze_symbol(item):
         ) * 100
 
         if price_difference > PRICE_DIFF_LIMIT:
+
             result["reason"] = (
                 f"اختلاف قیمت LBank/OKX برابر "
                 f"{price_difference:.2f}% است"
             )
+
             return result
 
         long_score, long_reasons = score_direction(
-            data, "LONG"
+            data,
+            "LONG"
         )
 
         short_score, short_reasons = score_direction(
-            data, "SHORT"
+            data,
+            "SHORT"
         )
 
         if long_score >= short_score:
+
             direction = "LONG"
             score = long_score
             reasons = long_reasons
+
         else:
+
             direction = "SHORT"
             score = short_score
             reasons = short_reasons
@@ -676,8 +823,10 @@ def analyze_symbol(item):
         m5 = data["5m"]
 
         if direction == "LONG":
+
             trend_confirmed = (
-                h4["bullish"] and h1["bullish"]
+                h4["bullish"]
+                and h1["bullish"]
             )
 
             macd_confirmed = (
@@ -693,8 +842,10 @@ def analyze_symbol(item):
             )
 
         else:
+
             trend_confirmed = (
-                h4["bearish"] and h1["bearish"]
+                h4["bearish"]
+                and h1["bearish"]
             )
 
             macd_confirmed = (
@@ -716,13 +867,15 @@ def analyze_symbol(item):
             and m15["volume_ratio"] >= MIN_15M_VOLUME_RATIO
         )
 
-        if (
-            score >= MIN_SIGNAL_SCORE
-            and trend_confirmed
+        all_confirmed = (
+            trend_confirmed
             and macd_confirmed
             and rsi_confirmed
             and volume_confirmed
-        ):
+        )
+
+        if score >= MIN_SIGNAL_SCORE and all_confirmed:
+
             trade = make_trade(
                 symbol,
                 lbank_price,
@@ -732,21 +885,27 @@ def analyze_symbol(item):
             )
 
             if trade:
+
                 result["status"] = "SIGNAL"
                 result["trade"] = trade
+
             else:
+
                 result["status"] = "WATCH"
                 result["reason"] = (
                     "فاصله حد ضرر خارج از محدوده مجاز"
                 )
 
         elif score >= MIN_WATCH_SCORE:
+
             result["status"] = "WATCH"
             result["reason"] = (
                 "تأییدیه‌های ورود کامل نیست"
             )
 
         else:
+
+            result["status"] = "REJECTED"
             result["reason"] = (
                 "امتیاز تکنیکال کافی نیست"
             )
@@ -754,53 +913,77 @@ def analyze_symbol(item):
         return result
 
     except SkipSymbol as exc:
+
+        result["status"] = "REJECTED"
         result["reason"] = str(exc)
+
         return result
 
     except Exception as exc:
+
         result["status"] = "ERROR"
         result["reason"] = str(exc)
+
         return result
+
+
 # ============================================================
-# PART 3 - REPORT, TELEGRAM AND MAIN
+# REPORT FORMATTING
 # ============================================================
 
 def format_trade(trade):
-    """Format a confirmed trade with entry, stop and targets."""
+
     if not isinstance(trade, dict):
         return "Trade details unavailable."
 
-    direction = str(trade.get("direction", "UNKNOWN")).upper()
+    direction = trade.get("direction", "UNKNOWN")
+
     entry = number(trade.get("entry"))
     stop = number(trade.get("stop"))
+
     tp1 = number(trade.get("tp1"))
     tp2 = number(trade.get("tp2"))
     tp3 = number(trade.get("tp3"))
-    risk_percent = number(trade.get("risk_percent"))
-    rr1 = number(trade.get("rr1"), 1.0)
-    rr2 = number(trade.get("rr2"), 2.0)
-    rr3 = number(trade.get("rr3"), 3.0)
-    leverage = int(number(trade.get("leverage"), 1))
+
+    risk_percent = number(
+        trade.get("risk_percent"),
+        0.0
+    )
+
+    leverage = int(
+        number(trade.get("leverage"), 1)
+    )
 
     return "\n".join([
         f"Direction: {direction}",
         f"Entry: {fmt(entry)}",
         f"Stop Loss: {fmt(stop)}",
-        f"TP1: {fmt(tp1)} | RR: {rr1:.2f}R",
-        f"TP2: {fmt(tp2)} | RR: {rr2:.2f}R",
-        f"TP3: {fmt(tp3)} | RR: {rr3:.2f}R",
+        f"TP1: {fmt(tp1)} | RR: 1R",
+        f"TP2: {fmt(tp2)} | RR: 2R",
+        f"TP3: {fmt(tp3)} | RR: 3R",
         f"Stop distance: {risk_percent:.2f}%",
-        f"Leverage: {leverage}x (ISOLATED)",
+        f"Leverage: {leverage}x ISOLATED",
         f"Maximum account risk: {RISK_PER_TRADE_PERCENT:.2f}%"
     ])
 
 
 def format_market_status(item):
-    """Create a compact multi-timeframe status for one symbol."""
+
     symbol = item.get("symbol", "UNKNOWN")
-    status = str(item.get("status", "UNKNOWN")).upper()
-    direction = str(item.get("direction", "-")).upper()
-    score = number(item.get("score"), 0)
+
+    status = str(
+        item.get("status", "UNKNOWN")
+    ).upper()
+
+    direction = str(
+        item.get("direction", "-")
+    ).upper()
+
+    score = number(
+        item.get("score"),
+        0.0
+    )
+
     price = number(item.get("price"))
 
     lines = [
@@ -809,15 +992,14 @@ def format_market_status(item):
     ]
 
     reason = item.get("reason")
+
     if reason:
         lines.append(f"Reason: {reason}")
 
     data = item.get("data") or {}
 
     if not isinstance(data, dict) or not data:
-        if status in ("ERROR", "REJECTED", "NO DATA"):
-            return "\n".join(lines)
-        lines.append("Technical data unavailable.")
+        lines.append("NO ENTRY.")
         return "\n".join(lines)
 
     def get_tf(tf):
@@ -825,73 +1007,115 @@ def format_market_status(item):
         return value if isinstance(value, dict) else {}
 
     def trend(tf):
+
         value = get_tf(tf)
+
         if value.get("bullish"):
             return "BULLISH"
+
         if value.get("bearish"):
             return "BEARISH"
+
         return "NEUTRAL"
 
     def macd_state(tf):
-        value = get_tf(tf)
-        histogram = number(value.get("macd_hist"))
+
+        histogram = number(
+            get_tf(tf).get("macd_hist")
+        )
+
+        if histogram is None:
+            return "N/A"
+
         if histogram > 0:
             return "POSITIVE"
+
         if histogram < 0:
             return "NEGATIVE"
+
         return "NEUTRAL"
 
-    def volume_ratio(tf):
-        value = get_tf(tf)
-        return number(value.get("volume_ratio"))
+    def volume_text(tf):
 
-    def rsi_value(tf):
-        return number(get_tf(tf).get("rsi"))
+        value = number(
+            get_tf(tf).get("volume_ratio")
+        )
+
+        if value is None:
+            return "N/A"
+
+        return f"{value:.2f}x"
+
+    def rsi_text(tf):
+
+        value = number(
+            get_tf(tf).get("rsi")
+        )
+
+        if value is None:
+            return "N/A"
+
+        return f"{value:.1f}"
 
     lines.extend([
         f"Direction: {direction}",
         f"Trend 4H / 1H: {trend('4h')} / {trend('1h')}",
-        f"RSI 4H / 1H: {rsi_value('4h'):.1f} / {rsi_value('1h'):.1f}",
+        f"RSI 4H / 1H: {rsi_text('4h')} / {rsi_text('1h')}",
         (
-            "MACD histogram 4H / 1H / 15M / 5M: "
+            "MACD 4H / 1H / 15M / 5M: "
             f"{macd_state('4h')} / {macd_state('1h')} / "
             f"{macd_state('15m')} / {macd_state('5m')}"
         ),
         (
-            "Volume ratio 15M / 5M: "
-            f"{volume_ratio('15m'):.2f}x / {volume_ratio('5m'):.2f}x"
+            "Volume 15M / 5M: "
+            f"{volume_text('15m')} / {volume_text('5m')}"
         )
     ])
 
-    # Show support and resistance from 1H analysis.
     one_hour = get_tf("1h")
+
     support = number(one_hour.get("support"))
     resistance = number(one_hour.get("resistance"))
 
     lines.append(
-        f"1H Support: {fmt(support)} | Resistance: {fmt(resistance)}"
+        f"1H Support: {fmt(support)} | "
+        f"Resistance: {fmt(resistance)}"
     )
 
     trade = item.get("trade")
+
     if status == "SIGNAL" and isinstance(trade, dict):
+
         lines.append(format_trade(trade))
+
     elif status == "WATCH":
+
         lines.append("WATCH ONLY — NO ENTRY.")
+
     else:
+
         lines.append("NO ENTRY.")
 
     return "\n".join(lines)
 
 
+# ============================================================
+# COMPLETE REPORT
+# ============================================================
+
 def build_report(results, total_symbols, missing_symbols):
-    """Build the complete report for all 10 core symbols."""
+
     results = results or []
     missing_symbols = missing_symbols or []
 
     result_map = {}
+
     for item in results:
+
         if isinstance(item, dict):
+
             symbol = item.get("symbol")
+
             if symbol:
                 result_map[symbol] = item
 
@@ -908,8 +1132,8 @@ def build_report(results, total_symbols, missing_symbols):
     ]
 
     lines = [
-        "L BANK AI FUTURES SCANNER",
-        "Multi-Timeframe Analysis: 5M / 15M / 1H / 4H",
+        "LBANK AI FUTURES SCANNER",
+        "MULTI-TIMEFRAME: 5M / 15M / 1H / 4H",
         "=" * 35,
         f"Core symbols: {len(CORE_SYMBOLS)}",
         f"Valid snapshots: {total_symbols}",
@@ -920,16 +1144,21 @@ def build_report(results, total_symbols, missing_symbols):
         "-" * 35
     ]
 
-    # Always display all 10 configured symbols.
     for symbol in CORE_SYMBOLS:
+
         item = result_map.get(symbol)
 
         if item:
-            lines.append(format_market_status(item))
+
+            lines.append(
+                format_market_status(item)
+            )
+
         else:
+
             lines.append(
                 f"• {symbol} | NO DATA / NO ENTRY\n"
-                "Reason: No valid fresh LBank market snapshot."
+                "Reason: No valid fresh LBank snapshot."
             )
 
         lines.append("")
@@ -941,11 +1170,21 @@ def build_report(results, total_symbols, missing_symbols):
     ])
 
     if signal_items:
+
         for item in signal_items:
-            lines.append(format_market_status(item))
+
+            lines.append(
+                format_market_status(item)
+            )
+
             lines.append("")
+
     else:
-        lines.append("NO CONFIRMED SIGNAL — NO ENTRY.")
+
+        lines.append(
+            "NO CONFIRMED SIGNAL — NO ENTRY."
+        )
+
         lines.append("")
 
     lines.extend([
@@ -954,18 +1193,30 @@ def build_report(results, total_symbols, missing_symbols):
     ])
 
     if watch_items:
+
         for item in watch_items:
+
             symbol = item.get("symbol", "UNKNOWN")
             direction = item.get("direction", "-")
-            score = number(item.get("score"))
-            reason = item.get("reason", "Conditions not fully confirmed.")
+
+            score = number(
+                item.get("score"),
+                0.0
+            )
+
+            reason = item.get(
+                "reason",
+                "Conditions not fully confirmed."
+            )
 
             lines.append(
                 f"{symbol}: {direction} | Score {score:.1f}/100\n"
                 f"Reason: {reason}\n"
                 "WATCH ONLY — DO NOT ENTER."
             )
+
     else:
+
         lines.append("No watch candidates.")
 
     lines.extend([
@@ -975,17 +1226,20 @@ def build_report(results, total_symbols, missing_symbols):
         "-" * 35,
         "Maximum leverage: 2x.",
         "Margin mode: ISOLATED.",
-        f"Maximum planned account risk per trade: "
-        f"{RISK_PER_TRADE_PERCENT:.2f}%.",
-        "Risk percentage is account-level risk, not leverage.",
-        "Position size must be calculated from entry-to-stop distance.",
+        (
+            "Maximum planned account risk per trade: "
+            f"{RISK_PER_TRADE_PERCENT:.2f}%."
+        ),
+        "Account risk is NOT the same as leverage.",
+        "Position size must be calculated from stop distance.",
         "No confirmed signal means NO ENTRY.",
-        "High leverage can cause rapid liquidation.",
+        "High leverage increases liquidation risk.",
         "",
-        "This report is technical analysis, not guaranteed financial advice."
+        "Technical analysis is not a guarantee of profit."
     ])
 
     if missing_symbols:
+
         lines.extend([
             "",
             "MISSING / STALE SNAPSHOTS",
@@ -996,40 +1250,60 @@ def build_report(results, total_symbols, missing_symbols):
     return "\n".join(lines)
 
 
+# ============================================================
+# TELEGRAM
+# ============================================================
+
 def send_telegram(message):
-    """Send report to Telegram, splitting long messages safely."""
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        print("Telegram credentials missing. Report was not sent.")
+
+        print(
+            "Telegram credentials missing. "
+            "Report was not sent."
+        )
+
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{token}/sendMessage"
+    )
 
-    # Telegram message limit is 4096 characters.
-    # Use a smaller limit to leave room for safety.
     max_length = 3900
 
     chunks = []
     remaining = str(message)
 
     while remaining:
+
         if len(remaining) <= max_length:
+
             chunks.append(remaining)
             break
 
-        split_at = remaining.rfind("\n", 0, max_length)
+        split_at = remaining.rfind(
+            "\n",
+            0,
+            max_length
+        )
 
         if split_at < max_length // 2:
             split_at = max_length
 
-        chunks.append(remaining[:split_at])
+        chunks.append(
+            remaining[:split_at]
+        )
+
         remaining = remaining[split_at:].lstrip()
 
     success = True
 
     for index, chunk in enumerate(chunks, start=1):
+
         payload = {
             "chat_id": chat_id,
             "text": chunk,
@@ -1037,6 +1311,7 @@ def send_telegram(message):
         }
 
         try:
+
             response = SESSION.post(
                 url,
                 json=payload,
@@ -1044,27 +1319,47 @@ def send_telegram(message):
             )
 
             if response.status_code != 200:
+
                 success = False
+
                 print(
-                    f"Telegram error on message {index}: "
-                    f"{response.status_code} {response.text[:300]}"
+                    f"Telegram error {index}: "
+                    f"{response.status_code} "
+                    f"{response.text[:300]}"
                 )
+
             else:
+
                 result = response.json()
+
                 if not result.get("ok", False):
+
                     success = False
-                    print(f"Telegram API rejected message {index}: {result}")
+
+                    print(
+                        f"Telegram rejected message {index}: "
+                        f"{result}"
+                    )
 
         except Exception as exc:
+
             success = False
-            print(f"Telegram send error: {exc}")
+
+            print(
+                f"Telegram send error: {exc}"
+            )
 
         time.sleep(0.5)
 
     return success
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
+
     print("=" * 60)
     print("LBank AI Futures Scanner starting...")
     print("=" * 60)
@@ -1075,35 +1370,52 @@ def main():
         snapshots = {}
 
     missing_symbols = [
-        symbol for symbol in CORE_SYMBOLS
+        symbol
+        for symbol in CORE_SYMBOLS
         if symbol not in snapshots
     ]
 
     results = []
 
-    print(f"Valid snapshots: {len(snapshots)} / {len(CORE_SYMBOLS)}")
+    print(
+        f"Valid snapshots: "
+        f"{len(snapshots)} / {len(CORE_SYMBOLS)}"
+    )
 
-    # Analyze only symbols with fresh and valid LBank snapshots.
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
         futures = {
-            executor.submit(analyze_symbol, item): symbol
+            executor.submit(
+                analyze_symbol,
+                item
+            ): symbol
+
             for symbol, item in snapshots.items()
         }
 
         for future in as_completed(futures):
+
             symbol = futures[future]
 
             try:
+
                 result = future.result()
 
                 if not isinstance(result, dict):
+
                     result = {
                         "symbol": symbol,
                         "status": "ERROR",
-                        "reason": "Analyzer returned an invalid result."
+                        "reason": "Invalid analyzer result."
                     }
 
-                result.setdefault("symbol", symbol)
+                result.setdefault(
+                    "symbol",
+                    symbol
+                )
+
                 results.append(result)
 
                 print(
@@ -1113,7 +1425,10 @@ def main():
                 )
 
             except Exception as exc:
-                print(f"{symbol} analysis error: {exc}")
+
+                print(
+                    f"{symbol} analysis error: {exc}"
+                )
 
                 results.append({
                     "symbol": symbol,
@@ -1127,17 +1442,31 @@ def main():
         missing_symbols=missing_symbols
     )
 
-    REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_FILE.write_text(report, encoding="utf-8")
+    REPORT_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    REPORT_FILE.write_text(
+        report,
+        encoding="utf-8"
+    )
 
     print("\n" + report)
 
     sent = send_telegram(report)
 
     if sent:
-        print("\nTelegram report sent successfully.")
+
+        print(
+            "\nTelegram report sent successfully."
+        )
+
     else:
-        print("\nTelegram report could not be fully delivered.")
+
+        print(
+            "\nTelegram report could not be fully delivered."
+        )
 
     print("\nScanner finished.")
 
