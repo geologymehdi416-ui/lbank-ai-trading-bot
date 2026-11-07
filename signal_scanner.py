@@ -12,26 +12,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
 
-# Binance USDT-M Futures
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+# OKX USDT Perpetual Futures
+OKX_URL = "https://www.okx.com/api/v5/market/candles"
 
 MAX_SYMBOLS = 40
 MIN_TURNOVER = 100000
 PRICE_DIFF_LIMIT = 0.75
 MAX_SNAPSHOT_AGE_MINUTES = 20
 MAX_RETRIES = 3
+MAX_WORKERS = 6
 
 INTERVALS = {
     "5m": "5m",
     "15m": "15m",
-    "1h": "1h",
-    "4h": "4h"
+    "1h": "1H",
+    "4h": "4H"
 }
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "LBank-Futures-Monitor/3.0"
-})
+HEADERS = {
+    "User-Agent": "LBank-Futures-Monitor/4.0"
+}
 
 
 def number(value):
@@ -156,7 +156,10 @@ def load_latest_lbank():
             try:
                 row = json.loads(line)
 
-                symbol = str(row.get("symbol", "")).upper()
+                symbol = str(
+                    row.get("symbol", "")
+                ).upper()
+
                 price = number(row.get("lastPrice"))
                 turnover = number(row.get("turnover24h"))
 
@@ -187,6 +190,7 @@ def load_latest_lbank():
                     row["_time"] = timestamp
                     row["_price"] = price
                     row["_turnover"] = turnover or 0
+
                     latest[symbol] = row
 
             except (ValueError, TypeError, KeyError):
@@ -195,33 +199,59 @@ def load_latest_lbank():
     return latest
 
 
+def get_okx_symbol(symbol):
+    if not symbol.endswith("USDT"):
+        raise ValueError(f"Invalid symbol: {symbol}")
+
+    base = symbol[:-4]
+
+    if not base:
+        raise ValueError(f"Invalid base asset: {symbol}")
+
+    return f"{base}-USDT-SWAP"
+
+
 def get_candles(symbol, interval):
     if interval not in INTERVALS:
         raise ValueError(f"Unsupported interval: {interval}")
 
+    inst_id = get_okx_symbol(symbol)
+
     params = {
-        "symbol": symbol,
-        "interval": INTERVALS[interval],
-        "limit": 250
+        "instId": inst_id,
+        "bar": INTERVALS[interval],
+        "limit": "250"
     }
 
     last_error = None
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = SESSION.get(
-                BINANCE_URL,
+            response = requests.get(
+                OKX_URL,
                 params=params,
+                headers=HEADERS,
                 timeout=20
             )
 
             response.raise_for_status()
-            raw = response.json()
+
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise RuntimeError("Invalid OKX response")
+
+            if payload.get("code") != "0":
+                raise RuntimeError(
+                    f"OKX API error: "
+                    f"{payload.get('code')} - "
+                    f"{payload.get('msg')}"
+                )
+
+            raw = payload.get("data", [])
 
             if not isinstance(raw, list):
-                raise RuntimeError(
-                    f"Invalid Binance response: {str(raw)[:200]}"
-                )
+                raise RuntimeError("Invalid OKX candle data")
 
             now_ms = int(
                 datetime.now(timezone.utc).timestamp() * 1000
@@ -230,47 +260,108 @@ def get_candles(symbol, interval):
             candles = []
 
             for item in raw:
-                if not isinstance(item, list) or len(item) < 7:
+
+                if not isinstance(item, list) or len(item) < 9:
+                    continue
+
+                # فقط کندل‌های بسته‌شده
+                if str(item[8]) != "1":
                     continue
 
                 start_ms = int(item[0])
-                close_time_ms = int(item[6])
 
-                # حذف کندل باز
-                if close_time_ms >= now_ms:
+                open_price = number(item[1])
+                high = number(item[2])
+                low = number(item[3])
+                close = number(item[4])
+                volume = number(item[5])
+
+                if any(
+                    value is None
+                    for value in (
+                        open_price,
+                        high,
+                        low,
+                        close,
+                        volume
+                    )
+                ):
+                    continue
+
+                if min(
+                    open_price,
+                    high,
+                    low,
+                    close
+                ) <= 0:
+                    continue
+
+                if volume < 0:
                     continue
 
                 candles.append([
                     start_ms,
-                    float(item[1]),
-                    float(item[2]),
-                    float(item[3]),
-                    float(item[4]),
-                    float(item[5]),
-                    close_time_ms
+                    open_price,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    start_ms
                 ])
+
+            candles.sort(key=lambda x: x[0])
+
+            # حذف کندل تکراری احتمالی
+            unique = {}
+
+            for candle in candles:
+                unique[candle[0]] = candle
+
+            candles = list(unique.values())
 
             candles.sort(key=lambda x: x[0])
 
             if len(candles) < 205:
                 raise RuntimeError(
-                    f"Insufficient closed candles: {len(candles)}"
+                    f"Insufficient closed candles for "
+                    f"{inst_id}: {len(candles)}"
+                )
+
+            # کنترل تازگی آخرین کندل
+            latest_start = candles[-1][0]
+
+            interval_ms = {
+                "5m": 5 * 60 * 1000,
+                "15m": 15 * 60 * 1000,
+                "1h": 60 * 60 * 1000,
+                "4h": 4 * 60 * 60 * 1000
+            }[interval]
+
+            candle_age = now_ms - (
+                latest_start + interval_ms
+            )
+
+            if candle_age > interval_ms * 2:
+                raise RuntimeError(
+                    f"Stale OKX candles for {inst_id}"
                 )
 
             return candles
 
         except Exception as error:
+
             last_error = error
 
             if attempt < MAX_RETRIES - 1:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(2 * (attempt + 1))
 
     raise RuntimeError(
-        f"Binance candle error for {symbol}: {last_error}"
+        f"OKX candle error for {inst_id}: {last_error}"
     )
 
 
 def timeframe_analysis(candles):
+
     closes = [c[4] for c in candles]
 
     e20 = ema(closes, 20)
@@ -278,7 +369,9 @@ def timeframe_analysis(candles):
     e200 = ema(closes, 200)
 
     current_rsi = rsi(closes)
+
     current_macd, signal, histogram = macd(closes)
+
     current_atr = atr(candles)
 
     volumes = [c[5] for c in candles]
@@ -294,8 +387,14 @@ def timeframe_analysis(candles):
     lows = [c[3] for c in candles[-48:]]
 
     values = [
-        e20, e50, e200, current_rsi,
-        current_macd, signal, histogram, current_atr
+        e20,
+        e50,
+        e200,
+        current_rsi,
+        current_macd,
+        signal,
+        histogram,
+        current_atr
     ]
 
     if any(value is None for value in values):
@@ -318,8 +417,11 @@ def timeframe_analysis(candles):
 
 
 def analyze_symbol(symbol, lbank):
+
     data = {
-        tf: timeframe_analysis(get_candles(symbol, tf))
+        tf: timeframe_analysis(
+            get_candles(symbol, tf)
+        )
         for tf in INTERVALS
     }
 
@@ -377,6 +479,7 @@ def analyze_symbol(symbol, lbank):
 
     if long_trend and long_confirm:
         side = "LONG"
+
     elif short_trend and short_confirm:
         side = "SHORT"
 
@@ -394,6 +497,7 @@ def analyze_symbol(symbol, lbank):
     entry = price
 
     if side == "LONG":
+
         stop = min(
             entry - 1.5 * current_atr,
             m15["support"] - 0.2 * current_atr
@@ -411,9 +515,12 @@ def analyze_symbol(symbol, lbank):
         ]
 
         if m15["resistance"] < targets[0]:
-            raise RuntimeError("Insufficient resistance clearance")
+            raise RuntimeError(
+                "Insufficient resistance clearance"
+            )
 
     else:
+
         stop = max(
             entry + 1.5 * current_atr,
             m15["resistance"] + 0.2 * current_atr
@@ -431,7 +538,9 @@ def analyze_symbol(symbol, lbank):
         ]
 
         if m15["support"] > targets[0]:
-            raise RuntimeError("Insufficient support clearance")
+            raise RuntimeError(
+                "Insufficient support clearance"
+            )
 
     risk_percent = risk / entry * 100
 
@@ -456,6 +565,7 @@ def analyze_symbol(symbol, lbank):
 
 
 def fmt(value):
+
     if value is None:
         return "ناموجود"
 
@@ -471,16 +581,23 @@ def fmt(value):
 
 
 def main():
+
     lbank_markets = load_latest_lbank()
 
     now = datetime.now(timezone.utc)
 
     candidates = []
-
     stale_count = 0
 
     for symbol, row in lbank_markets.items():
-        age = (now - row["_time"]).total_seconds() / 60
+
+        age = (
+            now - row["_time"]
+        ).total_seconds() / 60
+
+        if age < -2:
+            stale_count += 1
+            continue
 
         if age > MAX_SNAPSHOT_AGE_MINUTES:
             stale_count += 1
@@ -499,13 +616,22 @@ def main():
     results = []
     failures = []
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
         futures = {
-            executor.submit(analyze_symbol, symbol, row): symbol
+            executor.submit(
+                analyze_symbol,
+                symbol,
+                row
+            ): symbol
+
             for symbol, row in candidates
         }
 
         for future in as_completed(futures):
+
             symbol = futures[future]
 
             try:
@@ -522,14 +648,12 @@ def main():
         if item.get("side")
     ]
 
-    successful = len(results) + len(failures)
-
     lines = [
         "📊 LBank USDT Futures Smart Scanner",
-        "منبع کندل: Binance USDT-M Futures",
+        "منبع کندل: OKX USDT Perpetual Futures",
         f"زمان: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         f"بازارهای LBank: {len(lbank_markets)}",
-        f"بازارهای قدیمی حذف‌شده: {stale_count}",
+        f"بازارهای قدیمی یا نامعتبر: {stale_count}",
         f"بازارهای بررسی‌شده: {len(candidates)}",
         f"تحلیل‌های موفق: {len(results)}",
         f"خطاهای دریافت/تحلیل: {len(failures)}",
@@ -537,11 +661,13 @@ def main():
     ]
 
     if signals:
+
         lines.append(
             f"✅ ستاپ‌های واجد شرایط: {len(signals)}"
         )
 
         for item in signals[:5]:
+
             side = (
                 "لانگ"
                 if item["side"] == "LONG"
@@ -564,38 +690,53 @@ def main():
                 f"اختلاف قیمت دو صرافی: {item['difference']:.3f}%"
             ])
 
-    elif failures and not results:
+    if failures:
+
         lines.extend([
-            "⚠️ تحلیل بازار کامل نشد؛ خطای دریافت داده وجود دارد.",
-            "این وضعیت به معنی نبود ستاپ معاملاتی نیست.",
-            "ورود نکن تا منبع داده تأیید شود."
+            "",
+            "⚠️ اسکن ناقص است؛ بعضی بازارها تحلیل نشدند."
         ])
 
-    else:
+        if not signals:
+            lines.extend([
+                "نبود سیگنال در این اجرا تأیید نشده است.",
+                "ورود نکن تا دریافت داده کامل شود."
+            ])
+
+    elif not signals:
+
         lines.extend([
             "⛔ ستاپ معتبری پیدا نشد.",
             "ورود نکن؛ منتظر تأیید بمان."
         ])
 
     if failures:
+
         sample_errors = {}
 
         for _, message in failures:
-            key = message[:140]
-            sample_errors[key] = sample_errors.get(key, 0) + 1
+            key = message[:160]
+            sample_errors[key] = (
+                sample_errors.get(key, 0) + 1
+            )
 
         lines.extend([
             "",
             "نمونه خطاهای داده:"
         ])
 
-        for message, count in list(sample_errors.items())[:3]:
-            lines.append(f"- {count} مورد: {message}")
+        for message, count in list(
+            sample_errors.items()
+        )[:3]:
+
+            lines.append(
+                f"- {count} مورد: {message}"
+            )
 
     lines.extend([
         "",
-        "⚠️ کندل‌ها از Binance Futures هستند، نه LBank.",
-        "⚠️ قیمت LBank با Binance مقایسه می‌شود.",
+        "⚠️ کندل‌ها از OKX Futures هستند، نه LBank.",
+        "⚠️ قیمت LBank با قیمت OKX مقایسه می‌شود.",
         "⚠️ دفتر سفارش و Funding Rate بررسی نمی‌شوند.",
         "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
         "این ربات سفارش ثبت نمی‌کند."
