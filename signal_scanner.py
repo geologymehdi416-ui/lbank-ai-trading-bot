@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# =========================
+# ==========================================
 # SETTINGS
-# =========================
+# ==========================================
 
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
@@ -26,6 +26,10 @@ MAX_SNAPSHOT_AGE_MINUTES = 20
 MAX_RETRIES = 3
 MAX_WORKERS = 5
 
+MIN_VOLUME_RATIO = 1.2
+MIN_RISK_PERCENT = 0.15
+MAX_RISK_PERCENT = 3.0
+
 INTERVALS = {
     "5m": "5m",
     "15m": "15m",
@@ -34,22 +38,21 @@ INTERVALS = {
 }
 
 HEADERS = {
-    "User-Agent": "LBank-Futures-Monitor/5.0"
+    "User-Agent": "LBank-Futures-Signal-Bot/6.0"
 }
 
 
-# =========================
+# ==========================================
 # EXCEPTIONS
-# =========================
+# ==========================================
 
 class SkipSymbol(Exception):
-    """نماد قابل تحلیل نیست؛ خطای اجرایی محسوب نمی‌شود."""
     pass
 
 
-# =========================
-# BASIC FUNCTIONS
-# =========================
+# ==========================================
+# UTILITIES
+# ==========================================
 
 def number(value):
     try:
@@ -62,20 +65,19 @@ def number(value):
 def fmt(value):
     if value is None:
         return "ناموجود"
-
     return f"{float(value):,.8g}"
 
 
-# =========================
+# ==========================================
 # INDICATORS
-# =========================
+# ==========================================
 
 def ema_series(values, period):
 
-    if len(values) < period:
-        return [None] * len(values)
-
     output = [None] * len(values)
+
+    if len(values) < period:
+        return output
 
     current = sum(values[:period]) / period
     output[period - 1] = current
@@ -84,10 +86,9 @@ def ema_series(values, period):
 
     for i in range(period, len(values)):
         current = (
-            alpha * values[i]
-            + (1 - alpha) * current
+            values[i] * alpha
+            + current * (1 - alpha)
         )
-
         output[i] = current
 
     return output
@@ -110,7 +111,6 @@ def rsi(values, period=14):
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(changes)):
-
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
@@ -132,29 +132,26 @@ def macd(values):
     fast = ema_series(values, 12)
     slow = ema_series(values, 26)
 
-    macd_line = []
+    line = []
 
     for f, s in zip(fast, slow):
+        if f is not None and s is not None:
+            line.append(f - s)
 
-        if f is None or s is None:
-            continue
-
-        macd_line.append(f - s)
-
-    if len(macd_line) < 9:
+    if len(line) < 9:
         return None, None, None
 
-    signal_line = ema_series(macd_line, 9)
+    signal_series = ema_series(line, 9)
 
-    current_macd = macd_line[-1]
-    current_signal = signal_line[-1]
+    macd_value = line[-1]
+    signal_value = signal_series[-1]
 
-    if current_signal is None:
+    if signal_value is None:
         return None, None, None
 
-    histogram = current_macd - current_signal
+    histogram = macd_value - signal_value
 
-    return current_macd, current_signal, histogram
+    return macd_value, signal_value, histogram
 
 
 def atr(candles, period=14):
@@ -170,27 +167,25 @@ def atr(candles, period=14):
         low = candles[i][3]
         previous_close = candles[i - 1][4]
 
-        true_range = max(
+        tr = max(
             high - low,
             abs(high - previous_close),
             abs(low - previous_close)
         )
 
-        ranges.append(true_range)
+        ranges.append(tr)
 
     return sum(ranges[-period:]) / period
 
 
-# =========================
+# ==========================================
 # LBANK DATA
-# =========================
+# ==========================================
 
 def load_latest_lbank():
 
     if not DATA_FILE.exists():
-        raise RuntimeError(
-            "LBank price history not found"
-        )
+        raise RuntimeError("LBank data file not found")
 
     latest = {}
 
@@ -202,7 +197,6 @@ def load_latest_lbank():
         for line in file:
 
             try:
-
                 row = json.loads(line)
 
                 symbol = str(
@@ -250,19 +244,15 @@ def load_latest_lbank():
 
                     latest[symbol] = row
 
-            except (
-                ValueError,
-                TypeError,
-                KeyError
-            ):
+            except Exception:
                 continue
 
     return latest
 
 
-# =========================
-# OKX FUTURES CANDLES
-# =========================
+# ==========================================
+# OKX CANDLES
+# ==========================================
 
 def get_okx_symbol(symbol):
 
@@ -270,9 +260,6 @@ def get_okx_symbol(symbol):
         raise SkipSymbol("نماد USDT معتبر نیست")
 
     base = symbol[:-4]
-
-    if not base:
-        raise SkipSymbol("نام دارایی پایه نامعتبر است")
 
     return f"{base}-USDT-SWAP"
 
@@ -308,81 +295,49 @@ def get_candles(symbol, interval):
 
             if code == "51001":
                 raise SkipSymbol(
-                    "قرارداد متناظر در OKX موجود نیست"
+                    "قرارداد متناظر در OKX وجود ندارد"
                 )
 
             if code != "0":
                 raise RuntimeError(
-                    f"OKX API error: {code} - "
+                    f"OKX error: {code} "
                     f"{payload.get('msg')}"
                 )
 
             raw = payload.get("data", [])
 
-            now_ms = int(
-                datetime.now(timezone.utc).timestamp()
-                * 1000
-            )
-
             candles = []
 
             for item in raw:
 
-                if (
-                    not isinstance(item, list)
-                    or len(item) < 9
-                ):
+                if len(item) < 9:
                     continue
 
                 # فقط کندل بسته‌شده
                 if str(item[8]) != "1":
                     continue
 
-                try:
-                    start_ms = int(item[0])
-                except (TypeError, ValueError):
-                    continue
-
-                open_price = number(item[1])
-                high = number(item[2])
-                low = number(item[3])
-                close = number(item[4])
-                volume = number(item[5])
-
                 values = [
-                    open_price,
-                    high,
-                    low,
-                    close,
-                    volume
+                    number(item[1]),
+                    number(item[2]),
+                    number(item[3]),
+                    number(item[4]),
+                    number(item[5])
                 ]
 
-                if any(v is None for v in values):
+                if any(x is None for x in values):
                     continue
 
-                if min(
-                    open_price,
-                    high,
-                    low,
-                    close
-                ) <= 0:
-                    continue
-
-                if volume < 0:
+                if min(values[:4]) <= 0:
                     continue
 
                 candles.append([
-                    start_ms,
-                    open_price,
-                    high,
-                    low,
-                    close,
-                    volume
+                    int(item[0]),
+                    *values
                 ])
 
             candles.sort(key=lambda x: x[0])
 
-            # حذف کندل‌های تکراری
             unique = {
                 candle[0]: candle
                 for candle in candles
@@ -395,8 +350,7 @@ def get_candles(symbol, interval):
 
             if len(candles) < 205:
                 raise RuntimeError(
-                    f"کندل بسته‌شده کافی نیست: "
-                    f"{len(candles)}"
+                    f"کندل کافی نیست: {len(candles)}"
                 )
 
             interval_ms = {
@@ -406,13 +360,20 @@ def get_candles(symbol, interval):
                 "4h": 14400000
             }[interval]
 
-            candle_age = now_ms - (
-                candles[-1][0] + interval_ms
+            now_ms = int(
+                datetime.now(timezone.utc).timestamp()
+                * 1000
+            )
+
+            candle_age = (
+                now_ms
+                - candles[-1][0]
+                - interval_ms
             )
 
             if candle_age > interval_ms * 2:
                 raise RuntimeError(
-                    "آخرین کندل OKX قدیمی است"
+                    "کندل آخر قدیمی است"
                 )
 
             return candles
@@ -427,14 +388,12 @@ def get_candles(symbol, interval):
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 * (attempt + 1))
 
-    raise RuntimeError(
-        f"خطای دریافت کندل {inst_id}: {last_error}"
-    )
+    raise RuntimeError(str(last_error))
 
 
-# =========================
+# ==========================================
 # TIMEFRAME ANALYSIS
-# =========================
+# ==========================================
 
 def timeframe_analysis(candles):
 
@@ -446,7 +405,9 @@ def timeframe_analysis(candles):
 
     current_rsi = rsi(closes)
 
-    current_macd, signal, histogram = macd(closes)
+    macd_value, signal_value, histogram = macd(
+        closes
+    )
 
     current_atr = atr(candles)
 
@@ -465,11 +426,11 @@ def timeframe_analysis(candles):
     recent = candles[-48:]
 
     support = min(
-        candle[3] for candle in recent
+        c[3] for c in recent
     )
 
     resistance = max(
-        candle[2] for candle in recent
+        c[2] for c in recent
     )
 
     required = [
@@ -477,15 +438,15 @@ def timeframe_analysis(candles):
         ema50,
         ema200,
         current_rsi,
-        current_macd,
-        signal,
+        macd_value,
+        signal_value,
         histogram,
         current_atr
     ]
 
     if any(x is None for x in required):
         raise RuntimeError(
-            "محاسبه اندیکاتورها ناموفق بود"
+            "اندیکاتور ناقص است"
         )
 
     return {
@@ -494,8 +455,8 @@ def timeframe_analysis(candles):
         "ema50": ema50,
         "ema200": ema200,
         "rsi": current_rsi,
-        "macd": current_macd,
-        "macd_signal": signal,
+        "macd": macd_value,
+        "macd_signal": signal_value,
         "histogram": histogram,
         "atr": current_atr,
         "volume_ratio": volume_ratio,
@@ -504,9 +465,79 @@ def timeframe_analysis(candles):
     }
 
 
-# =========================
-# SYMBOL ANALYSIS
-# =========================
+# ==========================================
+# SIGNAL GENERATION
+# ==========================================
+
+def make_trade(side, entry, data):
+
+    m5 = data["5m"]
+    m15 = data["15m"]
+
+    volatility = m5["atr"]
+
+    if volatility <= 0:
+        return None
+
+    if side == "LONG":
+
+        stop = min(
+            entry - 1.5 * volatility,
+            m15["support"] - 0.15 * volatility
+        )
+
+        risk = entry - stop
+
+        if risk <= 0:
+            return None
+
+        targets = [
+            entry + risk,
+            entry + 2 * risk,
+            entry + 3 * risk
+        ]
+
+        # مقاومت نزدیک نباید مانع تارگت اول باشد
+        if m15["resistance"] < targets[0]:
+            return None
+
+    else:
+
+        stop = max(
+            entry + 1.5 * volatility,
+            m15["resistance"] + 0.15 * volatility
+        )
+
+        risk = stop - entry
+
+        if risk <= 0:
+            return None
+
+        targets = [
+            entry - risk,
+            entry - 2 * risk,
+            entry - 3 * risk
+        ]
+
+        if m15["support"] > targets[0]:
+            return None
+
+    risk_percent = risk / entry * 100
+
+    if not (
+        MIN_RISK_PERCENT
+        <= risk_percent
+        <= MAX_RISK_PERCENT
+    ):
+        return None
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "targets": targets,
+        "risk_percent": risk_percent
+    }
+
 
 def analyze_symbol(symbol, lbank):
 
@@ -532,218 +563,117 @@ def analyze_symbol(symbol, lbank):
     okx_price = m5["price"]
 
     difference = (
-        abs(okx_price - lbank_price)
+        abs(lbank_price - okx_price)
         / lbank_price
         * 100
     )
 
     if difference > PRICE_DIFF_LIMIT:
-
         raise SkipSymbol(
-            f"اختلاف قیمت دو صرافی: "
-            f"{difference:.3f}%"
+            f"اختلاف قیمت {difference:.3f}%"
         )
 
-    # روند تایم‌فریم بالاتر
+    # قیمت مرجع ورود از LBank گرفته می‌شود
+    entry = lbank_price
 
-    long_trend = (
-        h4["ema20"] > h4["ema50"] > h4["ema200"]
+    # روند تایم‌فریم بالاتر
+    bullish_htf = (
+        h4["ema20"] > h4["ema50"]
         and h1["ema20"] > h1["ema50"]
     )
 
-    short_trend = (
-        h4["ema20"] < h4["ema50"] < h4["ema200"]
+    bearish_htf = (
+        h4["ema20"] < h4["ema50"]
         and h1["ema20"] < h1["ema50"]
     )
 
-    # شرایط لانگ
+    # تأیید تایم‌فریم پایین‌تر
+    bullish_ltf = (
+        m5["ema20"] > m5["ema50"]
+        and m15["ema20"] > m15["ema50"]
+    )
 
-    long_checks = [
+    bearish_ltf = (
+        m5["ema20"] < m5["ema50"]
+        and m15["ema20"] < m15["ema50"]
+    )
 
-        (
-            "روند 4h و 1h صعودی نیست",
-            long_trend
-        ),
+    bullish_momentum = (
+        50 <= m15["rsi"] <= 68
+        and 45 <= m5["rsi"] <= 70
+        and m15["histogram"] > 0
+        and m5["histogram"] > 0
+    )
 
-        (
-            "EMA در 5m و 15m صعودی نیست",
-            (
-                m5["ema20"] > m5["ema50"]
-                and m15["ema20"] > m15["ema50"]
-            )
-        ),
+    bearish_momentum = (
+        32 <= m15["rsi"] <= 50
+        and 30 <= m5["rsi"] <= 55
+        and m15["histogram"] < 0
+        and m5["histogram"] < 0
+    )
 
-        (
-            "RSI برای لانگ مناسب نیست",
-            (
-                50 <= m15["rsi"] <= 68
-                and 45 <= m5["rsi"] <= 70
-            )
-        ),
-
-        (
-            "MACD مثبت نیست",
-            (
-                m5["histogram"] > 0
-                and m15["histogram"] > 0
-            )
-        ),
-
-        (
-            "حجم معاملات کافی نیست",
-            m5["volume_ratio"] >= 1.2
-        )
-    ]
-
-    # شرایط شورت
-
-    short_checks = [
-
-        (
-            "روند 4h و 1h نزولی نیست",
-            short_trend
-        ),
-
-        (
-            "EMA در 5m و 15m نزولی نیست",
-            (
-                m5["ema20"] < m5["ema50"]
-                and m15["ema20"] < m15["ema50"]
-            )
-        ),
-
-        (
-            "RSI برای شورت مناسب نیست",
-            (
-                32 <= m15["rsi"] <= 50
-                and 30 <= m5["rsi"] <= 55
-            )
-        ),
-
-        (
-            "MACD منفی نیست",
-            (
-                m5["histogram"] < 0
-                and m15["histogram"] < 0
-            )
-        ),
-
-        (
-            "حجم معاملات کافی نیست",
-            m5["volume_ratio"] >= 1.2
-        )
-    ]
+    volume_confirmed = (
+        m5["volume_ratio"] >= MIN_VOLUME_RATIO
+    )
 
     side = None
     reasons = []
 
-    if all(ok for _, ok in long_checks):
+    if (
+        bullish_htf
+        and bullish_ltf
+        and bullish_momentum
+        and volume_confirmed
+    ):
 
         side = "LONG"
 
-    elif all(ok for _, ok in short_checks):
+    elif (
+        bearish_htf
+        and bearish_ltf
+        and bearish_momentum
+        and volume_confirmed
+    ):
 
         side = "SHORT"
 
     else:
 
-        reasons = [
-            "لانگ: " + name
-            for name, ok in long_checks
-            if not ok
-        ]
+        if not volume_confirmed:
+            reasons.append(
+                "حجم معاملات برای ورود کافی نیست"
+            )
 
-        reasons += [
-            "شورت: " + name
-            for name, ok in short_checks
-            if not ok
-        ]
+        if not bullish_htf and not bearish_htf:
+            reasons.append(
+                "روند تایم‌فریم بالاتر یکپارچه نیست"
+            )
+
+        if not bullish_ltf and not bearish_ltf:
+            reasons.append(
+                "EMA تایم‌فریم پایین‌تر تأیید نمی‌دهد"
+            )
+
+        if not bullish_momentum and not bearish_momentum:
+            reasons.append(
+                "RSI و MACD مومنتوم ورود را تأیید نمی‌کنند"
+            )
 
     trade = None
 
     if side:
 
-        entry = okx_price
-        current_atr = m5["atr"]
+        trade = make_trade(
+            side,
+            entry,
+            data
+        )
 
-        if current_atr <= 0:
-            raise RuntimeError("ATR نامعتبر است")
-
-        if side == "LONG":
-
-            stop = min(
-                entry - 1.5 * current_atr,
-                m15["support"] - 0.2 * current_atr
-            )
-
-            risk = entry - stop
-
-            if (
-                risk <= 0
-                or m15["resistance"] <= entry
-                or m15["resistance"] < entry + risk
-            ):
-
-                side = None
-
-            else:
-
-                targets = [
-                    entry + risk,
-                    entry + 2 * risk,
-                    entry + 3 * risk
-                ]
-
-        else:
-
-            stop = max(
-                entry + 1.5 * current_atr,
-                m15["resistance"] + 0.2 * current_atr
-            )
-
-            risk = stop - entry
-
-            if (
-                risk <= 0
-                or m15["support"] >= entry
-                or m15["support"] > entry - risk
-            ):
-
-                side = None
-
-            else:
-
-                targets = [
-                    entry - risk,
-                    entry - 2 * risk,
-                    entry - 3 * risk
-                ]
-
-        if side:
-
-            risk_percent = risk / entry * 100
-
-            if (
-                risk_percent < 0.15
-                or risk_percent > 3
-            ):
-
-                side = None
-
-            else:
-
-                trade = {
-                    "entry": entry,
-                    "stop": stop,
-                    "targets": targets,
-                    "risk_percent": risk_percent
-                }
-
-        if side is None:
-
+        if trade is None:
             reasons.append(
-                "ساختار حمایت و مقاومت یا حد ضرر مناسب نیست"
+                "نسبت ریسک به بازده یا ساختار حمایت/مقاومت مناسب نیست"
             )
+            side = None
 
     return {
         "symbol": symbol,
@@ -753,17 +683,17 @@ def analyze_symbol(symbol, lbank):
         "okx_price": okx_price,
         "difference": difference,
         "turnover": lbank["_turnover"],
-        "reasons": reasons,
-        "trade": trade
+        "trade": trade,
+        "reasons": reasons
     }
 
 
-# =========================
-# REPORT GENERATION
-# =========================
+# ==========================================
+# REPORT
+# ==========================================
 
 def build_report(
-    lbank_markets,
+    market_count,
     candidates,
     results,
     skipped,
@@ -774,38 +704,56 @@ def build_report(
 
     signals = [
         x for x in results
-        if x["side"]
+        if x["side"] in ("LONG", "SHORT")
+    ]
+
+    longs = [
+        x for x in signals
+        if x["side"] == "LONG"
+    ]
+
+    shorts = [
+        x for x in signals
+        if x["side"] == "SHORT"
     ]
 
     lines = [
 
-        "📊 LBank USDT Futures Smart Scanner",
-
-        "منبع کندل: OKX USDT Perpetual Futures",
+        "🚨 LBank FUTURES AI SIGNALS",
 
         f"زمان: {now.strftime('%Y-%m-%d %H:%M UTC')}",
 
-        f"بازارهای LBank: {len(lbank_markets)}",
-
-        f"داده‌های قدیمی: {stale_count}",
+        f"بازارهای LBank: {market_count}",
 
         f"نمادهای منتخب: {len(candidates)}",
 
         f"تحلیل موفق: {len(results)}",
 
+        f"سیگنال LONG: {len(longs)}",
+
+        f"سیگنال SHORT: {len(shorts)}",
+
         f"نمادهای ردشده: {len(skipped)}",
 
         f"خطاهای واقعی: {len(failures)}",
 
-        f"ستاپ‌های تأییدشده: {len(signals)}",
-
         "",
-
-        "📋 تحلیل تک‌تک نمادها"
+        "==============================",
+        "🎯 سیگنال‌های معاملاتی تأییدشده",
+        "=============================="
     ]
 
-    for item in results:
+    if not signals:
 
+        lines.extend([
+            "",
+            "⛔ هیچ سیگنال معتبری پیدا نشد.",
+            "ورود نکن؛ منتظر تأیید شرایط بمان."
+        ])
+
+    for item in signals:
+
+        trade = item["trade"]
         d = item["data"]
 
         m5 = d["5m"]
@@ -813,122 +761,97 @@ def build_report(
         h1 = d["1h"]
         h4 = d["4h"]
 
-        if (
-            h4["ema20"] > h4["ema50"]
-            > h4["ema200"]
-        ):
-
-            trend = "صعودی"
-
-        elif (
-            h4["ema20"] < h4["ema50"]
-            < h4["ema200"]
-        ):
-
-            trend = "نزولی"
-
-        else:
-
-            trend = "خنثی/ترکیبی"
-
-        if item["side"] == "LONG":
-            label = "🟢 LONG"
-
-        elif item["side"] == "SHORT":
-            label = "🔴 SHORT"
-
-        else:
-            label = "⚪ بدون ورود"
+        icon = (
+            "🟢" if item["side"] == "LONG"
+            else "🔴"
+        )
 
         lines.extend([
 
             "",
+            "━━━━━━━━━━━━━━━━",
+            f"{icon} {item['side']} | {item['symbol']}",
+            "━━━━━━━━━━━━━━━━",
 
-            f"🔹 {item['symbol']} | {label}",
+            f"قیمت LBank: {fmt(item['lbank_price'])}",
 
-            (
-                f"قیمت LBank: {fmt(item['lbank_price'])}"
-                f" | OKX: {fmt(item['okx_price'])}"
-            ),
+            f"قیمت OKX: {fmt(item['okx_price'])}",
 
             f"اختلاف قیمت: {item['difference']:.3f}%",
 
-            f"روند 4h: {trend}",
+            f"ورود: {fmt(trade['entry'])}",
+
+            f"حد ضرر: {fmt(trade['stop'])}",
+
+            f"تارگت 1: {fmt(trade['targets'][0])}",
+
+            f"تارگت 2: {fmt(trade['targets'][1])}",
+
+            f"تارگت 3: {fmt(trade['targets'][2])}",
+
+            f"ریسک تا حد ضرر: {trade['risk_percent']:.2f}%",
+
+            "",
+            "📊 تحلیل تکنیکال:",
 
             (
-                f"EMA 4h: "
-                f"{fmt(h4['ema20'])} / "
-                f"{fmt(h4['ema50'])} / "
-                f"{fmt(h4['ema200'])}"
+                f"روند 4H: "
+                f"{'صعودی' if h4['ema20'] > h4['ema50'] else 'نزولی'}"
             ),
 
             (
-                f"EMA 1h: "
-                f"{fmt(h1['ema20'])} / "
-                f"{fmt(h1['ema50'])}"
+                f"روند 1H: "
+                f"{'صعودی' if h1['ema20'] > h1['ema50'] else 'نزولی'}"
             ),
 
-            (
-                f"RSI 15m / 5m: "
-                f"{m15['rsi']:.1f} / "
-                f"{m5['rsi']:.1f}"
-            ),
+            f"RSI 15m: {m15['rsi']:.1f}",
 
-            (
-                f"MACD Hist 15m / 5m: "
-                f"{fmt(m15['histogram'])} / "
-                f"{fmt(m5['histogram'])}"
-            ),
+            f"RSI 5m: {m5['rsi']:.1f}",
 
-            (
-                f"حجم نسبی 5m: "
-                f"{m5['volume_ratio']:.2f}x"
-            ),
+            f"MACD 15m: {fmt(m15['histogram'])}",
 
-            (
-                f"حمایت 15m: {fmt(m15['support'])}"
-                f" | مقاومت: {fmt(m15['resistance'])}"
-            )
+            f"MACD 5m: {fmt(m5['histogram'])}",
+
+            f"حجم نسبی 5m: {m5['volume_ratio']:.2f}x",
+
+            f"حمایت 15m: {fmt(m15['support'])}",
+
+            f"مقاومت 15m: {fmt(m15['resistance'])}",
+
+            "",
+            "شرط اعتبار: حفظ ساختار و تأیید حجم."
         ])
 
-        if item["trade"]:
+    lines.extend([
+        "",
+        "==============================",
+        "📋 وضعیت سایر نمادها",
+        "=============================="
+    ])
 
-            trade = item["trade"]
+    for item in results:
 
-            lines.extend([
+        if item["side"]:
+            continue
 
-                f"ورود: {fmt(trade['entry'])}",
+        lines.append(
+            f"⚪ {item['symbol']}: بدون ورود"
+        )
 
-                f"حد ضرر: {fmt(trade['stop'])}",
-
-                (
-                    f"ریسک: "
-                    f"{trade['risk_percent']:.2f}%"
-                ),
-
-                f"TP1: {fmt(trade['targets'][0])}",
-
-                f"TP2: {fmt(trade['targets'][1])}",
-
-                f"TP3: {fmt(trade['targets'][2])}"
-            ])
-
-        elif item["reasons"]:
-
+        if item["reasons"]:
             lines.append(
-                "دلایل عدم ورود: "
-                + "؛ ".join(item["reasons"][:4])
+                "دلیل: "
+                + "؛ ".join(item["reasons"][:3])
             )
 
     if skipped:
 
         lines.extend([
             "",
-            "ℹ️ نمادهای ردشده:"
+            "نمادهای ردشده:"
         ])
 
         for symbol, reason in skipped:
-
             lines.append(
                 f"- {symbol}: {reason}"
             )
@@ -937,59 +860,47 @@ def build_report(
 
         lines.extend([
             "",
-            "⚠️ خطاهای واقعی دریافت یا تحلیل:"
+            "خطاهای واقعی:"
         ])
 
         for symbol, reason in failures[:20]:
-
             lines.append(
-                f"- {symbol}: {reason[:150]}"
+                f"- {symbol}: {reason[:120]}"
             )
-
-    if not signals:
-
-        lines.extend([
-            "",
-            "⛔ ستاپ معتبر تأیید نشد.",
-            "ورود نکن؛ منتظر تأیید شرایط بمان."
-        ])
 
     lines.extend([
 
         "",
+        "⚠️ کندل‌ها از OKX Futures هستند.",
 
-        "⚠️ کندل‌ها از OKX Futures هستند، نه LBank.",
+        "⚠️ قیمت ورود بر اساس قیمت LBank محاسبه شده است.",
 
-        "⚠️ قیمت LBank با قیمت OKX مقایسه می‌شود.",
+        "⚠️ دفتر سفارش و Funding Rate بررسی نشده‌اند.",
 
-        "⚠️ دفتر سفارش و Funding Rate بررسی نمی‌شوند.",
-
-        "⚠️ فقط نمادهای منتخب بر اساس حجم معاملات بررسی شده‌اند.",
-
-        "⚠️ حد ضرر و تارگت‌ها تخمینی هستند.",
+        "⚠️ سیگنال‌ها مشروط به حفظ شرایط بازار هستند.",
 
         "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
 
-        "این ربات سفارش ثبت نمی‌کند."
+        "ربات هیچ سفارشی ثبت نمی‌کند."
     ])
 
     return "\n".join(lines)
 
 
-# =========================
+# ==========================================
 # MAIN
-# =========================
+# ==========================================
 
 def main():
 
     now = datetime.now(timezone.utc)
 
-    lbank_markets = load_latest_lbank()
+    markets = load_latest_lbank()
 
     candidates = []
     stale_count = 0
 
-    for symbol, row in lbank_markets.items():
+    for symbol, row in markets.items():
 
         age = (
             now - row["_time"]
@@ -999,12 +910,10 @@ def main():
             age < -2
             or age > MAX_SNAPSHOT_AGE_MINUTES
         ):
-
             stale_count += 1
             continue
 
         if row["_turnover"] >= MIN_TURNOVER:
-
             candidates.append((symbol, row))
 
     candidates.sort(
@@ -1019,8 +928,7 @@ def main():
     failures = []
 
     print(
-        f"Starting analysis of "
-        f"{len(candidates)} markets..."
+        f"Analyzing {len(candidates)} symbols..."
     )
 
     with ThreadPoolExecutor(
@@ -1028,13 +936,11 @@ def main():
     ) as executor:
 
         futures = {
-
             executor.submit(
                 analyze_symbol,
                 symbol,
                 row
             ): symbol
-
             for symbol, row in candidates
         }
 
@@ -1045,21 +951,17 @@ def main():
             try:
 
                 result = future.result()
-
                 results.append(result)
 
                 print(
-                    f"ANALYZED: {symbol}"
+                    f"ANALYZED {symbol}: "
+                    f"{result['side'] or 'NO SIGNAL'}"
                 )
 
             except SkipSymbol as error:
 
                 skipped.append(
                     (symbol, str(error))
-                )
-
-                print(
-                    f"SKIPPED: {symbol} - {error}"
                 )
 
             except Exception as error:
@@ -1069,7 +971,7 @@ def main():
                 )
 
                 print(
-                    f"FAILED: {symbol} - {error}"
+                    f"FAILED {symbol}: {error}"
                 )
 
     results.sort(
@@ -1078,7 +980,7 @@ def main():
     )
 
     report = build_report(
-        lbank_markets,
+        len(markets),
         candidates,
         results,
         skipped,
@@ -1092,7 +994,6 @@ def main():
         encoding="utf-8"
     )
 
-    print("\n")
     print(report)
 
 
