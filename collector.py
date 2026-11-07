@@ -6,49 +6,72 @@ from datetime import datetime, timezone
 URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketData"
 
 def main():
-    response = requests.get(
-        URL,
-        params={"productGroup": "SwapU"},
-        timeout=30
-    )
-    response.raise_for_status()
+response = requests.get(
+URL,
+params={"productGroup": "SwapU"},
+timeout=30,
+headers={"User-Agent": "LBank-Futures-Monitor/2.0"}
+)
+response.raise_for_status()
 
-    data = response.json().get("data", [])
+result = response.json()
 
-    if not isinstance(data, list):
-        raise RuntimeError("Invalid LBank response")
+if not isinstance(result, dict):
+    raise RuntimeError("Invalid API response format")
 
-    Path("data").mkdir(exist_ok=True)
-    now = datetime.now(timezone.utc).isoformat()
-    saved = 0
+if result.get("result") is False:
+    raise RuntimeError(f"LBank API error: {result}")
 
-    with open("data/prices.jsonl", "a", encoding="utf-8") as f:
-        for item in data:
-            symbol = str(item.get("symbol", "")).upper()
+data = result.get("data", [])
 
-            if not symbol.endswith("USDT"):
-                continue
+if not isinstance(data, list):
+    raise RuntimeError("Invalid LBank market data")
 
-            record = {
-                "timestamp": now,
-                "symbol": symbol,
-                "lastPrice": item.get("lastPrice"),
-                "markedPrice": item.get("markedPrice"),
-                "openPrice": item.get("openPrice"),
-                "highestPrice": item.get("highestPrice"),
-                "lowestPrice": item.get("lowestPrice"),
-                "volume24h": item.get("volume"),
-                "turnover24h": item.get("turnover"),
-                "fundingRate": item.get("prePositionFeeRate")
-            }
+Path("data").mkdir(exist_ok=True)
 
-            f.write(json.dumps(record) + "\n")
-            saved += 1
+now = datetime.now(timezone.utc).isoformat()
+saved = 0
+skipped = 0
 
-    print("Total USDT Futures saved:", saved)
+with open("data/prices.jsonl", "a", encoding="utf-8") as f:
+    for item in data:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
 
-    if saved == 0:
-        raise RuntimeError("No USDT Futures symbols found")
+        symbol = str(item.get("symbol", "")).upper()
 
-if __name__ == "__main__":
-    main()
+        if not symbol.endswith("USDT"):
+            continue
+
+        price = item.get("lastPrice")
+
+        if price is None:
+            skipped += 1
+            continue
+
+        record = {
+            "timestamp": now,
+            "symbol": symbol,
+            "lastPrice": price,
+            "markedPrice": item.get("markedPrice"),
+            "openPrice": item.get("openPrice"),
+            "highestPrice": item.get("highestPrice"),
+            "lowestPrice": item.get("lowestPrice"),
+            "volume24h": item.get("volume"),
+            "turnover24h": item.get("turnover"),
+            "fundingRate": item.get("prePositionFeeRate")
+        }
+
+        f.write(json.dumps(record) + "\n")
+        saved += 1
+
+print(f"USDT Futures markets received: {len(data)}")
+print(f"Markets saved: {saved}")
+print(f"Records skipped: {skipped}")
+
+if saved == 0:
+    raise RuntimeError("No valid USDT Futures markets found")
+
+if name == "main":
+main()
