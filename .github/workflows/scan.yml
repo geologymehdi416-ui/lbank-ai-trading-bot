@@ -79,7 +79,7 @@ jobs:
   websocket_probe:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - name: Setup Python
@@ -90,55 +90,92 @@ jobs:
       - name: Install WebSocket dependency
         run: pip install websocket-client
 
-      - name: Test LBank Futures WebSocket
+      - name: Probe Futures subscription protocol
         run: |
           python - <<'PY'
+          import json
           import time
           import websocket
 
           URL = "wss://lbkperpws.lbank.com/ws"
 
-          print("Connecting to:", URL)
+          probes = [
+              {
+                  "name": "KLINE_REQUEST",
+                  "payload": {
+                      "action": "request",
+                      "request": "kbar",
+                      "kbar": "5min",
+                      "pair": "BTCUSDT",
+                      "size": "2"
+                  }
+              },
+              {
+                  "name": "KLINE_SUBSCRIBE",
+                  "payload": {
+                      "action": "subscribe",
+                      "subscribe": "kbar",
+                      "kbar": "5min",
+                      "pair": "BTCUSDT"
+                  }
+              },
+              {
+                  "name": "TRADE_SUBSCRIBE",
+                  "payload": {
+                      "action": "subscribe",
+                      "subscribe": "trade",
+                      "pair": "BTCUSDT"
+                  }
+              }
+          ]
 
-          try:
-              ws = websocket.create_connection(
-                  URL,
-                  timeout=10,
-                  enable_multithread=True
-              )
+          for probe in probes:
+              print("\n================================")
+              print("TEST:", probe["name"])
+              print("================================")
 
-              print("RESULT: HANDSHAKE_OK")
-              print("WebSocket connection established.")
+              ws = None
 
-              ws.settimeout(2)
+              try:
+                  ws = websocket.create_connection(
+                      URL,
+                      timeout=10,
+                      enable_multithread=True
+                  )
 
-              print("Listening for server frames...")
+                  print("HANDSHAKE_OK")
 
-              end_time = time.time() + 20
-              received = 0
+                  message = json.dumps(probe["payload"])
+                  print("SEND:", message)
 
-              while time.time() < end_time:
-                  try:
-                      message = ws.recv()
+                  ws.send(message)
+                  ws.settimeout(2)
 
-                      if message:
-                          received += 1
-                          print("SERVER_FRAME:", message)
+                  end_time = time.time() + 12
+                  received = 0
 
-                  except websocket.WebSocketTimeoutException:
-                      print("Waiting for server data...")
+                  while time.time() < end_time:
+                      try:
+                          frame = ws.recv()
 
-              print("TOTAL_FRAMES:", received)
+                          if frame:
+                              received += 1
+                              print("SERVER_RESPONSE:", frame)
 
-              if received == 0:
-                  print("WARNING: Connected, but no server frames received.")
-                  print("Subscription protocol is not yet verified.")
+                      except websocket.WebSocketTimeoutException:
+                          continue
 
-              ws.close()
-              print("CONNECTION_CLOSED")
-              print("PROBE_FINISHED")
+                  print("FRAME_COUNT:", received)
 
-          except Exception as error:
-              print("WEBSOCKET_ERROR:", repr(error))
-              raise
+                  if received == 0:
+                      print("NO_RESPONSE")
+
+              except Exception as error:
+                  print("PROBE_ERROR:", repr(error))
+
+              finally:
+                  if ws:
+                      ws.close()
+
+          print("\nALL_PROBES_FINISHED")
           PY
