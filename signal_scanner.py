@@ -1,7 +1,10 @@
 import json
+import requests
 from pathlib import Path
 
 DATA_FILE = Path("data/prices.jsonl")
+ORDERBOOK_URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketOrder"
+
 MIN_TURNOVER = 100000
 MAX_RESULTS = 10
 
@@ -20,7 +23,6 @@ def load_latest():
 
                 if symbol and symbol.endswith("USDT"):
                     latest[symbol] = item
-
             except (ValueError, TypeError):
                 continue
 
@@ -35,18 +37,13 @@ def number(value):
 
 
 def analyze(item):
-    symbol = item["symbol"]
-
     price = number(item.get("lastPrice"))
     opening = number(item.get("openPrice"))
     high = number(item.get("highestPrice"))
     low = number(item.get("lowestPrice"))
     turnover = number(item.get("turnover24h"))
 
-    if price is None or opening is None:
-        return None
-
-    if high is None or low is None or turnover is None:
+    if None in (price, opening, high, low, turnover):
         return None
 
     if opening <= 0 or high <= low or turnover < MIN_TURNOVER:
@@ -57,24 +54,63 @@ def analyze(item):
 
     if change > 1 and position > 65:
         direction = "LONG"
-        score = abs(change) + position / 20
-
     elif change < -1 and position < 35:
         direction = "SHORT"
-        score = abs(change) + (100 - position) / 20
-
     else:
         return None
 
     return {
-        "symbol": symbol,
+        "symbol": item["symbol"],
         "direction": direction,
         "price": price,
         "change": change,
         "position": position,
         "turnover": turnover,
-        "score": score
+        "score": abs(change) + abs(position - 50) / 20
     }
+
+
+def get_orderbook(symbol):
+    try:
+        response = requests.get(
+            ORDERBOOK_URL,
+            params={
+                "symbol": symbol,
+                "depth": 20
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        data = result.get("data", result)
+
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+
+        bid_volume = sum(
+            number(level.get("volume")) or 0
+            for level in bids
+        )
+
+        ask_volume = sum(
+            number(level.get("volume")) or 0
+            for level in asks
+        )
+
+        total = bid_volume + ask_volume
+
+        if total <= 0:
+            return None
+
+        return {
+            "bid_pressure": bid_volume / total * 100,
+            "ask_pressure": ask_volume / total * 100
+        }
+
+    except Exception as error:
+        print(f"Orderbook error {symbol}: {error}")
+        return None
 
 
 def main():
@@ -83,8 +119,7 @@ def main():
 
     for item in market.values():
         result = analyze(item)
-
-        if result is not None:
+        if result:
             opportunities.append(result)
 
     opportunities.sort(
@@ -92,39 +127,65 @@ def main():
         reverse=True
     )
 
-    selected = opportunities[:MAX_RESULTS]
-
     report = [
         "🤖 LBank Futures Scanner",
-        "🌐 بررسی تمام قراردادهای USDT",
-        f"تعداد بازارهای بررسی‌شده: {len(market)}",
-        f"تعداد فرصت‌های پیدا‌شده: {len(opportunities)}",
+        "🌐 بررسی قراردادهای USDT",
+        f"بازارهای بررسی‌شده: {len(market)}",
+        f"فرصت‌های اولیه: {len(opportunities)}",
         "━━━━━━━━━━━━━━━━"
     ]
 
+    selected = opportunities[:MAX_RESULTS]
+
     if not selected:
-        report.append("فرصت معاملاتی مناسبی پیدا نشد.")
+        report.append("فرصت مناسبی پیدا نشد.")
         report.append("وضعیت: ورود نکن")
 
     for index, item in enumerate(selected, 1):
-        report.extend([
-            f"#{index} {item['symbol']} | {item['direction']}",
-            f"قیمت: {item['price']:g}",
-            f"تغییر ۲۴ ساعته: {item['change']:.2f}%",
-            f"موقعیت در محدوده روزانه: {item['position']:.1f}%",
-            f"گردش مالی: {item['turnover']:,.0f}",
-            f"امتیاز اولیه: {item['score']:.2f}",
-            "━━━━━━━━━━━━━━━━"
-        ])
+        book = get_orderbook(item["symbol"])
+
+        report.append(
+            f"#{index} {item['symbol']} | {item['direction']}"
+        )
+        report.append(f"قیمت: {item['price']:g}")
+        report.append(f"تغییر ۲۴ ساعته: {item['change']:.2f}%")
+        report.append(f"گردش مالی: {item['turnover']:,.0f}")
+
+        if book:
+            report.append(
+                f"فشار خریدار: {book['bid_pressure']:.1f}%"
+            )
+            report.append(
+                f"فشار فروشنده: {book['ask_pressure']:.1f}%"
+            )
+
+            if item["direction"] == "LONG":
+                confirmation = (
+                    "تأیید اولیه خریداران"
+                    if book["bid_pressure"] > 55
+                    else "تأیید نشد"
+                )
+            else:
+                confirmation = (
+                    "تأیید اولیه فروشندگان"
+                    if book["ask_pressure"] > 55
+                    else "تأیید نشد"
+                )
+
+            report.append(f"وضعیت دفتر سفارش: {confirmation}")
+        else:
+            report.append("دفتر سفارش: داده دریافت نشد")
+
+        report.append("━━━━━━━━━━━━━━━━")
 
     report.extend([
-        "⚠️ امتیازها فقط برای رتبه‌بندی اولیه هستند.",
-        "⚠️ قبل از ورود، ساختار بازار و حد ضرر را بررسی کن.",
+        "⚠️ این بررسی سیگنال قطعی ورود نیست.",
+        "⚠️ RSI، MACD و EMA هنوز محاسبه نمی‌شوند.",
+        "⚠️ قبل از معامله حد ضرر تعیین کن.",
         "⚠️ از اهرم بالا استفاده نکن."
     ])
 
     text = "\n".join(report)
-
     Path("report.txt").write_text(text, encoding="utf-8")
     print(text)
 
