@@ -1,50 +1,59 @@
-import requests
-from datetime import datetime, timezone
+import json
+from pathlib import Path
 
-BASE_URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub"
-WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-PRODUCT_GROUP = "SwapU"
+DATA_FILE = Path("data/prices.jsonl")
+MIN_TURNOVER = 100000
+MAX_RESULTS = 10
 
-SESSION = requests.Session()
-def get_market_data():
-    url = f"{BASE_URL}/marketData"
-    response = SESSION.get(
-        url,
-        params={"productGroup": PRODUCT_GROUP},
-        timeout=20
-    )
-    response.raise_for_status()
 
-    result = response.json()
-    data = result.get("data", [])
+def load_latest():
+    latest = {}
 
-    if not isinstance(data, list):
-        raise Exception(f"Invalid market data: {result}")
+    if not DATA_FILE.exists():
+        return latest
 
-    return data
-def scan_market():
-    print("=" * 45)
-    print("LBANK USDT FUTURES SCANNER")
-    print(datetime.now(timezone.utc).isoformat())
+    with DATA_FILE.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+                symbol = item.get("symbol")
 
+                if symbol:
+                    latest[symbol] = item
+            except (ValueError, TypeError):
+                continue
+
+    return latest
+
+
+def num(value):
     try:
-        data = get_market_data()
-
-        for item in data:
-            symbol = str(item.get("symbol", "")).upper()
-
-            if symbol in WATCHLIST:
-                print("-" * 40)
-                print("Symbol:", symbol)
-                print("Price:", item.get("lastPrice"))
-                print("Volume:", item.get("volume"))
-                print("Turnover:", item.get("turnover"))
-
-    except Exception as error:
-        print("SCANNER ERROR:", error)
-
-    print("SCAN COMPLETED")
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-if __name__ == "__main__":
-    scan_market()
+def analyze(item):
+    symbol = item["symbol"]
+
+    price = num(item.get("lastPrice"))
+    opening = num(item.get("openPrice"))
+    high = num(item.get("highestPrice"))
+    low = num(item.get("lowestPrice"))
+    turnover = num(item.get("turnover24h"))
+
+    if not all([price, opening, high, low, turnover]):
+        return None
+
+    if turnover < MIN_TURNOVER or high <= low:
+        return None
+
+    change = (price - opening) / opening * 100
+    position = (price - low) / (high - low) * 100
+
+    if change > 1 and position > 65:
+        direction = "LONG"
+        score = abs(change) + position / 20
+    elif change < -1 and position < 35:
+        direction = "SHORT"
+        score
