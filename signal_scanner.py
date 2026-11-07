@@ -16,6 +16,7 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
+  REPORT_FILE        plain-text report output, default report.txt
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -666,4 +668,231 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     return {"symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
             "global_blockers": gb, "signal": signal,
             "liq": liquidity_map(D["15m"], price)}
-logging.INFO
+def fmt_price(p: float) -> str:
+    if p >= 1000:
+        return "%.2f" % p
+    if p >= 1:
+        return "%.4f" % p
+    if p >= 0.01:
+        return "%.5f" % p
+    return "%.8f" % p
+
+
+def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
+    t = sc["trade"]
+    long = sc["side"] == "LONG"
+    icon = "🟢" if long else "🔴"
+    lines = [
+        "%s <b>سیگنال %s — %s</b>" % (icon, sc["side"], html.escape(res["symbol"])),
+        "امتیاز: <b>%d/100</b>" % sc["score"],
+        "",
+        "ورود (%s): <code>%s</code>" % (t["order_type"], fmt_price(t["entry"])),
+        "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(t["sl"]), t["stop_pct"]),
+        "TP1: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp1"]), t["rr1"]),
+        "TP2: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp2"]), t["rr2"]),
+        "",
+        "ریسک پیشنهادی: %.2f%% سرمایه | حداکثر اهرم: %.0fx" % (RISK_PCT, MAX_LEVERAGE),
+        "اهرم مؤثر پیشنهادی: %.2fx" % t["notional_x"],
+    ]
+    if t["capped"]:
+        lines.append("⚠️ به‌دلیل سقف اهرم، ریسک مؤثر ≈ %.2f%% است" % t["eff_risk_pct"])
+    eq = _env_float("ACCOUNT_EQUITY", 0.0)
+    if eq > 0:
+        lines.append("حجم پوزیشن (تقریبی): %.2f USDT" % (eq * t["notional_x"]))
+    lines.append("")
+    lines.append("دلایل:")
+    for n in sc["notes"]:
+        lines.append("• " + html.escape(n))
+    lines.append("")
+    lines.append("قیمت فعلی: %s" % fmt_price(res["price"]))
+    lines.append("اگر قبل از فعال‌شدن ورود، حد ضرر لمس شود سیگنال باطل است.")
+    lines.append("⚠️ فقط تحلیل است؛ سفارشی به‌صورت خودکار ثبت نمی‌شود.")
+    return "\n".join(lines)
+
+
+def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
+                  sent_signals: int) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = ["📊 <b>گزارش اسکن</b> — %s" % now, ""]
+    for res in results:
+        sym = html.escape(res["symbol"])
+        D = res["D"]
+        lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+        lines.append("<b>%s</b> | قیمت: %s" % (sym, fmt_price(res["price"])))
+        lines.append("روند 4H/1H/15m: %s / %s / %s" % (
+            TREND_FA[D["4h"]["trend"]], TREND_FA[D["1h"]["trend"]], TREND_FA[D["15m"]["trend"]]))
+        lines.append("LONG: %d | SHORT: %d" % (lg["score"], sh["score"]))
+        sig = res["signal"]
+        if sig:
+            lines.append("✅ سیگنال %s صادر شد" % sig["side"])
+        else:
+            best = lg if lg["score"] >= sh["score"] else sh
+            if res["global_blockers"]:
+                reason = res["global_blockers"][0]
+            elif best["blockers"]:
+                reason = best["blockers"][0]
+            else:
+                reason = "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
+            lines.append("⛔ بدون سیگنال: %s" % html.escape(reason))
+            bt = best["trade"]
+            if bt:
+                lines.append("سناریوی %s (غیرفعال): ورود %s | SL %s | TP1 %s | TP2 %s" % (
+                    best["side"], fmt_price(bt["entry"]), fmt_price(bt["sl"]),
+                    fmt_price(bt["tp1"]), fmt_price(bt["tp2"])))
+        liq = res["liq"]
+        pool = []
+        if liq["bsl"] is not None:
+            pool.append("BSL%s %s" % ("(EQH)" if liq["bsl_eq"] else "", fmt_price(liq["bsl"])))
+        if liq["ssl"] is not None:
+            pool.append("SSL%s %s" % ("(EQL)" if liq["ssl_eq"] else "", fmt_price(liq["ssl"])))
+        if pool:
+            lines.append("نقدینگی نزدیک: " + " | ".join(pool))
+        lines.append("")
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
+    lines.append("تعداد سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
+    return "\n".join(lines)
+
+
+def split_message(text: str, limit: int = 3800) -> List[str]:
+    chunks: List[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = cur + "\n" + line if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def send_telegram(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat:
+        log.warning("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set; printing instead")
+        print(text)
+        return False
+    ok = True
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    for chunk in split_message(text):
+        try:
+            resp = http_json(url, body={"chat_id": chat, "text": chunk, "parse_mode": "HTML",
+                                        "disable_web_page_preview": True})
+            if not isinstance(resp, dict) or not resp.get("ok"):
+                log.error("telegram rejected message: %s", str(resp)[:200])
+                ok = False
+        except ScanError as e:
+            log.error("telegram send failed: %s", e)
+            ok = False
+    return ok
+
+
+def load_state() -> Dict[str, float]:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): float(v) for k, v in data.items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def save_state(state: Dict[str, float]) -> None:
+    try:
+        cutoff = time.time() - 7 * 86400
+        state = {k: v for k, v in state.items() if v > cutoff}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError as e:
+        log.warning("could not save state: %s", e)
+
+
+def to_plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def write_report_file(parts: List[str]) -> None:
+    path = os.getenv("REPORT_FILE", "report.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(parts).strip() + "\n")
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
+    ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
+    ap.add_argument("--min-score", type=float, default=MIN_SCORE)
+    ap.add_argument("--dry-run", action="store_true", help="print only, do not send to Telegram")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if not symbols:
+        log.error("no symbols given")
+        return 2
+
+    results: List[Dict[str, Any]] = []
+    errors: List[Tuple[str, str]] = []
+    for sym in symbols:
+        try:
+            results.append(analyze_symbol(sym, args.min_score))
+            log.info("%s scanned", sym)
+        except ScanError as e:
+            log.error("%s: %s", sym, e)
+            errors.append((sym, str(e)))
+        except Exception as e:
+            log.exception("%s: unexpected error", sym)
+            errors.append((sym, "unexpected error: %s" % e))
+
+    outbox: List[str] = []
+    base_send = (lambda t: print(t) or True) if args.dry_run else send_telegram
+
+    def send(t: str) -> bool:
+        outbox.append(to_plain(t))
+        return base_send(t)
+
+    if not results:
+        send("❗ <b>اسکن ناموفق بود</b>\n" + "\n".join(
+            "%s: %s" % (html.escape(s), html.escape(e[:150])) for s, e in errors))
+        write_report_file(outbox)
+        return 1
+
+    state = load_state()
+    sent = 0
+    for res in results:
+        sig = res["signal"]
+        if not sig:
+            continue
+        key = "%s:%s" % (res["symbol"], sig["side"])
+        if time.time() - state.get(key, 0.0) < COOLDOWN_H * 3600:
+            log.info("%s in cooldown, skipped", key)
+            res["signal"] = None
+            res["global_blockers"] = list(res["global_blockers"]) + ["سیگنال مشابه اخیراً ارسال شده (cooldown)"]
+            continue
+        if send(format_signal(res, sig)) or args.dry_run:
+            state[key] = time.time()
+            sent += 1
+    if not args.dry_run:
+        save_state(state)
+    send(format_report(results, errors, sent))
+    write_report_file(outbox)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
