@@ -4,28 +4,33 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketData"
-WATCHLIST = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 def main():
-    r = requests.get(URL, params={"productGroup": "SwapU"}, timeout=20)
-    r.raise_for_status()
+    response = requests.get(
+        URL,
+        params={"productGroup": "SwapU"},
+        timeout=30
+    )
+    response.raise_for_status()
 
-    data = r.json().get("data", [])
+    data = response.json().get("data", [])
+
     if not isinstance(data, list):
-        raise RuntimeError("Invalid API response")
+        raise RuntimeError("Invalid LBank response")
 
     Path("data").mkdir(exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
     saved = 0
 
     with open("data/prices.jsonl", "a", encoding="utf-8") as f:
         for item in data:
             symbol = str(item.get("symbol", "")).upper()
 
-            if symbol not in WATCHLIST:
+            if not symbol.endswith("USDT"):
                 continue
 
             record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": now,
                 "symbol": symbol,
                 "lastPrice": item.get("lastPrice"),
                 "markedPrice": item.get("markedPrice"),
@@ -34,18 +39,16 @@ def main():
                 "lowestPrice": item.get("lowestPrice"),
                 "volume24h": item.get("volume"),
                 "turnover24h": item.get("turnover"),
-                "fundingRate": item.get("prePositionFeeRate"),
-                "raw": item
+                "fundingRate": item.get("prePositionFeeRate")
             }
 
             f.write(json.dumps(record) + "\n")
-            print("LBank data:", json.dumps(item))
             saved += 1
 
-    print("Saved records:", saved)
+    print("Total USDT Futures saved:", saved)
 
     if saved == 0:
-        raise RuntimeError("No watched Futures symbols found")
+        raise RuntimeError("No USDT Futures symbols found")
 
 if __name__ == "__main__":
     main()
