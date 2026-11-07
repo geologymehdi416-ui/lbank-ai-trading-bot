@@ -1,26 +1,20 @@
 import json
 import requests
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 
 URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketData"
 WATCHLIST = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 def main():
-    response = requests.get(
-        URL,
-        params={"productGroup": "SwapU"},
-        timeout=20
-    )
-    response.raise_for_status()
+    r = requests.get(URL, params={"productGroup": "SwapU"}, timeout=20)
+    r.raise_for_status()
 
-    data = response.json().get("data", [])
-
+    data = r.json().get("data", [])
     if not isinstance(data, list):
-        raise RuntimeError("Invalid LBank response")
+        raise RuntimeError("Invalid API response")
 
     Path("data").mkdir(exist_ok=True)
-    now = datetime.now(timezone.utc).isoformat()
     saved = 0
 
     with open("data/prices.jsonl", "a", encoding="utf-8") as f:
@@ -31,7 +25,7 @@ def main():
                 continue
 
             record = {
-                "timestamp": now,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol,
                 "lastPrice": item.get("lastPrice"),
                 "markedPrice": item.get("markedPrice"),
@@ -40,12 +34,18 @@ def main():
                 "lowestPrice": item.get("lowestPrice"),
                 "volume24h": item.get("volume"),
                 "turnover24h": item.get("turnover"),
-                "fundingRate": item.get("prePositionFeeRate")
+                "fundingRate": item.get("prePositionFeeRate"),
+                "raw": item
             }
 
             f.write(json.dumps(record) + "\n")
-            print(record)
+            print("LBank data:", json.dumps(item))
             saved += 1
 
+    print("Saved records:", saved)
+
     if saved == 0:
-        raise Runtime
+        raise RuntimeError("No watched Futures symbols found")
+
+if __name__ == "__main__":
+    main()
