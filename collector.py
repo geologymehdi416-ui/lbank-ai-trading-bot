@@ -3,44 +3,49 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketData"
+URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketData"
 WATCHLIST = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
-response = requests.get(
-    BASE_URL,
-    params={"productGroup": "SwapU"},
-    timeout=20
-)
-response.raise_for_status()
+def main():
+    response = requests.get(
+        URL,
+        params={"productGroup": "SwapU"},
+        timeout=20
+    )
+    response.raise_for_status()
 
-data = response.json().get("data", [])
+    data = response.json().get("data", [])
 
-if not isinstance(data, list):
-    raise RuntimeError("Invalid API response")
+    if not isinstance(data, list):
+        raise RuntimeError("Invalid LBank response")
 
-now = datetime.now(timezone.utc).isoformat()
-Path("data").mkdir(exist_ok=True)
+    Path("data").mkdir(exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    saved = 0
 
-saved = 0
+    with open("data/prices.jsonl", "a", encoding="utf-8") as f:
+        for item in data:
+            symbol = str(item.get("symbol", "")).upper()
 
-with open("data/prices.jsonl", "a", encoding="utf-8") as output:
-    for item in data:
-        symbol = str(item.get("symbol", "")).upper()
+            if symbol not in WATCHLIST:
+                continue
 
-        if symbol in WATCHLIST:
             record = {
                 "timestamp": now,
                 "symbol": symbol,
                 "lastPrice": item.get("lastPrice"),
+                "markedPrice": item.get("markedPrice"),
+                "openPrice": item.get("openPrice"),
+                "highestPrice": item.get("highestPrice"),
+                "lowestPrice": item.get("lowestPrice"),
                 "volume24h": item.get("volume"),
-                "turnover24h": item.get("turnover")
+                "turnover24h": item.get("turnover"),
+                "fundingRate": item.get("prePositionFeeRate")
             }
 
-            output.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record) + "\n")
             print(record)
             saved += 1
 
-if saved == 0:
-    raise RuntimeError("No Futures symbols found")
-
-print("Saved records:", saved)
+    if saved == 0:
+        raise Runtime
