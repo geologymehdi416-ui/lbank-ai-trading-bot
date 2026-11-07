@@ -2,6 +2,7 @@
 
 import json
 import math
+import time
 import requests
 
 from pathlib import Path
@@ -11,18 +12,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
 
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+# Binance USDT-M Futures
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 MAX_SYMBOLS = 40
 MIN_TURNOVER = 100000
 PRICE_DIFF_LIMIT = 0.75
+MAX_SNAPSHOT_AGE_MINUTES = 20
+MAX_RETRIES = 3
 
 INTERVALS = {
-    "5m": "5",
-    "15m": "15",
-    "1h": "60",
-    "4h": "240"
+    "5m": "5m",
+    "15m": "15m",
+    "1h": "1h",
+    "4h": "4h"
 }
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "LBank-Futures-Monitor/3.0"
+})
 
 
 def number(value):
@@ -110,6 +119,9 @@ def macd(values):
     signal = ema(macd_values, 9)
     current = macd_values[-1]
 
+    if signal is None:
+        return None, None, None
+
     return current, signal, current - signal
 
 
@@ -148,8 +160,13 @@ def load_latest_lbank():
                 price = number(row.get("lastPrice"))
                 turnover = number(row.get("turnover24h"))
 
+                raw_timestamp = row.get("timestamp")
+
+                if not raw_timestamp:
+                    continue
+
                 timestamp = datetime.fromisoformat(
-                    row["timestamp"].replace("Z", "+00:00")
+                    str(raw_timestamp).replace("Z", "+00:00")
                 )
 
                 if timestamp.tzinfo is None:
@@ -157,7 +174,11 @@ def load_latest_lbank():
                         tzinfo=timezone.utc
                     )
 
-                if not symbol.endswith("USDT") or not price or price <= 0:
+                if (
+                    not symbol.endswith("USDT")
+                    or not price
+                    or price <= 0
+                ):
                     continue
 
                 old = latest.get(symbol)
@@ -168,7 +189,7 @@ def load_latest_lbank():
                     row["_turnover"] = turnover or 0
                     latest[symbol] = row
 
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 continue
 
     return latest
@@ -178,73 +199,78 @@ def get_candles(symbol, interval):
     if interval not in INTERVALS:
         raise ValueError(f"Unsupported interval: {interval}")
 
-    response = requests.get(
-        BYBIT_URL,
-        params={
-            "category": "linear",
-            "symbol": symbol,
-            "interval": INTERVALS[interval],
-            "limit": 250
-        },
-        timeout=20,
-        headers={
-            "User-Agent": "LBank-Futures-Monitor/2.2"
-        }
+    params = {
+        "symbol": symbol,
+        "interval": INTERVALS[interval],
+        "limit": 250
+    }
+
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = SESSION.get(
+                BINANCE_URL,
+                params=params,
+                timeout=20
+            )
+
+            response.raise_for_status()
+            raw = response.json()
+
+            if not isinstance(raw, list):
+                raise RuntimeError(
+                    f"Invalid Binance response: {str(raw)[:200]}"
+                )
+
+            now_ms = int(
+                datetime.now(timezone.utc).timestamp() * 1000
+            )
+
+            candles = []
+
+            for item in raw:
+                if not isinstance(item, list) or len(item) < 7:
+                    continue
+
+                start_ms = int(item[0])
+                close_time_ms = int(item[6])
+
+                # حذف کندل باز
+                if close_time_ms >= now_ms:
+                    continue
+
+                candles.append([
+                    start_ms,
+                    float(item[1]),
+                    float(item[2]),
+                    float(item[3]),
+                    float(item[4]),
+                    float(item[5]),
+                    close_time_ms
+                ])
+
+            candles.sort(key=lambda x: x[0])
+
+            if len(candles) < 205:
+                raise RuntimeError(
+                    f"Insufficient closed candles: {len(candles)}"
+                )
+
+            return candles
+
+        except Exception as error:
+            last_error = error
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(
+        f"Binance candle error for {symbol}: {last_error}"
     )
-
-    response.raise_for_status()
-    payload = response.json()
-
-    if not isinstance(payload, dict) or payload.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error: {payload}")
-
-    raw = payload.get("result", {}).get("list", [])
-
-    if not isinstance(raw, list):
-        raise RuntimeError("Invalid Bybit candle response")
-
-    interval_ms = int(INTERVALS[interval]) * 60 * 1000
-
-    now_ms = int(
-        datetime.now(timezone.utc).timestamp() * 1000
-    )
-
-    candles = []
-
-    # Bybit کندل‌ها را از جدید به قدیم برمی‌گرداند.
-    # ترتیب را معکوس می‌کنیم و کندل باز را حذف می‌کنیم.
-
-    for item in reversed(raw):
-
-        if not isinstance(item, list) or len(item) < 6:
-            continue
-
-        start_ms = int(item[0])
-        close_time_ms = start_ms + interval_ms
-
-        if close_time_ms > now_ms:
-            continue
-
-        candles.append([
-            start_ms,
-            float(item[1]),
-            float(item[2]),
-            float(item[3]),
-            float(item[4]),
-            float(item[5]),
-            close_time_ms
-        ])
-
-    if len(candles) < 205:
-        raise RuntimeError(
-            f"Insufficient closed candles: {len(candles)}"
-        )
-
-    return candles
 
 
 def timeframe_analysis(candles):
-
     closes = [c[4] for c in candles]
 
     e20 = ema(closes, 20)
@@ -252,9 +278,7 @@ def timeframe_analysis(candles):
     e200 = ema(closes, 200)
 
     current_rsi = rsi(closes)
-
     current_macd, signal, histogram = macd(closes)
-
     current_atr = atr(candles)
 
     volumes = [c[5] for c in candles]
@@ -268,6 +292,14 @@ def timeframe_analysis(candles):
 
     highs = [c[2] for c in candles[-48:]]
     lows = [c[3] for c in candles[-48:]]
+
+    values = [
+        e20, e50, e200, current_rsi,
+        current_macd, signal, histogram, current_atr
+    ]
+
+    if any(value is None for value in values):
+        raise RuntimeError("Indicator calculation failed")
 
     return {
         "price": closes[-1],
@@ -286,158 +318,144 @@ def timeframe_analysis(candles):
 
 
 def analyze_symbol(symbol, lbank):
+    data = {
+        tf: timeframe_analysis(get_candles(symbol, tf))
+        for tf in INTERVALS
+    }
 
-    try:
+    price = data["5m"]["price"]
+    lbank_price = lbank["_price"]
 
-        data = {
-            tf: timeframe_analysis(
-                get_candles(symbol, tf)
-            )
-            for tf in INTERVALS
-        }
+    difference = (
+        abs(price - lbank_price) / lbank_price * 100
+    )
 
-        price = data["5m"]["price"]
-        lbank_price = lbank["_price"]
-
-        difference = (
-            abs(price - lbank_price) / lbank_price * 100
+    if difference > PRICE_DIFF_LIMIT:
+        raise RuntimeError(
+            f"Price difference too high: {difference:.3f}%"
         )
 
-        if difference > PRICE_DIFF_LIMIT:
-            return None
+    m5 = data["5m"]
+    m15 = data["15m"]
+    h1 = data["1h"]
+    h4 = data["4h"]
 
-        m5 = data["5m"]
-        m15 = data["15m"]
-        h1 = data["1h"]
-        h4 = data["4h"]
+    # روند تایم‌فریم بالاتر
+    long_trend = (
+        h4["ema20"] > h4["ema50"] > h4["ema200"]
+        and h1["ema20"] > h1["ema50"]
+    )
 
-        # روند تایم‌فریم بالاتر
+    short_trend = (
+        h4["ema20"] < h4["ema50"] < h4["ema200"]
+        and h1["ema20"] < h1["ema50"]
+    )
 
-        long_trend = (
-            h4["ema20"] > h4["ema50"] > h4["ema200"]
-            and h1["ema20"] > h1["ema50"]
-        )
+    # تأیید لانگ
+    long_confirm = (
+        m15["ema20"] > m15["ema50"]
+        and m5["ema20"] > m5["ema50"]
+        and 50 <= m15["rsi"] <= 68
+        and 45 <= m5["rsi"] <= 70
+        and m5["histogram"] > 0
+        and m15["histogram"] > 0
+        and m5["volume_ratio"] >= 1.2
+    )
 
-        short_trend = (
-            h4["ema20"] < h4["ema50"] < h4["ema200"]
-            and h1["ema20"] < h1["ema50"]
-        )
+    # تأیید شورت
+    short_confirm = (
+        m15["ema20"] < m15["ema50"]
+        and m5["ema20"] < m5["ema50"]
+        and 32 <= m15["rsi"] <= 50
+        and 30 <= m5["rsi"] <= 55
+        and m5["histogram"] < 0
+        and m15["histogram"] < 0
+        and m5["volume_ratio"] >= 1.2
+    )
 
-        # تأیید لانگ
+    side = None
 
-        long_confirm = (
-            m15["ema20"] > m15["ema50"]
-            and m5["ema20"] > m5["ema50"]
-            and 50 <= m15["rsi"] <= 68
-            and 45 <= m5["rsi"] <= 70
-            and m5["histogram"] > 0
-            and m15["histogram"] > 0
-            and m5["volume_ratio"] >= 1.2
-        )
+    if long_trend and long_confirm:
+        side = "LONG"
+    elif short_trend and short_confirm:
+        side = "SHORT"
 
-        # تأیید شورت
-
-        short_confirm = (
-            m15["ema20"] < m15["ema50"]
-            and m5["ema20"] < m5["ema50"]
-            and 32 <= m15["rsi"] <= 50
-            and 30 <= m5["rsi"] <= 55
-            and m5["histogram"] < 0
-            and m15["histogram"] < 0
-            and m5["volume_ratio"] >= 1.2
-        )
-
-        side = None
-
-        if long_trend and long_confirm:
-            side = "LONG"
-
-        elif short_trend and short_confirm:
-            side = "SHORT"
-
-        if side is None:
-            return {
-                "symbol": symbol,
-                "side": None
-            }
-
-        current_atr = m5["atr"]
-
-        if not current_atr or current_atr <= 0:
-            return None
-
-        entry = price
-
-        if side == "LONG":
-
-            stop = min(
-                entry - 1.5 * current_atr,
-                m15["support"] - 0.2 * current_atr
-            )
-
-            risk = entry - stop
-
-            if risk <= 0 or m15["resistance"] <= entry:
-                return None
-
-            targets = [
-                entry + risk,
-                entry + 2 * risk,
-                entry + 3 * risk
-            ]
-
-            if m15["resistance"] < targets[0]:
-                return None
-
-        else:
-
-            stop = max(
-                entry + 1.5 * current_atr,
-                m15["resistance"] + 0.2 * current_atr
-            )
-
-            risk = stop - entry
-
-            if risk <= 0 or m15["support"] >= entry:
-                return None
-
-            targets = [
-                entry - risk,
-                entry - 2 * risk,
-                entry - 3 * risk
-            ]
-
-            if m15["support"] > targets[0]:
-                return None
-
-        risk_percent = risk / entry * 100
-
-        if risk_percent < 0.15 or risk_percent > 3:
-            return None
-
+    if side is None:
         return {
             "symbol": symbol,
-            "price": price,
-            "side": side,
-            "entry": entry,
-            "stop": stop,
-            "targets": targets,
-            "risk_percent": risk_percent,
-            "rsi": m5["rsi"],
-            "volume_ratio": m5["volume_ratio"],
-            "support": m15["support"],
-            "resistance": m15["resistance"],
-            "difference": difference,
-            "turnover": lbank["_turnover"]
+            "side": None
         }
 
-    except Exception as error:
-        print(f"{symbol}: {error}")
-        raise
+    current_atr = m5["atr"]
+
+    if not current_atr or current_atr <= 0:
+        raise RuntimeError("Invalid ATR")
+
+    entry = price
+
+    if side == "LONG":
+        stop = min(
+            entry - 1.5 * current_atr,
+            m15["support"] - 0.2 * current_atr
+        )
+
+        risk = entry - stop
+
+        if risk <= 0 or m15["resistance"] <= entry:
+            raise RuntimeError("Invalid long structure")
+
+        targets = [
+            entry + risk,
+            entry + 2 * risk,
+            entry + 3 * risk
+        ]
+
+        if m15["resistance"] < targets[0]:
+            raise RuntimeError("Insufficient resistance clearance")
+
+    else:
+        stop = max(
+            entry + 1.5 * current_atr,
+            m15["resistance"] + 0.2 * current_atr
+        )
+
+        risk = stop - entry
+
+        if risk <= 0 or m15["support"] >= entry:
+            raise RuntimeError("Invalid short structure")
+
+        targets = [
+            entry - risk,
+            entry - 2 * risk,
+            entry - 3 * risk
+        ]
+
+        if m15["support"] > targets[0]:
+            raise RuntimeError("Insufficient support clearance")
+
+    risk_percent = risk / entry * 100
+
+    if risk_percent < 0.15 or risk_percent > 3:
+        raise RuntimeError("Risk outside permitted range")
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "side": side,
+        "entry": entry,
+        "stop": stop,
+        "targets": targets,
+        "risk_percent": risk_percent,
+        "rsi": m5["rsi"],
+        "volume_ratio": m5["volume_ratio"],
+        "support": m15["support"],
+        "resistance": m15["resistance"],
+        "difference": difference,
+        "turnover": lbank["_turnover"]
+    }
 
 
 def fmt(value):
-
     if value is None:
         return "ناموجود"
 
@@ -453,14 +471,23 @@ def fmt(value):
 
 
 def main():
-
     lbank_markets = load_latest_lbank()
 
-    candidates = [
-        (symbol, row)
-        for symbol, row in lbank_markets.items()
-        if row["_turnover"] >= MIN_TURNOVER
-    ]
+    now = datetime.now(timezone.utc)
+
+    candidates = []
+
+    stale_count = 0
+
+    for symbol, row in lbank_markets.items():
+        age = (now - row["_time"]).total_seconds() / 60
+
+        if age > MAX_SNAPSHOT_AGE_MINUTES:
+            stale_count += 1
+            continue
+
+        if row["_turnover"] >= MIN_TURNOVER:
+            candidates.append((symbol, row))
 
     candidates.sort(
         key=lambda x: x[1]["_turnover"],
@@ -473,14 +500,12 @@ def main():
     failures = []
 
     with ThreadPoolExecutor(max_workers=6) as executor:
-
         futures = {
             executor.submit(analyze_symbol, symbol, row): symbol
             for symbol, row in candidates
         }
 
         for future in as_completed(futures):
-
             symbol = futures[future]
 
             try:
@@ -497,27 +522,26 @@ def main():
         if item.get("side")
     ]
 
-    successful = len(results)
+    successful = len(results) + len(failures)
 
     lines = [
         "📊 LBank USDT Futures Smart Scanner",
-        "منبع کندل: Bybit USDT Linear Futures",
-        f"زمان: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "منبع کندل: Binance USDT-M Futures",
+        f"زمان: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         f"بازارهای LBank: {len(lbank_markets)}",
+        f"بازارهای قدیمی حذف‌شده: {stale_count}",
         f"بازارهای بررسی‌شده: {len(candidates)}",
-        f"تحلیل‌های موفق: {successful}",
+        f"تحلیل‌های موفق: {len(results)}",
         f"خطاهای دریافت/تحلیل: {len(failures)}",
         ""
     ]
 
     if signals:
-
         lines.append(
             f"✅ ستاپ‌های واجد شرایط: {len(signals)}"
         )
 
         for item in signals[:5]:
-
             side = (
                 "لانگ"
                 if item["side"] == "LONG"
@@ -540,23 +564,20 @@ def main():
                 f"اختلاف قیمت دو صرافی: {item['difference']:.3f}%"
             ])
 
-    elif failures and successful == 0:
-
+    elif failures and not results:
         lines.extend([
-            "⚠️ تحلیل بازار انجام نشد؛ خطای دریافت داده وجود دارد.",
+            "⚠️ تحلیل بازار کامل نشد؛ خطای دریافت داده وجود دارد.",
             "این وضعیت به معنی نبود ستاپ معاملاتی نیست.",
             "ورود نکن تا منبع داده تأیید شود."
         ])
 
     else:
-
         lines.extend([
-            "⛔ در بازارهای تحلیل‌شده ستاپ معتبری پیدا نشد.",
+            "⛔ ستاپ معتبری پیدا نشد.",
             "ورود نکن؛ منتظر تأیید بمان."
         ])
 
     if failures:
-
         sample_errors = {}
 
         for _, message in failures:
@@ -569,15 +590,13 @@ def main():
         ])
 
         for message, count in list(sample_errors.items())[:3]:
-            lines.append(
-                f"- {count} مورد: {message}"
-            )
+            lines.append(f"- {count} مورد: {message}")
 
     lines.extend([
         "",
-        "⚠️ کندل‌ها از Bybit Futures هستند، نه LBank.",
-        "⚠️ قیمت بازار و اطلاعات قرارداد از LBank دریافت می‌شود.",
-        "⚠️ دفتر سفارش و Funding Rate هنوز بررسی نمی‌شوند.",
+        "⚠️ کندل‌ها از Binance Futures هستند، نه LBank.",
+        "⚠️ قیمت LBank با Binance مقایسه می‌شود.",
+        "⚠️ دفتر سفارش و Funding Rate بررسی نمی‌شوند.",
         "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
         "این ربات سفارش ثبت نمی‌کند."
     ])
