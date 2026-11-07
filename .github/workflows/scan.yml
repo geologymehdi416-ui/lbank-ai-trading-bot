@@ -90,7 +90,7 @@ jobs:
       - name: Install WebSocket dependency
         run: pip install websocket-client
 
-      - name: Probe Futures subscription protocol
+      - name: Test Futures symbol formats
         run: |
           python - <<'PY'
           import json
@@ -99,39 +99,14 @@ jobs:
 
           URL = "wss://lbkperpws.lbank.com/ws"
 
-          probes = [
-              {
-                  "name": "KLINE_REQUEST",
-                  "payload": {
-                      "action": "request",
-                      "request": "kbar",
-                      "kbar": "5min",
-                      "pair": "BTCUSDT",
-                      "size": "2"
-                  }
-              },
-              {
-                  "name": "KLINE_SUBSCRIBE",
-                  "payload": {
-                      "action": "subscribe",
-                      "subscribe": "kbar",
-                      "kbar": "5min",
-                      "pair": "BTCUSDT"
-                  }
-              },
-              {
-                  "name": "TRADE_SUBSCRIBE",
-                  "payload": {
-                      "action": "subscribe",
-                      "subscribe": "trade",
-                      "pair": "BTCUSDT"
-                  }
-              }
+          pairs = [
+              "BTCUSDT",
+              "BTC_USDT"
           ]
 
-          for probe in probes:
+          for pair in pairs:
               print("\n================================")
-              print("TEST:", probe["name"])
+              print("TEST PAIR:", pair)
               print("================================")
 
               ws = None
@@ -145,7 +120,15 @@ jobs:
 
                   print("HANDSHAKE_OK")
 
-                  message = json.dumps(probe["payload"])
+                  payload = {
+                      "action": "subscribe",
+                      "subscribe": "kbar",
+                      "kbar": "5min",
+                      "pair": pair
+                  }
+
+                  message = json.dumps(payload)
+
                   print("SEND:", message)
 
                   ws.send(message)
@@ -177,5 +160,5 @@ jobs:
                   if ws:
                       ws.close()
 
-          print("\nALL_PROBES_FINISHED")
+          print("\nALL_TESTS_FINISHED")
           PY
