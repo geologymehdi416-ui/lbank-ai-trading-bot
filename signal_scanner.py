@@ -1,22 +1,16 @@
 import json
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
-
 ORDERBOOK_URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/marketOrder"
 
-TIMEFRAMES = {
-    "15m": (15, 0.05, 20),
-    "1h": (60, 0.10, 30),
-    "4h": (240, 0.20, 30),
-}
-
-MIN_SCORE = 70
+MAX_LATEST_AGE_MINUTES = 12
+MAX_REFERENCE_LAG_MINUTES = 12
 MIN_TURNOVER = 100000
-MAX_CANDIDATES = 100
+DISPLAY_COUNT = 10
 
 
 def number(value):
@@ -26,145 +20,115 @@ def number(value):
         return 0.0
 
 
+def parse_time(value):
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def load_history():
     history = {}
 
     if not DATA_FILE.exists():
         return history
 
-    with open(DATA_FILE, "r", encoding="utf-8") as file:
+    with DATA_FILE.open("r", encoding="utf-8") as file:
         for line in file:
             try:
                 item = json.loads(line)
-                symbol = item.get("symbol")
+                symbol = str(item.get("symbol", "")).upper()
 
-                if symbol:
+                if symbol.endswith("USDT") and parse_time(item.get("timestamp")):
                     history.setdefault(symbol, []).append(item)
 
             except Exception:
                 continue
 
-    for symbol in history:
-        history[symbol].sort(
-            key=lambda x: x.get("timestamp", "")
-        )
+    for records in history.values():
+        records.sort(key=lambda x: parse_time(x["timestamp"]))
 
     return history
 
 
-def timeframe_score(records, minutes, threshold, weight, direction):
-    if not records:
-        return 0, None
-
-    latest = records[-1]
-
-    try:
-        latest_time = datetime.fromisoformat(
-            latest["timestamp"].replace("Z", "+00:00")
-        )
-    except Exception:
-        return 0, None
-
-    target_time = latest_time.timestamp() - minutes * 60
-    old = None
+def timeframe_change(records, minutes, latest_time):
+    target = latest_time.timestamp() - minutes * 60
+    reference = None
+    reference_time = None
 
     for item in records:
-        try:
-            item_time = datetime.fromisoformat(
-                item["timestamp"].replace("Z", "+00:00")
-            ).timestamp()
+        ts = parse_time(item.get("timestamp"))
 
-            if item_time <= target_time:
-                old = item
+        if ts and ts.timestamp() <= target:
+            reference = item
+            reference_time = ts
 
-        except Exception:
-            continue
+    if reference is None:
+        return None
 
-    if old is None:
-        return 0, None
+    lag = (latest_time - reference_time).total_seconds() / 60 - minutes
 
-    old_price = number(old.get("lastPrice"))
-    new_price = number(latest.get("lastPrice"))
+    if lag > MAX_REFERENCE_LAG_MINUTES:
+        return None
 
-    if old_price <= 0 or new_price <= 0:
-        return 0, None
+    old_price = number(reference.get("lastPrice"))
+    current_price = number(records[-1].get("lastPrice"))
 
-    change = (new_price - old_price) / old_price * 100
+    if old_price <= 0 or current_price <= 0:
+        return None
 
-    directional_change = change * direction
-
-    ratio = max(
-        0,
-        min(1, directional_change / threshold)
-    )
-
-    score = weight * ratio
-
-    return score, change
+    return (current_price / old_price - 1) * 100
 
 
-def orderbook_score(symbol, direction):
+def orderbook_imbalance(symbol):
     try:
         response = requests.get(
             ORDERBOOK_URL,
-            params={
-                "symbol": symbol,
-                "depth": 20
-            },
-            timeout=15
+            params={"symbol": symbol, "depth": 20},
+            timeout=12
         )
 
         response.raise_for_status()
+        data = response.json().get("data") or {}
 
-        result = response.json()
-        data = result.get("data", {})
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
 
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
+        bid_volume = sum(number(x.get("volume")) for x in bids)
+        ask_volume = sum(number(x.get("volume")) for x in asks)
 
-        bid_volume = sum(
-            number(item.get("volume"))
-            for item in bids
-        )
+        total = bid_volume + ask_volume
 
-        ask_volume = sum(
-            number(item.get("volume"))
-            for item in asks
-        )
+        if total <= 0:
+            return None
 
-        total_volume = bid_volume + ask_volume
-
-        if total_volume <= 0:
-            return 0, 50
-
-        bid_percent = bid_volume / total_volume * 100
-
-        if direction == 1:
-            pressure = bid_percent
-        else:
-            pressure = 100 - bid_percent
-
-        score = max(
-            0,
-            min(20, (pressure - 45) / 20 * 20)
-        )
-
-        return score, pressure
+        return (bid_volume - ask_volume) / total * 100
 
     except Exception:
-        return 0, None
+        return None
 
 
 def main():
-    report = []
+    report = [
+        "🤖 LBank USDT Futures Market Monitor",
+        "⚠️ این گزارش سیگنال ورود نیست.",
+        "━━━━━━━━━━━━━━━━"
+    ]
 
     try:
         history = load_history()
 
         if not history:
-            raise RuntimeError("No price history available")
+            raise RuntimeError("تاریخچه قیمت موجود نیست.")
 
-        candidates = []
+        now = datetime.now(timezone.utc)
+
+        monitored = []
+        stale_count = 0
+        insufficient_count = 0
 
         for symbol, records in history.items():
 
@@ -172,210 +136,146 @@ def main():
                 continue
 
             latest = records[-1]
+            latest_time = parse_time(latest.get("timestamp"))
+
+            if not latest_time:
+                continue
+
+            age = (now - latest_time).total_seconds() / 60
+
+            if age < -2 or age > MAX_LATEST_AGE_MINUTES:
+                stale_count += 1
+                continue
 
             price = number(latest.get("lastPrice"))
-            open_price = number(latest.get("openPrice"))
+            turnover = number(latest.get("turnover24h"))
             high = number(latest.get("highestPrice"))
             low = number(latest.get("lowestPrice"))
-            turnover = number(latest.get("turnover24h"))
+            open_price = number(latest.get("openPrice"))
 
-            if price <= 0 or open_price <= 0:
+            if price <= 0 or turnover < MIN_TURNOVER:
                 continue
 
-            if turnover < MIN_TURNOVER:
+            if high <= low or open_price <= 0:
                 continue
 
-            if high <= low:
+            changes = {
+                "15m": timeframe_change(records, 15, latest_time),
+                "1h": timeframe_change(records, 60, latest_time),
+                "4h": timeframe_change(records, 240, latest_time)
+            }
+
+            if any(value is None for value in changes.values()):
+                insufficient_count += 1
                 continue
 
-            change_24h = (
-                (price - open_price) / open_price
-            ) * 100
+            change24 = (price / open_price - 1) * 100
+            range_position = (price - low) / (high - low) * 100
 
-            if abs(change_24h) > 15:
-                continue
+            values = list(changes.values())
 
-            range_position = (
-                (price - low) / (high - low)
-            ) * 100
-
-            if change_24h >= 1 and range_position >= 50:
-                direction = 1
-
-            elif change_24h <= -1 and range_position <= 50:
-                direction = -1
-
+            if all(x > 0 for x in values):
+                bias = "مومنتوم مثبت 🟢"
+            elif all(x < 0 for x in values):
+                bias = "مومنتوم منفی 🔴"
             else:
-                continue
+                bias = "مومنتوم ترکیبی 🟡"
 
-            candidates.append({
+            monitored.append({
                 "symbol": symbol,
-                "records": records,
-                "direction": direction,
-                "change24h": change_24h,
-                "range_position": range_position
+                "price": price,
+                "turnover": turnover,
+                "age": age,
+                "change24": change24,
+                "range": range_position,
+                "changes": changes,
+                "bias": bias
             })
 
-        candidates.sort(
-            key=lambda x: abs(x["change24h"]),
+        monitored.sort(
+            key=lambda x: (
+                abs(x["changes"]["4h"]) +
+                abs(x["changes"]["1h"]) +
+                abs(x["changes"]["15m"])
+            ),
             reverse=True
         )
 
-        ranked = []
+        report.extend([
+            f"بازارهای دارای سابقه: {len(history)}",
+            f"نمادهای دارای داده کامل: {len(monitored)}",
+            f"نمادهای دارای داده قدیمی: {stale_count}",
+            f"نمادهای با سابقه ناکافی: {insufficient_count}",
+            "━━━━━━━━━━━━━━━━"
+        ])
 
-        for candidate in candidates[:MAX_CANDIDATES]:
+        if not monitored:
 
-            total_score = 0
-            details = {}
-
-            for name, settings in TIMEFRAMES.items():
-
-                minutes, threshold, weight = settings
-
-                score, change = timeframe_score(
-                    candidate["records"],
-                    minutes,
-                    threshold,
-                    weight,
-                    candidate["direction"]
-                )
-
-                total_score += score
-
-                details[name] = {
-                    "score": score,
-                    "change": change
-                }
-
-            book_score, pressure = orderbook_score(
-                candidate["symbol"],
-                candidate["direction"]
-            )
-
-            total_score += book_score
-
-            ranked.append({
-                **candidate,
-                "score": round(total_score, 1),
-                "details": details,
-                "book_score": round(book_score, 1),
-                "pressure": pressure
-            })
-
-        ranked.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        qualified = [
-            item for item in ranked
-            if item["score"] >= MIN_SCORE
-        ]
-
-        report.append("🤖 LBank Futures Scanner")
-        report.append("📊 سیستم امتیازدهی چندبازه‌ای")
-        report.append(f"بازارهای دارای سابقه: {len(history)}")
-        report.append(f"فرصت‌های اولیه: {len(candidates)}")
-        report.append(f"نمادهای امتیازدهی‌شده: {len(ranked)}")
-        report.append(f"فرصت‌های با امتیاز حداقل ۷۰: {len(qualified)}")
-        report.append("━━━━━━━━━━━━━━━━")
-
-        if qualified:
-
-            report.append("🏆 فرصت‌های تأییدشده از نظر امتیاز:")
-
-            display_list = qualified[:5]
+            report.append("نمادی با داده کافی پیدا نشد.")
+            report.append("وضعیت: ورود نکن")
 
         else:
 
-            report.append("⚠️ هیچ نمادی به امتیاز ۷۰ نرسید.")
-            report.append("📊 پنج نماد برتر برای بررسی:")
-            report.append("این نمادها سیگنال ورود نیستند.")
+            report.append("📊 فهرست پایش بازار:")
 
-            display_list = ranked[:5]
+            for item in monitored[:DISPLAY_COUNT]:
 
-        for item in display_list:
+                report.extend([
+                    "",
+                    f"{item['symbol']} | {item['bias']}",
+                    f"قیمت: {item['price']:.8g} USDT",
+                    f"۱۵ دقیقه: {item['changes']['15m']:+.3f}%",
+                    f"۱ ساعت: {item['changes']['1h']:+.3f}%",
+                    f"۴ ساعت: {item['changes']['4h']:+.3f}%",
+                    f"تغییر ۲۴ ساعت: {item['change24']:+.2f}%",
+                    f"موقعیت بازه روزانه: {item['range']:.1f}%",
+                    f"گردش ۲۴ ساعته: {item['turnover']:.0f}",
+                    f"تازگی داده: {item['age']:.1f} دقیقه"
+                ])
 
-            direction = (
-                "LONG 🟢"
-                if item["direction"] == 1
-                else "SHORT 🔴"
-            )
+            report.extend([
+                "",
+                "📚 عدم تعادل دفتر سفارش:"
+            ])
 
-            report.append("")
-            report.append(
-                f"{item['symbol']} | {direction}"
-            )
+            for item in monitored[:5]:
 
-            report.append(
-                f"⭐ امتیاز کل: {item['score']}/100"
-            )
+                imbalance = orderbook_imbalance(item["symbol"])
 
-            report.append(
-                f"تغییر ۲۴ ساعته: {item['change24h']:.2f}%"
-            )
-
-            pressure_text = (
-                "نامشخص"
-                if item["pressure"] is None
-                else f"{item['pressure']:.1f}%"
-            )
-
-            report.append(
-                f"فشار سفارش‌ها: {pressure_text}"
-            )
-
-            for tf, detail in item["details"].items():
-
-                change = detail["change"]
-
-                if change is None:
-                    change_text = "داده ناکافی"
-                else:
-                    change_text = f"{change:.3f}%"
-
-                report.append(
-                    f"{tf}: امتیاز {detail['score']:.1f} "
-                    f"| تغییر {change_text}"
+                text = (
+                    "نامشخص"
+                    if imbalance is None
+                    else f"{imbalance:+.1f}%"
                 )
 
-            report.append(
-                f"امتیاز دفتر سفارش: {item['book_score']:.1f}/20"
-            )
+                report.append(f"{item['symbol']}: {text}")
 
-        if not qualified:
             report.append("")
             report.append("وضعیت معاملاتی: ورود نکن")
 
-        report.append("")
-        report.append("━━━━━━━━━━━━━━━━")
-        report.append(
-            "⚠️ امتیازها رتبه‌بندی الگوریتمی هستند، نه احتمال موفقیت."
-        )
-        report.append(
-            "⚠️ روندها از سوابق قیمت پنج‌دقیقه‌ای محاسبه می‌شوند، نه کندل واقعی."
-        )
-        report.append(
-            "⚠️ RSI، MACD و EMA در این نسخه محاسبه نمی‌شوند."
-        )
-        report.append(
-            "⚠️ قبل از ورود، ساختار بازار و حد ضرر را بررسی کن."
-        )
-        report.append(
-            "⚠️ از اهرم بالا استفاده نکن."
-        )
+        report.extend([
+            "",
+            "━━━━━━━━━━━━━━━━",
+            "⚠️ اطلاعات زمانی از Snapshot پنج‌دقیقه‌ای ساخته شده‌اند.",
+            "⚠️ این داده‌ها کندل رسمی فیوچرز نیستند.",
+            "⚠️ RSI، MACD و EMA تا زمان دریافت کندل واقعی محاسبه نمی‌شوند.",
+            "⚠️ عدم تعادل سفارش‌ها به‌تنهایی سیگنال ورود نیست.",
+            "⚠️ قبل از معامله، ساختار بازار و حد ضرر را بررسی کن.",
+            "⚠️ اهرم بالا ریسک لیکویید شدن را افزایش می‌دهد."
+        ])
 
     except Exception as error:
 
-        report.append("❌ خطا در اسکن بازار")
-        report.append(str(error))
+        report.extend([
+            "❌ خطا در اسکن بازار",
+            str(error),
+            "وضعیت معاملاتی: ورود نکن"
+        ])
 
-    finally:
-
-        REPORT_FILE.write_text(
-            "\n".join(report),
-            encoding="utf-8"
-        )
+    REPORT_FILE.write_text(
+        "\n".join(report),
+        encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":
