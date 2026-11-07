@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
-# LBank USDT Futures Smart Scanner
-# Monitoring only — no automatic order execution.
 
 import json
 import math
-from collections import defaultdict
-from datetime import datetime, timezone
+import requests
+
 from pathlib import Path
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
 
-MIN_RECORDS = 60
-HISTORY_LIMIT = 300
-LEVEL_WINDOW = 48
-MAX_SYMBOLS = 10
+BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+
+MAX_SYMBOLS = 40
+MIN_TURNOVER = 100000
+PRICE_DIFF_LIMIT = 0.75
 
 
-def to_float(value):
+def number(value):
     try:
-        result = float(value)
-        return result if math.isfinite(result) else None
+        x = float(value)
+        return x if math.isfinite(x) else None
     except (TypeError, ValueError):
         return None
 
 
-def ema_series(values, period):
+def ema(values, period):
     if len(values) < period:
-        return []
+        return None
 
-    alpha = 2 / (period + 1)
     current = sum(values[:period]) / period
-
-    result = [None] * (period - 1) + [current]
+    alpha = 2 / (period + 1)
 
     for value in values[period:]:
         current = alpha * value + (1 - alpha) * current
-        result.append(current)
 
-    return result
+    return current
 
 
-def rsi_wilder(values, period=14):
+def rsi(values, period=14):
     if len(values) <= period:
         return None
 
@@ -66,459 +64,459 @@ def rsi_wilder(values, period=14):
         ) / period
 
     if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
+        return 100 if avg_gain > 0 else 50
 
-    if avg_gain == 0:
-        return 0.0
-
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+    return 100 - 100 / (1 + avg_gain / avg_loss)
 
 
-def calculate_macd(values):
-    fast = ema_series(values, 12)
-    slow = ema_series(values, 26)
-
-    if not fast or not slow:
+def macd(values):
+    if len(values) < 50:
         return None, None, None
 
-    macd_line = []
+    fast = []
+    slow = []
 
-    for f, s in zip(fast, slow):
-        if f is None or s is None:
-            macd_line.append(None)
+    alpha_fast = 2 / 13
+    alpha_slow = 2 / 27
+
+    f = sum(values[:12]) / 12
+    s = sum(values[:26]) / 26
+
+    fast = [None] * 11
+    slow = [None] * 25
+
+    for i in range(12, len(values)):
+        f = alpha_fast * values[i] + (1 - alpha_fast) * f
+        fast.append(f)
+
+    for i in range(26, len(values)):
+        s = alpha_slow * values[i] + (1 - alpha_slow) * s
+        slow.append(s)
+
+    line = []
+
+    for i in range(len(values)):
+        if fast[i] is None or slow[i] is None:
+            line.append(None)
         else:
-            macd_line.append(f - s)
+            line.append(fast[i] - slow[i])
 
-    valid = [x for x in macd_line if x is not None]
+    valid = [x for x in line if x is not None]
 
-    signal_series = ema_series(valid, 9)
-
-    if not signal_series:
+    if len(valid) < 9:
         return None, None, None
 
-    macd = valid[-1]
-    signal = signal_series[-1]
-    histogram = macd - signal
+    signal = ema(valid, 9)
+    current = valid[-1]
 
-    return macd, signal, histogram
+    return current, signal, current - signal
 
 
-def load_history():
-    history = defaultdict(list)
+def atr(candles, period=14):
+    if len(candles) <= period:
+        return None
 
+    ranges = []
+
+    for i in range(1, len(candles)):
+        high = candles[i][2]
+        low = candles[i][3]
+        previous_close = candles[i - 1][4]
+
+        ranges.append(max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close)
+        ))
+
+    return sum(ranges[-period:]) / period
+
+
+def load_latest_lbank():
     if not DATA_FILE.exists():
-        raise RuntimeError("Price history file not found")
+        raise RuntimeError("LBank price history not found")
+
+    latest = {}
 
     with DATA_FILE.open("r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, 1):
-
+        for line in file:
             try:
                 row = json.loads(line)
 
-                symbol = str(
-                    row.get("symbol", "")
-                ).upper()
-
-                price = to_float(row.get("lastPrice"))
-
-                if not symbol.endswith("USDT"):
-                    continue
-
-                if price is None or price <= 0:
-                    continue
+                symbol = str(row.get("symbol", "")).upper()
+                price = number(row.get("lastPrice"))
+                turnover = number(row.get("turnover24h"))
 
                 timestamp = datetime.fromisoformat(
-                    str(row["timestamp"]).replace(
-                        "Z", "+00:00"
-                    )
+                    row["timestamp"].replace("Z", "+00:00")
                 )
 
                 if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(
-                        tzinfo=timezone.utc
-                    )
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-                row["_price"] = price
-                row["_time"] = timestamp
+                if not symbol.endswith("USDT") or not price or price <= 0:
+                    continue
 
-                history[symbol].append(row)
+                old = latest.get(symbol)
 
-            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                print(
-                    f"Invalid record skipped: {line_number}"
-                )
+                if old is None or timestamp > old["_time"]:
+                    row["_time"] = timestamp
+                    row["_price"] = price
+                    row["_turnover"] = turnover or 0
+                    latest[symbol] = row
 
-    result = {}
+            except Exception:
+                continue
 
-    for symbol, rows in history.items():
-
-        unique = {
-            row["_time"].isoformat(): row
-            for row in rows
-        }
-
-        ordered = sorted(
-            unique.values(),
-            key=lambda x: x["_time"]
-        )
-
-        result[symbol] = ordered[-HISTORY_LIMIT:]
-
-    return result
+    return latest
 
 
-def analyze_symbol(symbol, rows):
+def get_candles(symbol, interval):
+    response = requests.get(
+        BINANCE_URL,
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "limit": 250
+        },
+        timeout=15
+    )
 
-    if len(rows) < MIN_RECORDS:
-        return None
+    response.raise_for_status()
+    raw = response.json()
 
-    prices = [
-        row["_price"]
-        for row in rows
+    if not isinstance(raw, list) or len(raw) < 205:
+        raise RuntimeError("Insufficient candle history")
+
+    candles = []
+
+    for item in raw:
+        candles.append([
+            int(item[0]),
+            float(item[1]),
+            float(item[2]),
+            float(item[3]),
+            float(item[4]),
+            float(item[5]),
+            int(item[6])
+        ])
+
+    # آخرین کندل ممکن است هنوز باز باشد؛ حذفش می‌کنیم.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    candles = [
+        candle for candle in candles
+        if candle[6] <= now_ms
     ]
 
-    price = prices[-1]
-    latest = rows[-1]
+    if len(candles) < 205:
+        raise RuntimeError("Not enough closed candles")
 
-    ema20_series = ema_series(prices, 20)
-    ema50_series = ema_series(prices, 50)
-    ema200_series = ema_series(prices, 200)
+    return candles[:-1]
 
-    if not ema20_series or not ema50_series:
-        return None
 
-    ema20 = ema20_series[-1]
-    ema50 = ema50_series[-1]
+def timeframe_analysis(candles):
+    closes = [c[4] for c in candles]
 
-    ema200 = (
-        ema200_series[-1]
-        if ema200_series else None
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    e200 = ema(closes, 200)
+
+    current_rsi = rsi(closes)
+    current_macd, signal, histogram = macd(closes)
+    current_atr = atr(candles)
+
+    volumes = [c[5] for c in candles]
+
+    average_volume = sum(volumes[-21:-1]) / 20
+    current_volume = volumes[-1]
+
+    volume_ratio = (
+        current_volume / average_volume
+        if average_volume > 0 else 0
     )
 
-    rsi = rsi_wilder(prices)
+    highs = [c[2] for c in candles[-48:]]
+    lows = [c[3] for c in candles[-48:]]
 
-    macd, macd_signal, macd_hist = calculate_macd(
-        prices
-    )
-
-    if any(
-        value is None
-        for value in (
-            rsi,
-            macd,
-            macd_signal,
-            macd_hist
-        )
-    ):
-        return None
-
-    recent_prices = prices[-LEVEL_WINDOW:]
-
-    support = min(recent_prices)
-    resistance = max(recent_prices)
-
-    volume = to_float(
-        latest.get("volume24h")
-    )
-
-    turnover = to_float(
-        latest.get("turnover24h")
-    )
-
-    funding = to_float(
-        latest.get("fundingRate")
-    )
-
-    long_trend = (
-        ema20 > ema50
-        and (ema200 is None or price > ema200)
-    )
-
-    short_trend = (
-        ema20 < ema50
-        and (ema200 is None or price < ema200)
-    )
-
-    side = None
-    reasons = []
-
-    if (
-        long_trend
-        and price > ema20
-        and 50 <= rsi <= 68
-        and macd_hist > 0
-    ):
-
-        side = "LONG"
-
-        reasons = [
-            "EMA20 بالاتر از EMA50",
-            "قیمت بالاتر از EMA20",
-            "RSI صعودی",
-            "MACD مثبت"
-        ]
-
-    elif (
-        short_trend
-        and price < ema20
-        and 32 <= rsi <= 50
-        and macd_hist < 0
-    ):
-
-        side = "SHORT"
-
-        reasons = [
-            "EMA20 پایین‌تر از EMA50",
-            "قیمت پایین‌تر از EMA20",
-            "RSI نزولی",
-            "MACD منفی"
-        ]
-
-    plan = None
-
-    if side == "LONG":
-
-        stop = min(
-            support * 0.998,
-            price * 0.998
-        )
-
-        risk = price - stop
-
-        risk_percent = (
-            risk / price
-        ) * 100
-
-        target = min(
-            price + 2 * risk,
-            resistance * 0.998
-        )
-
-        reward = target - price
-
-        rr = (
-            reward / risk
-            if risk > 0 else 0
-        )
-
-        if (
-            0.25 <= risk_percent <= 2
-            and rr >= 1.5
-            and target > price
-        ):
-
-            plan = {
-                "side": side,
-                "entry": price,
-                "stop": stop,
-                "target": target,
-                "rr": rr
-            }
-
-    elif side == "SHORT":
-
-        stop = max(
-            resistance * 1.002,
-            price * 1.002
-        )
-
-        risk = stop - price
-
-        risk_percent = (
-            risk / price
-        ) * 100
-
-        target = max(
-            price - 2 * risk,
-            support * 1.002
-        )
-
-        reward = price - target
-
-        rr = (
-            reward / risk
-            if risk > 0 else 0
-        )
-
-        if (
-            0.25 <= risk_percent <= 2
-            and rr >= 1.5
-            and target < price
-        ):
-
-            plan = {
-                "side": side,
-                "entry": price,
-                "stop": stop,
-                "target": target,
-                "rr": rr
-            }
+    price = closes[-1]
 
     return {
-        "symbol": symbol,
         "price": price,
-        "records": len(rows),
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi,
-        "macd": macd,
-        "macd_signal": macd_signal,
-        "macd_hist": macd_hist,
-        "support": support,
-        "resistance": resistance,
-        "volume": volume,
-        "turnover": turnover,
-        "funding": funding,
-        "side": side,
-        "reasons": reasons,
-        "plan": plan
+        "ema20": e20,
+        "ema50": e50,
+        "ema200": e200,
+        "rsi": current_rsi,
+        "macd": current_macd,
+        "macd_signal": signal,
+        "histogram": histogram,
+        "atr": current_atr,
+        "volume_ratio": volume_ratio,
+        "support": min(lows),
+        "resistance": max(highs)
     }
 
 
-def fmt(value):
+def analyze_symbol(symbol, lbank):
+    try:
+        intervals = {
+            "5m": "5m",
+            "15m": "15m",
+            "1h": "1h",
+            "4h": "4h"
+        }
 
+        data = {}
+
+        for name, interval in intervals.items():
+            candles = get_candles(symbol, interval)
+            data[name] = timeframe_analysis(candles)
+
+        price = data["5m"]["price"]
+        lbank_price = lbank["_price"]
+
+        difference = abs(
+            price - lbank_price
+        ) / lbank_price * 100
+
+        if difference > PRICE_DIFF_LIMIT:
+            return None
+
+        m5 = data["5m"]
+        m15 = data["15m"]
+        h1 = data["1h"]
+        h4 = data["4h"]
+
+        long_trend = (
+            h4["ema20"] > h4["ema50"] > h4["ema200"]
+            and h1["ema20"] > h1["ema50"]
+        )
+
+        short_trend = (
+            h4["ema20"] < h4["ema50"] < h4["ema200"]
+            and h1["ema20"] < h1["ema50"]
+        )
+
+        long_confirm = (
+            m15["ema20"] > m15["ema50"]
+            and m5["ema20"] > m5["ema50"]
+            and 50 <= m15["rsi"] <= 68
+            and 45 <= m5["rsi"] <= 70
+            and m5["histogram"] > 0
+            and m15["histogram"] > 0
+            and m5["volume_ratio"] >= 1.2
+        )
+
+        short_confirm = (
+            m15["ema20"] < m15["ema50"]
+            and m5["ema20"] < m5["ema50"]
+            and 32 <= m15["rsi"] <= 50
+            and 30 <= m5["rsi"] <= 55
+            and m5["histogram"] < 0
+            and m15["histogram"] < 0
+            and m5["volume_ratio"] >= 1.2
+        )
+
+        side = None
+
+        if long_trend and long_confirm:
+            side = "LONG"
+
+        elif short_trend and short_confirm:
+            side = "SHORT"
+
+        if side is None:
+            return {
+                "symbol": symbol,
+                "price": price,
+                "side": None,
+                "rsi": m5["rsi"],
+                "support": m15["support"],
+                "resistance": m15["resistance"],
+                "difference": difference
+            }
+
+        current_atr = m5["atr"]
+
+        if not current_atr or current_atr <= 0:
+            return None
+
+        entry = price
+
+        if side == "LONG":
+            stop = min(
+                entry - 1.5 * current_atr,
+                m15["support"] - 0.2 * current_atr
+            )
+
+            risk = entry - stop
+
+            if risk <= 0:
+                return None
+
+            targets = [
+                entry + risk,
+                entry + 2 * risk,
+                entry + 3 * risk
+            ]
+
+            if m15["resistance"] <= entry:
+                return None
+
+            if m15["resistance"] < targets[0]:
+                return None
+
+        else:
+            stop = max(
+                entry + 1.5 * current_atr,
+                m15["resistance"] + 0.2 * current_atr
+            )
+
+            risk = stop - entry
+
+            if risk <= 0:
+                return None
+
+            targets = [
+                entry - risk,
+                entry - 2 * risk,
+                entry - 3 * risk
+            ]
+
+            if m15["support"] >= entry:
+                return None
+
+            if m15["support"] > targets[0]:
+                return None
+
+        risk_percent = risk / entry * 100
+
+        if risk_percent < 0.15 or risk_percent > 3:
+            return None
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "side": side,
+            "entry": entry,
+            "stop": stop,
+            "targets": targets,
+            "risk_percent": risk_percent,
+            "rsi": m5["rsi"],
+            "volume_ratio": m5["volume_ratio"],
+            "support": m15["support"],
+            "resistance": m15["resistance"],
+            "difference": difference,
+            "turnover": lbank["_turnover"]
+        }
+
+    except Exception as error:
+        print(f"{symbol}: {error}")
+        return None
+
+
+def fmt(value):
     if value is None:
         return "ناموجود"
 
     value = float(value)
 
     if abs(value) >= 100:
-        return f"{value:,.3f}"
+        return f"{value:,.4f}"
 
     if abs(value) >= 1:
-        return f"{value:.5f}"
+        return f"{value:.6f}"
 
     return f"{value:.8f}"
 
 
-def build_report(results, total_symbols):
+def main():
+    lbank_markets = load_latest_lbank()
 
-    now = datetime.now(
-        timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
+    candidates = [
+        (symbol, row)
+        for symbol, row in lbank_markets.items()
+        if row["_turnover"] >= MIN_TURNOVER
+    ]
 
-    results.sort(
-        key=lambda x: x.get("turnover") or 0,
+    candidates.sort(
+        key=lambda x: x[1]["_turnover"],
         reverse=True
     )
 
+    candidates = candidates[:MAX_SYMBOLS]
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(analyze_symbol, symbol, row): symbol
+            for symbol, row in candidates
+        }
+
+        for future in as_completed(futures):
+            result = future.result()
+
+            if result:
+                results.append(result)
+
     signals = [
         item for item in results
-        if item["plan"] is not None
+        if item.get("side")
     ]
 
     lines = [
         "📊 LBank USDT Futures Smart Scanner",
-        f"زمان: {now}",
-        f"تعداد بازارها: {total_symbols}",
-        f"بازارهای دارای داده کافی: {len(results)}",
-        "",
-        "⚠️ داده‌ها Snapshot قیمت هستند، نه کندل رسمی.",
+        "منبع کندل: Binance USD-M Futures",
+        f"زمان: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"بازارهای LBank: {len(lbank_markets)}",
+        f"بازارهای بررسی‌شده: {len(candidates)}",
+        f"تحلیل‌های موفق: {len(results)}",
         ""
     ]
 
     if signals:
-
-        lines.append(
-            f"✅ تعداد ستاپ‌های واجد شرایط: {len(signals)}"
-        )
+        lines.append(f"✅ ستاپ‌های واجد شرایط: {len(signals)}")
 
         for item in signals[:5]:
-
-            plan = item["plan"]
-
-            side = (
-                "لانگ"
-                if plan["side"] == "LONG"
-                else "شورت"
-            )
+            side = "لانگ" if item["side"] == "LONG" else "شورت"
 
             lines.extend([
                 "",
                 f"🔹 {item['symbol']} — {side}",
-                f"ورود: {fmt(plan['entry'])}",
-                f"حد ضرر: {fmt(plan['stop'])}",
-                f"تارگت: {fmt(plan['target'])}",
-                f"ریسک به بازده: {plan['rr']:.2f}R",
+                f"ورود: {fmt(item['entry'])}",
+                f"حد ضرر: {fmt(item['stop'])}",
+                f"تارگت ۱: {fmt(item['targets'][0])}",
+                f"تارگت ۲: {fmt(item['targets'][1])}",
+                f"تارگت ۳: {fmt(item['targets'][2])}",
+                f"ریسک: {item['risk_percent']:.2f}%",
                 f"RSI: {item['rsi']:.2f}",
-                f"EMA20: {fmt(item['ema20'])}",
-                f"EMA50: {fmt(item['ema50'])}",
-                f"EMA200: {fmt(item['ema200'])}",
-                f"MACD: {item['macd']:.8f}",
-                f"MACD Signal: {item['macd_signal']:.8f}",
-                f"MACD Histogram: {item['macd_hist']:.8f}",
-                f"حمایت تخمینی: {fmt(item['support'])}",
-                f"مقاومت تخمینی: {fmt(item['resistance'])}",
-                "دلایل: " + "، ".join(item["reasons"])
+                f"حجم نسبی: {item['volume_ratio']:.2f}x",
+                f"حمایت: {fmt(item['support'])}",
+                f"مقاومت: {fmt(item['resistance'])}",
+                f"اختلاف قیمت دو صرافی: {item['difference']:.3f}%"
             ])
 
     else:
-
         lines.extend([
             "⛔ هیچ ستاپ معتبری پیدا نشد.",
-            "ورود نکن؛ منتظر تأیید ساختار بازار بمان.",
-            ""
+            "ورود نکن؛ منتظر تأیید بمان."
         ])
 
     lines.extend([
         "",
-        "🔍 برترین بازارها:"
+        "⚠️ کندل‌ها متعلق به Binance USD-M Futures هستند، نه LBank.",
+        "⚠️ قیمت و اطلاعات قرارداد از LBank دریافت می‌شود.",
+        "⚠️ سیگنال‌ها نیازمند بررسی نهایی دفتر سفارش و اجرای واقعی هستند.",
+        "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
+        "این ربات سفارش ثبت نمی‌کند."
     ])
 
-    for item in results[:MAX_SYMBOLS]:
+    report = "\n".join(lines)
 
-        lines.append(
-            f"{item['symbol']} | "
-            f"قیمت: {fmt(item['price'])} | "
-            f"RSI: {item['rsi']:.1f} | "
-            f"EMA20: {fmt(item['ema20'])} | "
-            f"EMA50: {fmt(item['ema50'])} | "
-            f"حجم ۲۴h: {fmt(item['volume'])}"
-        )
-
-    lines.extend([
-        "",
-        "📌 حمایت و مقاومت از محدوده Snapshotهای اخیر تخمین زده شده‌اند.",
-        "📌 MACD از سری قیمت Snapshot محاسبه شده است.",
-        "📌 حجم نمایش داده‌شده حجم ۲۴ ساعته است، نه حجم کندل.",
-        "",
-        "این گزارش تضمین سود یا توصیه مالی نیست.",
-        "قبل از معامله، نمودار کندلی و دفتر سفارش را بررسی کن.",
-        "⚠️ اهرم بالا خطر لیکوییدشدن را به‌شدت افزایش می‌دهد."
-    ])
-
-    return "\n".join(lines)[:3900]
-
-
-def main():
-
-    history = load_history()
-
-    results = []
-
-    for symbol, rows in history.items():
-
-        item = analyze_symbol(
-            symbol,
-            rows
-        )
-
-        if item is not None:
-            results.append(item)
-
-    report = build_report(
-        results,
-        len(history)
-    )
-
-    REPORT_FILE.write_text(
-        report,
-        encoding="utf-8"
-    )
+    REPORT_FILE.write_text(report, encoding="utf-8")
 
     print(report)
-    print("Report saved successfully.")
 
 
 if __name__ == "__main__":
