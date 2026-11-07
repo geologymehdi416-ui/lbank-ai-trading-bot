@@ -237,5 +237,5 @@ def load_latest_lbank():
                 row = json.loads(line)
 
                 symbol = str(
-                    row.get("symbol", "")
-                ).
+    row.get("symbol", "")
+).strip().upper()
