@@ -8,9 +8,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: lbank-futures-scanner
+  cancel-in-progress: false
+
 jobs:
+
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -59,10 +65,80 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add data/prices.jsonl
+
           if ! git diff --cached --quiet; then
             git commit -m "Update LBank Futures price history"
-            git push
+            git pull --rebase origin main
+            git push origin HEAD:main
           else
             echo "No new data"
           fi
+
+  websocket_probe:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install WebSocket dependency
+        run: pip install websocket-client
+
+      - name: Test LBank Futures WebSocket
+        run: |
+          python - <<'PY'
+          import time
+          import websocket
+
+          URL = "wss://lbkperpws.lbank.com/ws"
+
+          print("Connecting to:", URL)
+
+          try:
+              ws = websocket.create_connection(
+                  URL,
+                  timeout=10,
+                  enable_multithread=True
+              )
+
+              print("RESULT: HANDSHAKE_OK")
+              print("WebSocket connection established.")
+
+              ws.settimeout(2)
+
+              print("Listening for server frames...")
+
+              end_time = time.time() + 20
+              received = 0
+
+              while time.time() < end_time:
+                  try:
+                      message = ws.recv()
+
+                      if message:
+                          received += 1
+                          print("SERVER_FRAME:", message)
+
+                  except websocket.WebSocketTimeoutException:
+                      print("Waiting for server data...")
+
+              print("TOTAL_FRAMES:", received)
+
+              if received == 0:
+                  print("WARNING: Connected, but no server frames received.")
+                  print("Subscription protocol is not yet verified.")
+
+              ws.close()
+              print("CONNECTION_CLOSED")
+              print("PROBE_FINISHED")
+
+          except Exception as error:
+              print("WEBSOCKET_ERROR:", repr(error))
+              raise
+          PY
