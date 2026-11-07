@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
 
@@ -30,8 +31,13 @@ INTERVALS = {
 }
 
 HEADERS = {
-    "User-Agent": "LBank-Futures-Monitor/4.0"
+    "User-Agent": "LBank-Futures-Monitor/4.1"
 }
+
+
+class SkipSymbol(Exception):
+    """نماد قابل بررسی نیست؛ این مورد خطای اجرایی محسوب نمی‌شود."""
+    pass
 
 
 def number(value):
@@ -201,12 +207,12 @@ def load_latest_lbank():
 
 def get_okx_symbol(symbol):
     if not symbol.endswith("USDT"):
-        raise ValueError(f"Invalid symbol: {symbol}")
+        raise SkipSymbol(f"Invalid USDT symbol: {symbol}")
 
     base = symbol[:-4]
 
     if not base:
-        raise ValueError(f"Invalid base asset: {symbol}")
+        raise SkipSymbol(f"Invalid base asset: {symbol}")
 
     return f"{base}-USDT-SWAP"
 
@@ -241,11 +247,19 @@ def get_candles(symbol, interval):
             if not isinstance(payload, dict):
                 raise RuntimeError("Invalid OKX response")
 
-            if payload.get("code") != "0":
+            code = str(payload.get("code", ""))
+
+            # قرارداد متناظر در OKX وجود ندارد.
+            # این وضعیت را دوباره امتحان نمی‌کنیم.
+            if code == "51001":
+                raise SkipSymbol(
+                    f"OKX contract unavailable: {inst_id}"
+                )
+
+            if code != "0":
                 raise RuntimeError(
                     f"OKX API error: "
-                    f"{payload.get('code')} - "
-                    f"{payload.get('msg')}"
+                    f"{code} - {payload.get('msg')}"
                 )
 
             raw = payload.get("data", [])
@@ -268,7 +282,10 @@ def get_candles(symbol, interval):
                 if str(item[8]) != "1":
                     continue
 
-                start_ms = int(item[0])
+                try:
+                    start_ms = int(item[0])
+                except (TypeError, ValueError):
+                    continue
 
                 open_price = number(item[1])
                 high = number(item[2])
@@ -309,6 +326,7 @@ def get_candles(symbol, interval):
                     start_ms
                 ])
 
+            # مرتب‌سازی از قدیمی به جدید
             candles.sort(key=lambda x: x[0])
 
             # حذف کندل تکراری احتمالی
@@ -317,9 +335,10 @@ def get_candles(symbol, interval):
             for candle in candles:
                 unique[candle[0]] = candle
 
-            candles = list(unique.values())
-
-            candles.sort(key=lambda x: x[0])
+            candles = sorted(
+                unique.values(),
+                key=lambda x: x[0]
+            )
 
             if len(candles) < 205:
                 raise RuntimeError(
@@ -347,6 +366,10 @@ def get_candles(symbol, interval):
                 )
 
             return candles
+
+        except SkipSymbol:
+            # نماد نامعتبر یا فاقد قرارداد است؛ retry نکن.
+            raise
 
         except Exception as error:
 
@@ -432,8 +455,10 @@ def analyze_symbol(symbol, lbank):
         abs(price - lbank_price) / lbank_price * 100
     )
 
+    # اختلاف قیمت بالا یعنی احتمالاً دو بازار
+    # یا دو قرارداد معادل نیستند.
     if difference > PRICE_DIFF_LIMIT:
-        raise RuntimeError(
+        raise SkipSymbol(
             f"Price difference too high: {difference:.3f}%"
         )
 
@@ -595,11 +620,9 @@ def main():
             now - row["_time"]
         ).total_seconds() / 60
 
-        if age < -2:
-            stale_count += 1
-            continue
-
-        if age > MAX_SNAPSHOT_AGE_MINUTES:
+        # داده‌های خیلی قدیمی یا دارای timestamp آینده
+        # وارد اسکن نمی‌شوند.
+        if age < -2 or age > MAX_SNAPSHOT_AGE_MINUTES:
             stale_count += 1
             continue
 
@@ -614,6 +637,7 @@ def main():
     candidates = candidates[:MAX_SYMBOLS]
 
     results = []
+    skipped = []
     failures = []
 
     with ThreadPoolExecutor(
@@ -640,6 +664,9 @@ def main():
                 if result:
                     results.append(result)
 
+            except SkipSymbol as error:
+                skipped.append((symbol, str(error)))
+
             except Exception as error:
                 failures.append((symbol, str(error)))
 
@@ -654,9 +681,10 @@ def main():
         f"زمان: {now.strftime('%Y-%m-%d %H:%M UTC')}",
         f"بازارهای LBank: {len(lbank_markets)}",
         f"بازارهای قدیمی یا نامعتبر: {stale_count}",
-        f"بازارهای بررسی‌شده: {len(candidates)}",
+        f"نمادهای انتخاب‌شده برای بررسی: {len(candidates)}",
         f"تحلیل‌های موفق: {len(results)}",
-        f"خطاهای دریافت/تحلیل: {len(failures)}",
+        f"نمادهای ردشده: {len(skipped)}",
+        f"خطاهای واقعی دریافت/تحلیل: {len(failures)}",
         ""
     ]
 
@@ -690,11 +718,40 @@ def main():
                 f"اختلاف قیمت دو صرافی: {item['difference']:.3f}%"
             ])
 
+    # دلایل رد شدن نمادها
+    if skipped:
+
+        skip_reasons = {}
+
+        for _, message in skipped:
+
+            if "Price difference too high" in message:
+                key = "اختلاف قیمت بیش از حد مجاز"
+
+            elif "OKX contract unavailable" in message:
+                key = "قرارداد متناظر در OKX موجود نیست"
+
+            else:
+                key = message[:120]
+
+            skip_reasons[key] = (
+                skip_reasons.get(key, 0) + 1
+            )
+
+        lines.extend([
+            "",
+            "ℹ️ نمادهای ردشده:"
+        ])
+
+        for reason, count in list(skip_reasons.items())[:5]:
+            lines.append(f"- {count} مورد: {reason}")
+
+    # خطاهای واقعی دریافت یا تحلیل
     if failures:
 
         lines.extend([
             "",
-            "⚠️ اسکن ناقص است؛ بعضی بازارها تحلیل نشدند."
+            "⚠️ اسکن ناقص است؛ بعضی نمادها خطای واقعی داشته‌اند."
         ])
 
         if not signals:
@@ -702,15 +759,6 @@ def main():
                 "نبود سیگنال در این اجرا تأیید نشده است.",
                 "ورود نکن تا دریافت داده کامل شود."
             ])
-
-    elif not signals:
-
-        lines.extend([
-            "⛔ ستاپ معتبری پیدا نشد.",
-            "ورود نکن؛ منتظر تأیید بمان."
-        ])
-
-    if failures:
 
         sample_errors = {}
 
@@ -722,7 +770,7 @@ def main():
 
         lines.extend([
             "",
-            "نمونه خطاهای داده:"
+            "نمونه خطاهای واقعی:"
         ])
 
         for message, count in list(
@@ -733,11 +781,20 @@ def main():
                 f"- {count} مورد: {message}"
             )
 
+    elif not signals:
+
+        lines.extend([
+            "",
+            "⛔ در نمادهای قابل تحلیل، ستاپ معتبری پیدا نشد.",
+            "ورود نکن؛ منتظر تأیید شرایط بمان."
+        ])
+
     lines.extend([
         "",
         "⚠️ کندل‌ها از OKX Futures هستند، نه LBank.",
         "⚠️ قیمت LBank با قیمت OKX مقایسه می‌شود.",
         "⚠️ دفتر سفارش و Funding Rate بررسی نمی‌شوند.",
+        "⚠️ فقط نمادهای انتخاب‌شده بر اساس حجم معاملات بررسی شده‌اند.",
         "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
         "این ربات سفارش ثبت نمی‌کند."
     ])
