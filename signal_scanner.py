@@ -11,11 +11,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DATA_FILE = Path("data/prices.jsonl")
 REPORT_FILE = Path("report.txt")
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 
 MAX_SYMBOLS = 40
 MIN_TURNOVER = 100000
 PRICE_DIFF_LIMIT = 0.75
+
+INTERVALS = {
+    "5m": "5",
+    "15m": "15",
+    "1h": "60",
+    "4h": "240"
+}
 
 
 def number(value):
@@ -70,44 +77,38 @@ def rsi(values, period=14):
 
 
 def macd(values):
-    if len(values) < 50:
+    if len(values) < 35:
         return None, None, None
 
-    fast = []
-    slow = []
+    fast = sum(values[:12]) / 12
+    slow = sum(values[:26]) / 26
+
+    fast_values = [None] * 11 + [fast]
+    slow_values = [None] * 25 + [slow]
 
     alpha_fast = 2 / 13
     alpha_slow = 2 / 27
 
-    f = sum(values[:12]) / 12
-    s = sum(values[:26]) / 26
+    for value in values[12:]:
+        fast = alpha_fast * value + (1 - alpha_fast) * fast
+        fast_values.append(fast)
 
-    fast = [None] * 11
-    slow = [None] * 25
+    for value in values[26:]:
+        slow = alpha_slow * value + (1 - alpha_slow) * slow
+        slow_values.append(slow)
 
-    for i in range(12, len(values)):
-        f = alpha_fast * values[i] + (1 - alpha_fast) * f
-        fast.append(f)
+    macd_values = [
+        fast_values[i] - slow_values[i]
+        for i in range(len(values))
+        if fast_values[i] is not None
+        and slow_values[i] is not None
+    ]
 
-    for i in range(26, len(values)):
-        s = alpha_slow * values[i] + (1 - alpha_slow) * s
-        slow.append(s)
-
-    line = []
-
-    for i in range(len(values)):
-        if fast[i] is None or slow[i] is None:
-            line.append(None)
-        else:
-            line.append(fast[i] - slow[i])
-
-    valid = [x for x in line if x is not None]
-
-    if len(valid) < 9:
+    if len(macd_values) < 9:
         return None, None, None
 
-    signal = ema(valid, 9)
-    current = valid[-1]
+    signal = ema(macd_values, 9)
+    current = macd_values[-1]
 
     return current, signal, current - signal
 
@@ -152,7 +153,9 @@ def load_latest_lbank():
                 )
 
                 if timestamp.tzinfo is None:
-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    timestamp = timestamp.replace(
+                        tzinfo=timezone.utc
+                    )
 
                 if not symbol.endswith("USDT") or not price or price <= 0:
                     continue
@@ -172,50 +175,76 @@ def load_latest_lbank():
 
 
 def get_candles(symbol, interval):
+    if interval not in INTERVALS:
+        raise ValueError(f"Unsupported interval: {interval}")
+
     response = requests.get(
-        BINANCE_URL,
+        BYBIT_URL,
         params={
+            "category": "linear",
             "symbol": symbol,
-            "interval": interval,
+            "interval": INTERVALS[interval],
             "limit": 250
         },
-        timeout=15
+        timeout=20,
+        headers={
+            "User-Agent": "LBank-Futures-Monitor/2.2"
+        }
     )
 
     response.raise_for_status()
-    raw = response.json()
+    payload = response.json()
 
-    if not isinstance(raw, list) or len(raw) < 205:
-        raise RuntimeError("Insufficient candle history")
+    if not isinstance(payload, dict) or payload.get("retCode") != 0:
+        raise RuntimeError(f"Bybit API error: {payload}")
+
+    raw = payload.get("result", {}).get("list", [])
+
+    if not isinstance(raw, list):
+        raise RuntimeError("Invalid Bybit candle response")
+
+    interval_ms = int(INTERVALS[interval]) * 60 * 1000
+
+    now_ms = int(
+        datetime.now(timezone.utc).timestamp() * 1000
+    )
 
     candles = []
 
-    for item in raw:
+    # Bybit کندل‌ها را از جدید به قدیم برمی‌گرداند.
+    # ترتیب را معکوس می‌کنیم و کندل باز را حذف می‌کنیم.
+
+    for item in reversed(raw):
+
+        if not isinstance(item, list) or len(item) < 6:
+            continue
+
+        start_ms = int(item[0])
+        close_time_ms = start_ms + interval_ms
+
+        if close_time_ms > now_ms:
+            continue
+
         candles.append([
-            int(item[0]),
+            start_ms,
             float(item[1]),
             float(item[2]),
             float(item[3]),
             float(item[4]),
             float(item[5]),
-            int(item[6])
+            close_time_ms
         ])
 
-    # آخرین کندل ممکن است هنوز باز باشد؛ حذفش می‌کنیم.
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-    candles = [
-        candle for candle in candles
-        if candle[6] <= now_ms
-    ]
-
     if len(candles) < 205:
-        raise RuntimeError("Not enough closed candles")
+        raise RuntimeError(
+            f"Insufficient closed candles: {len(candles)}"
+        )
 
-    return candles[:-1]
+    return candles
 
 
 def timeframe_analysis(candles):
+
     closes = [c[4] for c in candles]
 
     e20 = ema(closes, 20)
@@ -223,26 +252,25 @@ def timeframe_analysis(candles):
     e200 = ema(closes, 200)
 
     current_rsi = rsi(closes)
+
     current_macd, signal, histogram = macd(closes)
+
     current_atr = atr(candles)
 
     volumes = [c[5] for c in candles]
 
     average_volume = sum(volumes[-21:-1]) / 20
-    current_volume = volumes[-1]
 
     volume_ratio = (
-        current_volume / average_volume
+        volumes[-1] / average_volume
         if average_volume > 0 else 0
     )
 
     highs = [c[2] for c in candles[-48:]]
     lows = [c[3] for c in candles[-48:]]
 
-    price = closes[-1]
-
     return {
-        "price": price,
+        "price": closes[-1],
         "ema20": e20,
         "ema50": e50,
         "ema200": e200,
@@ -258,26 +286,22 @@ def timeframe_analysis(candles):
 
 
 def analyze_symbol(symbol, lbank):
+
     try:
-        intervals = {
-            "5m": "5m",
-            "15m": "15m",
-            "1h": "1h",
-            "4h": "4h"
+
+        data = {
+            tf: timeframe_analysis(
+                get_candles(symbol, tf)
+            )
+            for tf in INTERVALS
         }
-
-        data = {}
-
-        for name, interval in intervals.items():
-            candles = get_candles(symbol, interval)
-            data[name] = timeframe_analysis(candles)
 
         price = data["5m"]["price"]
         lbank_price = lbank["_price"]
 
-        difference = abs(
-            price - lbank_price
-        ) / lbank_price * 100
+        difference = (
+            abs(price - lbank_price) / lbank_price * 100
+        )
 
         if difference > PRICE_DIFF_LIMIT:
             return None
@@ -286,6 +310,8 @@ def analyze_symbol(symbol, lbank):
         m15 = data["15m"]
         h1 = data["1h"]
         h4 = data["4h"]
+
+        # روند تایم‌فریم بالاتر
 
         long_trend = (
             h4["ema20"] > h4["ema50"] > h4["ema200"]
@@ -297,6 +323,8 @@ def analyze_symbol(symbol, lbank):
             and h1["ema20"] < h1["ema50"]
         )
 
+        # تأیید لانگ
+
         long_confirm = (
             m15["ema20"] > m15["ema50"]
             and m5["ema20"] > m5["ema50"]
@@ -306,6 +334,8 @@ def analyze_symbol(symbol, lbank):
             and m15["histogram"] > 0
             and m5["volume_ratio"] >= 1.2
         )
+
+        # تأیید شورت
 
         short_confirm = (
             m15["ema20"] < m15["ema50"]
@@ -328,12 +358,7 @@ def analyze_symbol(symbol, lbank):
         if side is None:
             return {
                 "symbol": symbol,
-                "price": price,
-                "side": None,
-                "rsi": m5["rsi"],
-                "support": m15["support"],
-                "resistance": m15["resistance"],
-                "difference": difference
+                "side": None
             }
 
         current_atr = m5["atr"]
@@ -344,6 +369,7 @@ def analyze_symbol(symbol, lbank):
         entry = price
 
         if side == "LONG":
+
             stop = min(
                 entry - 1.5 * current_atr,
                 m15["support"] - 0.2 * current_atr
@@ -351,7 +377,7 @@ def analyze_symbol(symbol, lbank):
 
             risk = entry - stop
 
-            if risk <= 0:
+            if risk <= 0 or m15["resistance"] <= entry:
                 return None
 
             targets = [
@@ -360,13 +386,11 @@ def analyze_symbol(symbol, lbank):
                 entry + 3 * risk
             ]
 
-            if m15["resistance"] <= entry:
-                return None
-
             if m15["resistance"] < targets[0]:
                 return None
 
         else:
+
             stop = max(
                 entry + 1.5 * current_atr,
                 m15["resistance"] + 0.2 * current_atr
@@ -374,7 +398,7 @@ def analyze_symbol(symbol, lbank):
 
             risk = stop - entry
 
-            if risk <= 0:
+            if risk <= 0 or m15["support"] >= entry:
                 return None
 
             targets = [
@@ -382,9 +406,6 @@ def analyze_symbol(symbol, lbank):
                 entry - 2 * risk,
                 entry - 3 * risk
             ]
-
-            if m15["support"] >= entry:
-                return None
 
             if m15["support"] > targets[0]:
                 return None
@@ -412,10 +433,11 @@ def analyze_symbol(symbol, lbank):
 
     except Exception as error:
         print(f"{symbol}: {error}")
-        return None
+        raise
 
 
 def fmt(value):
+
     if value is None:
         return "ناموجود"
 
@@ -431,6 +453,7 @@ def fmt(value):
 
 
 def main():
+
     lbank_markets = load_latest_lbank()
 
     candidates = [
@@ -447,39 +470,59 @@ def main():
     candidates = candidates[:MAX_SYMBOLS]
 
     results = []
+    failures = []
 
     with ThreadPoolExecutor(max_workers=6) as executor:
+
         futures = {
             executor.submit(analyze_symbol, symbol, row): symbol
             for symbol, row in candidates
         }
 
         for future in as_completed(futures):
-            result = future.result()
 
-            if result:
-                results.append(result)
+            symbol = futures[future]
+
+            try:
+                result = future.result()
+
+                if result:
+                    results.append(result)
+
+            except Exception as error:
+                failures.append((symbol, str(error)))
 
     signals = [
         item for item in results
         if item.get("side")
     ]
 
+    successful = len(results)
+
     lines = [
         "📊 LBank USDT Futures Smart Scanner",
-        "منبع کندل: Binance USD-M Futures",
+        "منبع کندل: Bybit USDT Linear Futures",
         f"زمان: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"بازارهای LBank: {len(lbank_markets)}",
         f"بازارهای بررسی‌شده: {len(candidates)}",
-        f"تحلیل‌های موفق: {len(results)}",
+        f"تحلیل‌های موفق: {successful}",
+        f"خطاهای دریافت/تحلیل: {len(failures)}",
         ""
     ]
 
     if signals:
-        lines.append(f"✅ ستاپ‌های واجد شرایط: {len(signals)}")
+
+        lines.append(
+            f"✅ ستاپ‌های واجد شرایط: {len(signals)}"
+        )
 
         for item in signals[:5]:
-            side = "لانگ" if item["side"] == "LONG" else "شورت"
+
+            side = (
+                "لانگ"
+                if item["side"] == "LONG"
+                else "شورت"
+            )
 
             lines.extend([
                 "",
@@ -497,24 +540,54 @@ def main():
                 f"اختلاف قیمت دو صرافی: {item['difference']:.3f}%"
             ])
 
-    else:
+    elif failures and successful == 0:
+
         lines.extend([
-            "⛔ هیچ ستاپ معتبری پیدا نشد.",
+            "⚠️ تحلیل بازار انجام نشد؛ خطای دریافت داده وجود دارد.",
+            "این وضعیت به معنی نبود ستاپ معاملاتی نیست.",
+            "ورود نکن تا منبع داده تأیید شود."
+        ])
+
+    else:
+
+        lines.extend([
+            "⛔ در بازارهای تحلیل‌شده ستاپ معتبری پیدا نشد.",
             "ورود نکن؛ منتظر تأیید بمان."
         ])
 
+    if failures:
+
+        sample_errors = {}
+
+        for _, message in failures:
+            key = message[:140]
+            sample_errors[key] = sample_errors.get(key, 0) + 1
+
+        lines.extend([
+            "",
+            "نمونه خطاهای داده:"
+        ])
+
+        for message, count in list(sample_errors.items())[:3]:
+            lines.append(
+                f"- {count} مورد: {message}"
+            )
+
     lines.extend([
         "",
-        "⚠️ کندل‌ها متعلق به Binance USD-M Futures هستند، نه LBank.",
-        "⚠️ قیمت و اطلاعات قرارداد از LBank دریافت می‌شود.",
-        "⚠️ سیگنال‌ها نیازمند بررسی نهایی دفتر سفارش و اجرای واقعی هستند.",
+        "⚠️ کندل‌ها از Bybit Futures هستند، نه LBank.",
+        "⚠️ قیمت بازار و اطلاعات قرارداد از LBank دریافت می‌شود.",
+        "⚠️ دفتر سفارش و Funding Rate هنوز بررسی نمی‌شوند.",
         "⚠️ اهرم بالا خطر لیکوییدشدن را افزایش می‌دهد.",
         "این ربات سفارش ثبت نمی‌کند."
     ])
 
     report = "\n".join(lines)
 
-    REPORT_FILE.write_text(report, encoding="utf-8")
+    REPORT_FILE.write_text(
+        report,
+        encoding="utf-8"
+    )
 
     print(report)
 
