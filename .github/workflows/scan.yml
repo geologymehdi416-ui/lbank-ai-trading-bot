@@ -27,10 +27,10 @@ jobs:
       - name: Collect Futures prices
         run: python collector.py
 
-      - name: Technical Analysis
+      - name: Analyze market
         run: python signal_scanner.py
 
-      - name: Send Telegram Test
+      - name: Send Telegram Report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -38,17 +38,19 @@ jobs:
           python - <<'PY'
           import os
           import requests
+          from pathlib import Path
+
+          report = Path("report.txt").read_text(encoding="utf-8")
 
           response = requests.post(
               f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
               data={
                   "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": "🟢 اتصال ربات LBank برقرار شد!"
+                  "text": report
               },
               timeout=20
           )
 
-          print(response.status_code)
           print(response.text)
           response.raise_for_status()
           PY
