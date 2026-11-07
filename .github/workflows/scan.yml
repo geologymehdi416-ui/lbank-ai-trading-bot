@@ -2,6 +2,7 @@ name: LBank Futures Smart Scanner
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "*/5 * * * *"
 
@@ -13,14 +14,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-
-  collect:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,137 +30,140 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
-      - name: Collect Futures prices
-        run: python collector.py
+      - name: Collect LBank Futures prices
+        run: |
+          python collector.py
 
-      - name: Analyze market
-        run: python signal_scanner.py
+      - name: Run smart scanner
+        run: |
+          python signal_scanner.py
 
-      - name: Send Telegram Report
+      - name: Send Telegram report in multiple messages
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
           import os
+          import time
           import requests
           from pathlib import Path
 
-          report = Path("report.txt").read_text(encoding="utf-8")
+          token = os.environ.get("TELEGRAM_BOT_TOKEN")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
-          response = requests.post(
-              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
-              data={
-                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": report
-              },
-              timeout=20
+          if not token or not chat_id:
+              raise RuntimeError(
+                  "Telegram secrets are missing"
+              )
+
+          report_file = Path("report.txt")
+
+          if not report_file.exists():
+              raise RuntimeError(
+                  "report.txt was not generated"
+              )
+
+          report = report_file.read_text(
+              encoding="utf-8"
+          ).strip()
+
+          if not report:
+              raise RuntimeError(
+                  "Telegram report is empty"
+              )
+
+          # تقسیم گزارش به پیام‌های زیر 3800 کاراکتر
+          max_length = 3800
+          chunks = []
+          current = ""
+
+          for line in report.splitlines():
+
+              if len(line) > max_length:
+                  raise RuntimeError(
+                      "A report line exceeds Telegram message limit"
+                  )
+
+              candidate = (
+                  current + "\n" + line
+                  if current
+                  else line
+              )
+
+              if len(candidate) > max_length:
+                  chunks.append(current)
+                  current = line
+              else:
+                  current = candidate
+
+          if current:
+              chunks.append(current)
+
+          url = (
+              f"https://api.telegram.org/"
+              f"bot{token}/sendMessage"
           )
 
-          print(response.text)
-          response.raise_for_status()
+          total = len(chunks)
+
+          for index, chunk in enumerate(chunks, start=1):
+
+              prefix = (
+                  f"📨 بخش {index}/{total}\n\n"
+                  if total > 1
+                  else ""
+              )
+
+              payload = {
+                  "chat_id": chat_id,
+                  "text": prefix + chunk
+              }
+
+              response = requests.post(
+                  url,
+                  json=payload,
+                  timeout=30
+              )
+
+              response.raise_for_status()
+
+              result = response.json()
+
+              if not result.get("ok"):
+                  raise RuntimeError(
+                      f"Telegram error: {result}"
+                  )
+
+              print(
+                  f"Telegram message "
+                  f"{index}/{total} sent"
+              )
+
+              time.sleep(1)
+
+          print(
+              f"Successfully sent {total} Telegram messages"
+          )
           PY
 
-      - name: Save history
+      - name: Save collected market data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add data/prices.jsonl
 
-          if ! git diff --cached --quiet; then
-            git commit -m "Update LBank Futures price history"
-            git pull --rebase origin main
-            git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "No market data changes"
           else
-            echo "No new data"
+            git commit -m "Update LBank futures market data"
+
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-
-  websocket_probe:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install WebSocket dependency
-        run: pip install websocket-client
-
-      - name: Test Futures symbol formats
-        run: |
-          python - <<'PY'
-          import json
-          import time
-          import websocket
-
-          URL = "wss://lbkperpws.lbank.com/ws"
-
-          pairs = [
-              "BTCUSDT",
-              "BTC_USDT"
-          ]
-
-          for pair in pairs:
-              print("\n================================")
-              print("TEST PAIR:", pair)
-              print("================================")
-
-              ws = None
-
-              try:
-                  ws = websocket.create_connection(
-                      URL,
-                      timeout=10,
-                      enable_multithread=True
-                  )
-
-                  print("HANDSHAKE_OK")
-
-                  payload = {
-                      "action": "subscribe",
-                      "subscribe": "kbar",
-                      "kbar": "5min",
-                      "pair": pair
-                  }
-
-                  message = json.dumps(payload)
-
-                  print("SEND:", message)
-
-                  ws.send(message)
-                  ws.settimeout(2)
-
-                  end_time = time.time() + 12
-                  received = 0
-
-                  while time.time() < end_time:
-                      try:
-                          frame = ws.recv()
-
-                          if frame:
-                              received += 1
-                              print("SERVER_RESPONSE:", frame)
-
-                      except websocket.WebSocketTimeoutException:
-                          continue
-
-                  print("FRAME_COUNT:", received)
-
-                  if received == 0:
-                      print("NO_RESPONSE")
-
-              except Exception as error:
-                  print("PROBE_ERROR:", repr(error))
-
-              finally:
-                  if ws:
-                      ws.close()
-
-          print("\nALL_TESTS_FINISHED")
-          PY
