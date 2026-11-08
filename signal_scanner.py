@@ -5,18 +5,33 @@ signal_scanner.py
 -----------------
 Analysis-only crypto futures signal scanner (NO order execution).
 
+Pipeline per symbol:
+  1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
+  2. Higher-timeframe trend, EMA20/50/200, RSI, MACD, ATR, volume ratio.
+  3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
+     FVG and Order Blocks.
+  4. Score LONG and SHORT scenarios out of 100.
+  5. Build Entry / SL / TP1 / TP2 / RR; signal only if score >= MIN_SCORE and
+     all risk gates pass.
+  6. Send scan report + signals to Telegram.
+
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
   SYMBOLS            comma list, default BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT
   MIN_SCORE          default 75
   RISK_PCT           risk per trade in % of equity, default 0.5
   MAX_LEVERAGE       default 2
-  ACCOUNT_EQUITY     optional (USDT)
+  ACCOUNT_EQUITY     optional (USDT) -> shows position size in the signal
   LBANK_BASE_URL     default https://api.lbkex.com
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
+  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
   REPORT_FILE        plain-text report output, default report.txt
+
+Usage:
+  python signal_scanner.py
+  python signal_scanner.py --symbols BTC_USDT,ETH_USDT --dry-run
 """
 from __future__ import annotations
 
@@ -37,6 +52,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("signal_scanner")
 
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
 DEFAULT_SYMBOLS = "BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT"
 
@@ -55,14 +73,25 @@ REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
 
-MAX_STOP_PCT = 3.0
-MAX_STOP_ATR = 3.0
-MIN_STOP_ATR = 0.5
-MIN_ATR_PCT = 0.0008
-MAX_ATR_PCT = 0.03
+MAX_STOP_PCT = 3.0          # max stop distance, % of entry
+MAX_STOP_ATR = 3.0          # max stop distance in 15m ATR
+MIN_STOP_ATR = 0.5          # min stop distance in 15m ATR
+MIN_ATR_PCT = 0.0004        # 15m ATR / price below this -> dead market
+MAX_ATR_PCT = 0.03          # above this -> too volatile
 MIN_VOL_RATIO = 0.5
 MIN_CANDLES = 100
 
+MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
+FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
+MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees
+WATCH_MIN = 60              # minimum score for the Watchlist
+STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
+MAX_SAME_DIR = 2            # max signals in the same direction per scan
+MSS_MAX_DELAY = 8           # MSS must happen within N candles after the sweep
+MSS_MIN_BODY = 0.8          # MSS candle body >= this x ATR
+MIN_ATR_RANK = 0.10         # 15m ATR percentile (last 100 candles) below this = dead market
+
+# tf name -> (LBank type, seconds)
 TF_MAP: Dict[str, Tuple[str, int]] = {
     "5m": ("minute5", 300),
     "15m": ("minute15", 900),
@@ -71,12 +100,16 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 }
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
+TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
 
 
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
 
 
+# --------------------------------------------------------------------------
+# HTTP with throttling, retries and backoff
+# --------------------------------------------------------------------------
 _last_req = 0.0
 
 
@@ -133,6 +166,9 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
             log.warning("%s - retry %d/%d", last_err, attempt, retries)
             time.sleep(min(2 ** attempt, 20))
     raise ScanError("request failed after %d tries (%s)" % (retries, last_err))
+# --------------------------------------------------------------------------
+# Market data
+# --------------------------------------------------------------------------
 class Candles:
     """Column-oriented OHLCV container (closed candles only)."""
 
@@ -163,7 +199,7 @@ def fetch_klines(symbol: str, tf: str, size: int = 300) -> Candles:
     for r in rows_raw:
         try:
             ts = int(float(r[0]))
-            if ts > 10 ** 11:
+            if ts > 10 ** 11:          # milliseconds -> seconds
                 ts //= 1000
             o, h, l, c, v = (float(x) for x in r[1:6])
         except (ValueError, TypeError, IndexError):
@@ -172,7 +208,7 @@ def fetch_klines(symbol: str, tf: str, size: int = 300) -> Candles:
             continue
         parsed[ts] = (ts, o, h, l, c, v)
     rows = [parsed[k] for k in sorted(parsed)]
-    if rows and rows[-1][0] + sec > time.time():
+    if rows and rows[-1][0] + sec > time.time():   # drop the still-forming candle
         rows.pop()
     if len(rows) < MIN_CANDLES:
         raise ScanError("kline %s %s: only %d candles" % (symbol, tf, len(rows)))
@@ -196,6 +232,9 @@ def fetch_price(symbol: str) -> Optional[float]:
     return None
 
 
+# --------------------------------------------------------------------------
+# Indicators
+# --------------------------------------------------------------------------
 def ema(values: List[float], n: int) -> List[float]:
     if not values:
         return []
@@ -259,6 +298,7 @@ def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[flo
 
 
 def volume_ratio(v: List[float]) -> float:
+    """Mean of last 3 closed candles vs mean of the 20 before them."""
     if len(v) < 24:
         return 1.0
     recent = sum(v[-3:]) / 3.0
@@ -266,6 +306,9 @@ def volume_ratio(v: List[float]) -> float:
     if base <= 0:
         return 1.0
     return recent / base
+# --------------------------------------------------------------------------
+# Structure helpers
+# --------------------------------------------------------------------------
 def find_swings(h: List[float], l: List[float], n: int = 3
                 ) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
     highs: List[Tuple[int, float]] = []
@@ -302,6 +345,8 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     at = atr(h, l, c)
     highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
     st = structure_dir(highs, lows)
+    recent_atr = at[-100:]
+    atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
     pts = 0
     pts += 1 if c[-1] > e50[-1] else -1
     pts += 1 if e20[-1] > e50[-1] else -1
@@ -315,11 +360,16 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
         "hist": mh[-1], "hist_prev": mh[-2] if len(mh) > 1 else mh[-1],
         "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
         "highs": highs, "lows": lows, "struct": st, "trend": trend,
-        "trend_pts": pts,
+        "trend_pts": pts, "atr_rank": atr_rank,
     }
 
 
+# --------------------------------------------------------------------------
+# Smart-money concepts
+# --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
+    """LONG -> sell-side liquidity sweep (wick below swing low, close back above).
+    SHORT -> buy-side sweep (wick above swing high, close back below)."""
     cs: Candles = d["cs"]
     n = len(cs)
     a = d["atr"]
@@ -343,28 +393,32 @@ def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[s
 
 
 def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """MSS: strong-bodied close beyond the last opposite swing, shortly after the sweep."""
     cs: Candles = d["cs"]
+    a = d["atr"]
     j = sweep["idx"]
+    end = min(len(cs), j + MSS_MAX_DELAY + 1)
     if side == "LONG":
         prior = [p for p in d["highs"] if p[0] < j]
         if not prior:
             return None
         lvl = prior[-1][1]
-        for k in range(j, len(cs)):
-            if cs.c[k] > lvl:
+        for k in range(j, end):
+            if cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     else:
         prior = [p for p in d["lows"] if p[0] < j]
         if not prior:
             return None
         lvl = prior[-1][1]
-        for k in range(j, len(cs)):
-            if cs.c[k] < lvl:
+        for k in range(j, end):
+            if cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     return None
 
 
 def detect_bos(d: Dict[str, Any], side: str, within: int = 6) -> Optional[Dict[str, Any]]:
+    """Continuation break of structure in the last `within` candles."""
     cs: Candles = d["cs"]
     n = len(cs)
     if side == "LONG":
@@ -481,19 +535,25 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
         out["ssl"] = s
         out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
     return out
+# --------------------------------------------------------------------------
+# Scenario evaluation
+# --------------------------------------------------------------------------
 def global_blockers(D: Dict[str, Dict[str, Any]], price: float) -> List[str]:
     out: List[str] = []
     d15, d5 = D["15m"], D["5m"]
     atr_pct = d15["atr"] / price
     if atr_pct < MIN_ATR_PCT:
         out.append("نوسان بازار خیلی کم است")
+    elif d15["atr_rank"] < MIN_ATR_RANK:
+        out.append("نوسان 15m نسبت به ۱۰۰ کندل اخیر خیلی کم است")
     elif atr_pct > MAX_ATR_PCT:
         out.append("نوسان بازار بیش‌ازحد زیاد است")
     if d15["vol_ratio"] < MIN_VOL_RATIO:
         out.append("حجم معاملات ضعیف است")
     cs5: Candles = d5["cs"]
-    if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"]:
-        out.append("کندل اسپایک اخیر در 5m؛ صبر برای آرام‌شدن بازار")
+    cs15: Candles = d15["cs"]
+    if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"] or (cs15.h[-1] - cs15.l[-1]) > 4.0 * d15["atr"]:
+        out.append("کندل اسپایک اخیر؛ صبر برای آرام‌شدن بازار")
     return out
 
 
@@ -504,6 +564,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     atr15 = d15["atr"]
     notes: List[str] = []
     blockers: List[str] = []
+    soft: List[str] = []
     parts: Dict[str, float] = {}
 
     s4 = 12 if d4["trend"] == want else 4 if d4["trend"] == "RANGE" else 0
@@ -522,7 +583,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if sw15:
         pairs.append((d15, sw15, 15))
     if sw5:
-        pairs.append((d5, sw5, 10))
+        pairs.append((d5, sw5, 8))
     chosen = None
     chosen_mss = None
     for d, sw, pts in pairs:
@@ -535,11 +596,18 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     sweep = chosen[1] if chosen else None
     parts["sweep"] = float(chosen[2]) if chosen else 0.0
     parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
+    if chosen and detect_sweep(d1, side, 4):
+        parts["sweep"] = min(15.0, parts["sweep"] + 5.0)
+        notes.append("Sweep هم‌زمان روی نقدینگی 1H")
     bos = None
     if sweep:
         notes.append("Liquidity Sweep در %s %s" % (sweep["tf"], "(نقدینگی فروش)" if long else "(نقدینگی خرید)"))
     if chosen_mss:
-        notes.append("MSS تأیید شد (%s)" % chosen_mss[0]["tf"])
+        notes.append("MSS قوی تأیید شد (%s)" % chosen_mss[0]["tf"])
+        lvl_mss = chosen_mss[0]["level"]
+        moved = (price - lvl_mss) if long else (lvl_mss - price)
+        if moved > 2.0 * atr15:
+            blockers.append("ورود دیرهنگام: قیمت بیش از 2 ATR از سطح MSS دور شده")
     elif aligned == 2:
         bos = detect_bos(d15, side, 6)
         if bos:
@@ -547,7 +615,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             notes.append("BOS ادامه‌دهنده در 15m")
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
     if not structure_ok:
-        blockers.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
+        soft.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
 
     zone = pick_zone([d15, d5], side, price, atr15)
     if zone:
@@ -577,9 +645,11 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     buf = 0.25 * atr15
     sl = ref - buf if long else ref + buf
     risk = abs(entry - sl)
-    if risk < MIN_STOP_ATR * atr15:
-        risk = MIN_STOP_ATR * atr15
+    min_risk = max(MIN_STOP_ATR * atr15, MIN_STOP_PCT / 100.0 * entry, 0.2 * d1["atr"])
+    if risk < min_risk:
+        risk = min_risk
         sl = entry - risk if long else entry + risk
+        notes.append("حد ضرر به حداقل مجاز گسترش یافت (%.2f%%)" % (risk / entry * 100.0))
     trade: Optional[Dict[str, Any]] = None
     if risk > MAX_STOP_ATR * atr15 or risk / entry * 100.0 > MAX_STOP_PCT:
         blockers.append("فاصله حد ضرر بیش از حد مجاز است (%.2f%%)" % (risk / entry * 100.0))
@@ -595,16 +665,23 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
                    entry + sign * 3.0 * risk)
         rr1 = abs(tp1 - entry) / risk
         rr2 = abs(tp2 - entry) / risk
-        stop_pct = risk / entry
-        notional_mult = (RISK_PCT / 100.0) / stop_pct
+        risk_pct = risk / entry * 100.0
+        cost = 2.0 * FEE_PCT
+        rr1n = (abs(tp1 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+        rr2n = (abs(tp2 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+        total_stop = (risk_pct + cost) / 100.0
+        notional_mult = (RISK_PCT / 100.0) / total_stop
         lev = min(MAX_LEVERAGE, notional_mult)
-        eff_risk = lev * stop_pct * 100.0
+        eff_risk = lev * total_stop * 100.0
         order_type = "LIMIT" if abs(entry - price) > 0.05 * atr15 else "MARKET"
         trade = {
             "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2,
-            "stop_pct": stop_pct * 100.0, "order_type": order_type,
+            "rr1n": rr1n, "rr2n": rr2n, "cost_pct": cost,
+            "stop_pct": risk_pct, "order_type": order_type,
             "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
         }
+        if rr2n < MIN_RR2_NET:
+            blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
         htf = collect_levels(D, htf_only=True)
         obst = [p for p in htf if (p > entry if long else p < entry)]
         if obst:
@@ -619,8 +696,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             notes.append("مانع HTF نسبتاً نزدیک است")
     parts.setdefault("room", 0.0)
     if trade:
-        rr = trade["rr2"]
-        parts["rr"] = 10.0 if rr >= 3 else 8.0 if rr >= 2.5 else 6.0 if rr >= 2 else 3.0 if rr >= 1.5 else 0.0
+        rr = trade["rr2n"]
+        parts["rr"] = 10.0 if rr >= 2.5 else 8.0 if rr >= 2.0 else 6.0 if rr >= 1.5 else 3.0 if rr >= 1.0 else 0.0
     else:
         parts["rr"] = 0.0
 
@@ -645,8 +722,25 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         notes.append("حجم بالاتر از میانگین (x%.2f)" % vr)
 
     score = int(round(sum(parts.values())))
+    if not structure_ok:
+        score = min(score, STRUCT_CAP)
     return {"side": side, "score": score, "parts": parts, "notes": notes,
-            "blockers": blockers, "trade": trade, "zone": zone, "sweep": sweep}
+            "blockers": blockers, "soft_blockers": soft, "trade": trade,
+            "zone": zone, "sweep": sweep}
+
+
+def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
+    liq = res["liq"]
+    if sc["side"] == "LONG":
+        lvl = liq["ssl"]
+        cond = ("جاروب زیر SSL≈%s، بسته‌شدن دوباره بالای آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                if lvl is not None else "منتظر Sweep نقدینگی فروش + MSS قوی")
+    else:
+        lvl = liq["bsl"]
+        cond = ("جاروب بالای BSL≈%s، بسته‌شدن دوباره زیر آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                if lvl is not None else "منتظر Sweep نقدینگی خرید + MSS قوی")
+    return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
+            "condition": cond, "extra": extra}
 
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
@@ -662,12 +756,23 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        if s["score"] >= min_score and not s["blockers"] and not gb and s["trade"]:
+        if (s["score"] >= min_score and not s["blockers"] and not s["soft_blockers"]
+                and not gb and s["trade"]):
             signal = s
             break
-    return {"symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
-            "global_blockers": gb, "signal": signal,
-            "liq": liquidity_map(D["15m"], price)}
+    age_min = (time.time() - (D["5m"]["cs"].t[-1] + TF_MAP["5m"][1])) / 60.0
+    res: Dict[str, Any] = {
+        "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
+        "global_blockers": gb, "signal": signal, "watch": None,
+        "reason_override": None, "data_age_min": age_min,
+        "liq": liquidity_map(D["15m"], price),
+    }
+    if not signal and not gb:
+        cands = [s for s in scenarios.values()
+                 if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN]
+        if cands:
+            res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
+    return res
 def fmt_price(p: float) -> str:
     if p >= 1000:
         return "%.2f" % p
@@ -683,15 +788,16 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     long = sc["side"] == "LONG"
     icon = "🟢" if long else "🔴"
     lines = [
-        "%s <b>سیگنال %s — %s</b>" % (icon, sc["side"], html.escape(res["symbol"])),
+        "%s <b>سیگنال قطعی %s — %s</b>" % (icon, sc["side"], html.escape(res["symbol"])),
         "امتیاز: <b>%d/100</b>" % sc["score"],
         "",
         "ورود (%s): <code>%s</code>" % (t["order_type"], fmt_price(t["entry"])),
         "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(t["sl"]), t["stop_pct"]),
-        "TP1: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp1"]), t["rr1"]),
-        "TP2: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp2"]), t["rr2"]),
+        "TP1: <code>%s</code> (RR %.2f | خالص %.2f)" % (fmt_price(t["tp1"]), t["rr1"], t["rr1n"]),
+        "TP2: <code>%s</code> (RR %.2f | خالص %.2f)" % (fmt_price(t["tp2"]), t["rr2"], t["rr2n"]),
+        "(RR خالص بعد از کارمزد رفت‌وبرگشت %.2f%%)" % t["cost_pct"],
         "",
-        "ریسک پیشنهادی: %.2f%% سرمایه | حداکثر اهرم: %.0fx" % (RISK_PCT, MAX_LEVERAGE),
+        "ریسک پیشنهادی: %.2f%% سرمایه (شامل کارمزد) | حداکثر اهرم: %.0fx" % (RISK_PCT, MAX_LEVERAGE),
         "اهرم مؤثر پیشنهادی: %.2fx" % t["notional_x"],
     ]
     if t["capped"]:
@@ -704,53 +810,79 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     for n in sc["notes"]:
         lines.append("• " + html.escape(n))
     lines.append("")
-    lines.append("قیمت فعلی: %s" % fmt_price(res["price"]))
+    lines.append("قیمت فعلی: %s | سن داده: %.0f دقیقه" % (fmt_price(res["price"]), max(res["data_age_min"], 0.0)))
     lines.append("اگر قبل از فعال‌شدن ورود، حد ضرر لمس شود سیگنال باطل است.")
     lines.append("⚠️ فقط تحلیل است؛ سفارشی به‌صورت خودکار ثبت نمی‌شود.")
     return "\n".join(lines)
+
+
+def no_signal_reason(res: Dict[str, Any]) -> str:
+    if res.get("reason_override"):
+        return res["reason_override"]
+    if res["global_blockers"]:
+        return res["global_blockers"][0]
+    lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+    best = lg if lg["score"] >= sh["score"] else sh
+    if best["blockers"]:
+        return best["blockers"][0]
+    if best["soft_blockers"]:
+        return best["soft_blockers"][0]
+    return "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
 
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now, ""]
-    for res in results:
-        sym = html.escape(res["symbol"])
-        D = res["D"]
-        lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
-        lines.append("<b>%s</b> | قیمت: %s" % (sym, fmt_price(res["price"])))
-        lines.append("روند 4H/1H/15m: %s / %s / %s" % (
-            TREND_FA[D["4h"]["trend"]], TREND_FA[D["1h"]["trend"]], TREND_FA[D["15m"]["trend"]]))
-        lines.append("LONG: %d | SHORT: %d" % (lg["score"], sh["score"]))
-        sig = res["signal"]
-        if sig:
-            lines.append("✅ سیگنال %s صادر شد" % sig["side"])
+    sigs = [r for r in results if r["signal"]]
+    lines.append("🎯 سیگنال قطعی: %d" % len(sigs))
+    for r in sigs:
+        lines.append("• %s %s (امتیاز %d)" % (html.escape(r["symbol"]), r["signal"]["side"], r["signal"]["score"]))
+    watches = [r for r in results if r.get("watch") and not r["signal"]]
+    if watches:
+        lines.append("")
+        lines.append("👀 <b>Watchlist</b> — هنوز سیگنال نیست؛ ورود فقط بعد از تحقق شرط:")
+        for r in watches:
+            w = r["watch"]
+            t = w["trade"]
+            lines.append("")
+            lines.append("<b>%s %s</b> | امتیاز %d | قیمت %s" % (
+                html.escape(r["symbol"]), w["side"], w["score"], fmt_price(r["price"])))
+            lines.append("شرط فعال‌سازی: " + html.escape(w["condition"]))
+            lines.append("سناریو: ورود %s | SL %s | TP1 %s | TP2 %s | RR خالص %.2f" % (
+                fmt_price(t["entry"]), fmt_price(t["sl"]), fmt_price(t["tp1"]),
+                fmt_price(t["tp2"]), t["rr2n"]))
+            if w["extra"]:
+                lines.append("توضیح: " + html.escape(w["extra"]))
+    lines.append("")
+    lines.append("🔎 <b>خلاصه‌ی بازار</b>")
+    for r in results:
+        D = r["D"]
+        lg, sh = r["scenarios"]["LONG"], r["scenarios"]["SHORT"]
+        if r["signal"]:
+            status = "✅ سیگنال %s" % r["signal"]["side"]
+        elif r.get("watch"):
+            status = "👀 Watchlist"
         else:
-            best = lg if lg["score"] >= sh["score"] else sh
-            if res["global_blockers"]:
-                reason = res["global_blockers"][0]
-            elif best["blockers"]:
-                reason = best["blockers"][0]
-            else:
-                reason = "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
-            lines.append("⛔ بدون سیگنال: %s" % html.escape(reason))
-            bt = best["trade"]
-            if bt:
-                lines.append("سناریوی %s (غیرفعال): ورود %s | SL %s | TP1 %s | TP2 %s" % (
-                    best["side"], fmt_price(bt["entry"]), fmt_price(bt["sl"]),
-                    fmt_price(bt["tp1"]), fmt_price(bt["tp2"])))
-        liq = res["liq"]
+            status = "⛔ " + html.escape(no_signal_reason(r))
+        age = max(r["data_age_min"], 0.0)
+        stale = " ⚠️ داده قدیمی" if age > 20 else ""
+        liq = r["liq"]
         pool = []
         if liq["bsl"] is not None:
             pool.append("BSL%s %s" % ("(EQH)" if liq["bsl_eq"] else "", fmt_price(liq["bsl"])))
         if liq["ssl"] is not None:
             pool.append("SSL%s %s" % ("(EQL)" if liq["ssl_eq"] else "", fmt_price(liq["ssl"])))
+        lines.append("<b>%s</b> %s | %s%s%s | L%d S%d | %s | داده %.0fد" % (
+            html.escape(r["symbol"]), fmt_price(r["price"]),
+            TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]],
+            lg["score"], sh["score"], status, age) + stale)
         if pool:
-            lines.append("نقدینگی نزدیک: " + " | ".join(pool))
-        lines.append("")
+            lines.append("   نقدینگی: " + " | ".join(pool))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
-    lines.append("تعداد سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
+    lines.append("")
+    lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
 
 
@@ -796,6 +928,9 @@ def send_telegram(text: str) -> bool:
     return ok
 
 
+# --------------------------------------------------------------------------
+# Cooldown state (best effort)
+# --------------------------------------------------------------------------
 def load_state() -> Dict[str, float]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -815,6 +950,9 @@ def save_state(state: Dict[str, float]) -> None:
         log.warning("could not save state: %s", e)
 
 
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
 def to_plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
@@ -852,7 +990,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ScanError as e:
             log.error("%s: %s", sym, e)
             errors.append((sym, str(e)))
-        except Exception as e:
+        except Exception as e:  # keep the scan alive on unexpected per-symbol bugs
             log.exception("%s: unexpected error", sym)
             errors.append((sym, "unexpected error: %s" % e))
 
@@ -869,6 +1007,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_report_file(outbox)
         return 1
 
+    cnt = {"LONG": 0, "SHORT": 0}
+    for r in sorted([x for x in results if x["signal"]], key=lambda x: -x["signal"]["score"]):
+        sd = r["signal"]["side"]
+        if cnt[sd] >= MAX_SAME_DIR:
+            r["watch"] = make_watch(r, r["signal"], "سقف سیگنال هم‌جهت در یک اسکن")
+            r["reason_override"] = "سقف سیگنال هم‌جهت در یک اسکن"
+            r["signal"] = None
+        else:
+            cnt[sd] += 1
+
     state = load_state()
     sent = 0
     for res in results:
@@ -879,7 +1027,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if time.time() - state.get(key, 0.0) < COOLDOWN_H * 3600:
             log.info("%s in cooldown, skipped", key)
             res["signal"] = None
-            res["global_blockers"] = list(res["global_blockers"]) + ["سیگنال مشابه اخیراً ارسال شده (cooldown)"]
+            res["reason_override"] = "سیگنال مشابه اخیراً ارسال شده (cooldown)"
             continue
         if send(format_signal(res, sig)) or args.dry_run:
             state[key] = time.time()
