@@ -18,7 +18,7 @@ Pipeline per symbol:
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
-  SYMBOLS            comma list, default BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT
+  SYMBOLS            comma list, default BTC,ETH,SOL,BNB,XRP,DOGE,ADA,AVAX,LINK,TON (_USDT)
   MIN_SCORE          default 75
   RISK_PCT           risk per trade in % of equity, default 0.5
   MAX_LEVERAGE       default 2
@@ -59,7 +59,8 @@ log = logging.getLogger("signal_scanner")
 # Configuration
 # --------------------------------------------------------------------------
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-DEFAULT_SYMBOLS = "BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT"
+DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
+                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,TON_USDT")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -93,7 +94,11 @@ STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
 MAX_SAME_DIR = 2            # max signals in the same direction per scan
 MSS_MAX_DELAY = 8           # MSS must happen within N candles after the sweep
 MSS_MIN_BODY = 0.8          # MSS candle body >= this x ATR
-MIN_ATR_RANK = 0.10         # 15m ATR percentile (last 100 candles) below this = dead market
+MIN_ATR_RANK = 0.10         # 15m ATR percentile (last 100 candles) below this = quiet market
+QUIET_RANGE_RANK = 0.10     # 20-candle 15m range percentile (vs last ~200 windows) below this = compression
+BREAKOUT_WINDOW = 20        # candles that define the compression range
+BREAKOUT_MAX_RANK = 0.30    # the range before a breakout must be in the lowest 30% of this symbol's own ranges
+BREAKOUT_MIN_VOL = 1.2      # breakout candle volume >= this x mean volume of the range
 
 # tf name -> (LBank type, seconds)
 TF_MAP: Dict[str, Tuple[str, int]] = {
@@ -105,6 +110,7 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+REGIME_FA = {"DEAD": "مرده", "QUIET": "فشرده", "NORMAL": "عادی", "WILD": "پرنوسان"}
 
 
 class ScanError(Exception):
@@ -236,6 +242,20 @@ def fetch_price(symbol: str) -> Optional[float]:
     return None
 
 
+def fetch_pairs() -> Optional[set]:
+    """Best-effort list of LBank spot pairs; None if unavailable (then no filtering)."""
+    try:
+        data = http_json(LBANK_BASE + "/v2/currencyPairs.do")
+    except ScanError as e:
+        log.warning("pair list unavailable: %s", e)
+        return None
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    pairs = {str(x).lower() for x in items if isinstance(x, str)}
+    return pairs if "btc_usdt" in pairs else None
+
+
 # --------------------------------------------------------------------------
 # ATR / volume (filters only)
 # --------------------------------------------------------------------------
@@ -328,7 +348,7 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
         "name": name, "cs": cs, "close": c[-1],
         "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
         "highs": highs, "lows": lows, "struct": st, "trend": trend,
-        "atr_rank": atr_rank,
+        "atr_rank": atr_rank, "atr_list": at,
     }
 
 
@@ -506,17 +526,80 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # Scenario evaluation
 # --------------------------------------------------------------------------
-def global_blockers(D: Dict[str, Dict[str, Any]], price: float) -> List[str]:
+def squeeze_info(d: Dict[str, Any], n: int = BREAKOUT_WINDOW) -> Dict[str, float]:
+    """Current n-candle range, in ATR and as a percentile of this symbol's own
+    recent n-candle ranges (adaptive: no fixed threshold shared by all coins)."""
+    cs: Candles = d["cs"]
+    total = len(cs)
+    hi, lo = max(cs.h[-n:]), min(cs.l[-n:])
+    cur = hi - lo
+    start = max(n, total - 200)
+    ranges = [max(cs.h[i - n:i]) - min(cs.l[i - n:i]) for i in range(start, total + 1)]
+    rank = sum(1 for x in ranges if x <= cur) / float(len(ranges))
+    return {"hi": hi, "lo": lo, "range_atr": cur / d["atr"], "range_rank": rank}
+
+
+def detect_breakout(d: Dict[str, Any], within: int = 3) -> Optional[Dict[str, Any]]:
+    """Valid breakout from a compression: strong-bodied close beyond the prior
+    20-candle range (which was tight vs this symbol's own history) with
+    above-average volume, still outside the range now."""
+    cs: Candles = d["cs"]
+    at: List[float] = d["atr_list"]
+    n = len(cs)
+    w = BREAKOUT_WINDOW
+    ranges: Dict[int, float] = {}
+    for j in range(max(w, n - 1 - within - 200), n):
+        ranges[j] = max(cs.h[j - w:j]) - min(cs.l[j - w:j])
+    for k in range(n - 1, n - 1 - within, -1):
+        if k - w < 1 or k not in ranges:
+            break
+        hi, lo = max(cs.h[k - w:k]), min(cs.l[k - w:k])
+        a = at[k - 1]
+        if a <= 0:
+            continue
+        hist = [v for j, v in ranges.items() if j <= k]
+        rank = sum(1 for v in hist if v <= ranges[k]) / float(len(hist))
+        if rank > BREAKOUT_MAX_RANK:
+            continue
+        vmean = sum(cs.v[k - w:k]) / float(w)
+        if vmean <= 0 or cs.v[k] < BREAKOUT_MIN_VOL * vmean:
+            continue
+        body = cs.c[k] - cs.o[k]
+        if cs.c[k] > hi and body >= MSS_MIN_BODY * a and cs.c[-1] > hi:
+            return {"dir": "UP", "idx": k, "level": hi, "range_hi": hi, "range_lo": lo}
+        if cs.c[k] < lo and -body >= MSS_MIN_BODY * a and cs.c[-1] < lo:
+            return {"dir": "DOWN", "idx": k, "level": lo, "range_hi": hi, "range_lo": lo}
+    return None
+
+
+def classify_regime(D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
+    """DEAD (untradable), QUIET (compressed: only a valid breakout may trade),
+    NORMAL, WILD (too volatile)."""
+    d15 = D["15m"]
+    atr_pct = d15["atr"] / price
+    sq = squeeze_info(d15)
+    bo = detect_breakout(d15)
+    quiet = d15["atr_rank"] < MIN_ATR_RANK or sq["range_rank"] < QUIET_RANGE_RANK
+    if atr_pct < MIN_ATR_PCT:
+        name = "DEAD"
+    elif atr_pct > MAX_ATR_PCT:
+        name = "WILD"
+    elif quiet:
+        name = "QUIET"
+    else:
+        name = "NORMAL"
+    return {"name": name, "breakout": bo, "squeeze": sq, "atr_pct": atr_pct}
+
+
+def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
+                    regime: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     d15, d5 = D["15m"], D["5m"]
-    atr_pct = d15["atr"] / price
-    if atr_pct < MIN_ATR_PCT:
-        out.append("نوسان بازار خیلی کم است")
-    elif d15["atr_rank"] < MIN_ATR_RANK:
-        out.append("نوسان 15m نسبت به ۱۰۰ کندل اخیر خیلی کم است")
-    elif atr_pct > MAX_ATR_PCT:
+    if regime["name"] == "DEAD":
+        out.append("نوسان بازار خیلی کم است (بازار مرده)")
+    elif regime["name"] == "WILD":
         out.append("نوسان بازار بیش‌ازحد زیاد است")
-    if d15["vol_ratio"] < MIN_VOL_RATIO:
+    if d15["vol_ratio"] < MIN_VOL_RATIO and not regime["breakout"]:
         out.append("حجم معاملات ضعیف است")
     cs5: Candles = d5["cs"]
     cs15: Candles = d15["cs"]
@@ -691,8 +774,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep}
-
-
 PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
             "momentum": 15, "rr": 10, "room": 5}
 PART_HINT = {
@@ -740,8 +821,16 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     if abs(price - last_close) / last_close > 0.02:
         log.warning("%s ticker %.6f deviates from last close %.6f; using close", symbol, price, last_close)
         price = last_close
-    gb = global_blockers(D, price)
+    regime = classify_regime(D, price)
+    gb = global_blockers(D, price, regime)
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
+    bo = regime["breakout"]
+    for sc in scenarios.values():
+        want_dir = "UP" if sc["side"] == "LONG" else "DOWN"
+        if bo and bo["dir"] == want_dir:
+            sc["notes"].append("شکست معتبر از فشردگی (بدنه‌دار + حجم) بالای/زیر %s" % fmt_price(bo["level"]))
+        elif regime["name"] == "QUIET":
+            sc["blockers"].insert(0, "بازار فشرده؛ ورود فقط پس از شکست معتبر (بدنه‌دار + حجم)")
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
         if (s["score"] >= min_score and not s["blockers"] and not s["soft_blockers"]
@@ -752,7 +841,7 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     res: Dict[str, Any] = {
         "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
         "global_blockers": gb, "signal": signal, "watch": None,
-        "reason_override": None, "data_age_min": age_min,
+        "reason_override": None, "data_age_min": age_min, "regime": regime,
         "liq": liquidity_map(D["15m"], price),
     }
     if not signal and not gb:
@@ -761,6 +850,8 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
         if cands:
             res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
     return res
+
+
 def fmt_price(p: float) -> str:
     if p >= 1000:
         return "%.2f" % p
@@ -842,6 +933,25 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                 fmt_price(t["tp2"]), t["rr2n"]))
             if w["extra"]:
                 lines.append("توضیح: " + html.escape(w["extra"]))
+    breakouts = [r for r in results if r["regime"]["breakout"]]
+    if breakouts:
+        lines.append("")
+        lines.append("🚀 <b>شکست معتبر از فشردگی</b>")
+        for r in breakouts:
+            b = r["regime"]["breakout"]
+            lines.append("%s | %s | سطح %s (رنج %s تا %s)" % (
+                html.escape(r["symbol"]), "صعودی" if b["dir"] == "UP" else "نزولی",
+                fmt_price(b["level"]), fmt_price(b["range_lo"]), fmt_price(b["range_hi"])))
+    squeezes = [r for r in results if r["regime"]["name"] == "QUIET" and not r["regime"]["breakout"]]
+    if squeezes:
+        lines.append("")
+        lines.append("⏳ <b>فشردگی نوسان</b> — منتظر شکست معتبر:")
+        for r in squeezes:
+            q = r["regime"]["squeeze"]
+            lines.append("%s | رنج ۲۰ کندل 15m: بالا %s | پایین %s (≈ %.1f ATR، صدک %.0f%%)" % (
+                html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
+                q["range_atr"], q["range_rank"] * 100.0))
+        lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
     lines.append("")
     lines.append("🔎 <b>خلاصه‌ی بازار</b>")
     for r in results:
@@ -861,10 +971,10 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             pool.append("BSL%s %s" % ("(EQH)" if liq["bsl_eq"] else "", fmt_price(liq["bsl"])))
         if liq["ssl"] is not None:
             pool.append("SSL%s %s" % ("(EQL)" if liq["ssl_eq"] else "", fmt_price(liq["ssl"])))
-        lines.append("<b>%s</b> %s | %s%s%s | L%d S%d | %s | داده %.0fد" % (
+        lines.append("<b>%s</b> %s | %s%s%s | L%d S%d | نوسان %s | %s | داده %.0fد" % (
             html.escape(r["symbol"]), fmt_price(r["price"]),
             TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]],
-            lg["score"], sh["score"], status, age) + stale)
+            lg["score"], sh["score"], REGIME_FA[r["regime"]["name"]], status, age) + stale)
         if pool:
             lines.append("   نقدینگی: " + " | ".join(pool))
     for sym, err in errors:
@@ -872,8 +982,6 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("")
     lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
-
-
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
@@ -956,7 +1064,7 @@ def write_report_file(parts: List[str]) -> None:
 
 SCAN_LOG_FIELDS = [
     "ts_utc", "symbol", "price", "last_candle_utc", "trend_4h", "trend_1h", "trend_15m",
-    "long_score", "short_score", "status", "side", "entry", "sl", "tp1", "tp2",
+    "long_score", "short_score", "regime", "status", "side", "entry", "sl", "tp1", "tp2",
     "rr2_net", "stop_pct", "reason",
 ]
 
@@ -989,7 +1097,7 @@ def append_scan_log(results: List[Dict[str, Any]]) -> None:
                     "last_candle_utc": datetime.fromtimestamp(last_t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "trend_4h": D["4h"]["trend"], "trend_1h": D["1h"]["trend"], "trend_15m": D["15m"]["trend"],
                     "long_score": lg["score"], "short_score": sh["score"],
-                    "status": status, "side": sc["side"],
+                    "regime": r["regime"]["name"], "status": status, "side": sc["side"],
                     "entry": t.get("entry", ""), "sl": t.get("sl", ""),
                     "tp1": t.get("tp1", ""), "tp2": t.get("tp2", ""),
                     "rr2_net": round(t["rr2n"], 3) if t else "",
@@ -1018,6 +1126,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     results: List[Dict[str, Any]] = []
     errors: List[Tuple[str, str]] = []
+    pairs = fetch_pairs()
+    if pairs:
+        for sym in [x for x in symbols if x.lower() not in pairs]:
+            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد؛ نادیده گرفته شد"))
+        symbols = [x for x in symbols if x.lower() in pairs]
     for sym in symbols:
         try:
             results.append(analyze_symbol(sym, args.min_score))
