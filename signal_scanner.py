@@ -18,7 +18,7 @@ Pipeline per symbol:
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
-  SYMBOLS            comma list, default BTC,ETH,SOL,BNB,XRP,DOGE,ADA,AVAX,LINK,TON (_USDT)
+  SYMBOLS            comma list, default 15 liquid majors/alts (see DEFAULT_SYMBOLS)
   MIN_SCORE          default 75
   RISK_PCT           risk per trade in % of equity, default 0.5
   MAX_LEVERAGE       default 2
@@ -27,9 +27,6 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
-  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
-  REPORT_FILE        plain-text report output, default report.txt
-  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
 
 Usage:
   python signal_scanner.py
@@ -60,7 +57,8 @@ log = logging.getLogger("signal_scanner")
 # --------------------------------------------------------------------------
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
 DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
-                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,TON_USDT")
+                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,TON_USDT,"
+                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -77,6 +75,7 @@ REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
 SCAN_LOG_FILE = os.getenv("SCAN_LOG_FILE", "scan_log.csv")   # empty string disables logging
+DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")        # per-gate diagnostic report (never sent to Telegram)
 
 MAX_STOP_PCT = 3.0          # max stop distance, % of entry
 MAX_STOP_ATR = 3.0          # max stop distance in 15m ATR
@@ -176,6 +175,8 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
             log.warning("%s - retry %d/%d", last_err, attempt, retries)
             time.sleep(min(2 ** attempt, 20))
     raise ScanError("request failed after %d tries (%s)" % (retries, last_err))
+
+
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
@@ -523,6 +524,8 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
         out["ssl"] = s
         out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
     return out
+
+
 # --------------------------------------------------------------------------
 # Scenario evaluation
 # --------------------------------------------------------------------------
@@ -606,8 +609,6 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
     if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"] or (cs15.h[-1] - cs15.l[-1]) > 4.0 * d15["atr"]:
         out.append("کندل اسپایک اخیر؛ صبر برای آرام‌شدن بازار")
     return out
-
-
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
     want, opp = ("UP", "DOWN") if long else ("DOWN", "UP")
@@ -774,6 +775,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep}
+
+
 PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
             "momentum": 15, "rr": 10, "room": 5}
 PART_HINT = {
@@ -893,8 +896,6 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     lines.append("اگر قبل از فعال‌شدن ورود، حد ضرر لمس شود سیگنال باطل است.")
     lines.append("⚠️ فقط تحلیل است؛ سفارشی به‌صورت خودکار ثبت نمی‌شود.")
     return "\n".join(lines)
-
-
 def no_signal_reason(res: Dict[str, Any]) -> str:
     if res.get("reason_override"):
         return res["reason_override"]
@@ -982,6 +983,8 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("")
     lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
+
+
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
@@ -1109,12 +1112,77 @@ def append_scan_log(results: List[Dict[str, Any]]) -> None:
         log.warning("could not write scan log %s: %s", path, e)
 
 
+def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
+    """One line per gate for each side: PASS / FAIL with the measured value.
+    Diagnostic only; does not change any decision."""
+    D = res["D"]
+    out: List[str] = []
+    out.append("=" * 70)
+    out.append("%s | price %s | regime %s | min_score %d" % (
+        res["symbol"], fmt_price(res["price"]), res["regime"]["name"], min_score))
+    out.append("  trend 4H=%s 1H=%s 15m=%s 5m=%s | struct 15m=%d 5m=%d" % (
+        D["4h"]["trend"], D["1h"]["trend"], D["15m"]["trend"], D["5m"]["trend"],
+        D["15m"]["struct"], D["5m"]["struct"]))
+    out.append("  vol_ratio 15m=%.2f | atr_rank 15m=%.2f | atr%% 15m=%.3f%%" % (
+        D["15m"]["vol_ratio"], D["15m"]["atr_rank"], res["regime"]["atr_pct"] * 100.0))
+    for name in ("LONG", "SHORT"):
+        sc = res["scenarios"][name]
+        t = sc["trade"]
+        out.append("  --- %s score=%d parts=%s" % (name, sc["score"],
+                   ", ".join("%s=%d" % (k, round(v)) for k, v in sc["parts"].items())))
+        want = "UP" if name == "LONG" else "DOWN"
+        aligned_ok = D["4h"]["trend"] == want or D["1h"]["trend"] == want
+        against = D["4h"]["trend"] == ("DOWN" if name == "LONG" else "UP") or \
+            D["1h"]["trend"] == ("DOWN" if name == "LONG" else "UP")
+        out.append("    [HTF aligned]      %s  (4H=%s 1H=%s)" % (
+            "PASS" if aligned_ok and not against else "FAIL", D["4h"]["trend"], D["1h"]["trend"]))
+        out.append("    [structure]        %s  (sweep=%s mss=%s)" % (
+            "PASS" if not sc["soft_blockers"] else "FAIL",
+            "yes" if sc["sweep"] else "no", "yes" if sc["parts"].get("mss") else "no"))
+        if t:
+            out.append("    [stop distance]    %s  (%.3f%%, max %.1f%%)" % (
+                "PASS" if not any("حد ضرر" in b for b in sc["blockers"]) else "FAIL",
+                t["stop_pct"], MAX_STOP_PCT))
+            out.append("    [RR net to TP2]    %s  (%.2f, min %.1f, fee %.2f%%/side)" % (
+                "PASS" if t["rr2n"] >= MIN_RR2_NET else "FAIL", t["rr2n"], MIN_RR2_NET, FEE_PCT))
+            out.append("    [HTF obstacle]     %s  (room in R: %s)" % (
+                "FAIL" if any("مانع HTF" in b for b in sc["blockers"]) else "PASS",
+                "see blockers"))
+        else:
+            out.append("    [trade levels]     FAIL  (no trade built)")
+        out.append("    [score>=min]       %s  (%d)" % ("PASS" if sc["score"] >= min_score else "FAIL", sc["score"]))
+        if sc["blockers"]:
+            out.append("    blockers: " + " | ".join(sc["blockers"]))
+    out.append("  global: " + (" | ".join(res["global_blockers"]) if res["global_blockers"] else "none"))
+    out.append("  => decision: %s" % (
+        ("SIGNAL " + res["signal"]["side"]) if res["signal"] else
+        ("WATCH " + res["watch"]["side"]) if res.get("watch") else
+        "NONE (" + no_signal_reason(res) + ")"))
+    return out
+
+
+def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
+    """Write the diagnostic report locally only (never sent to Telegram)."""
+    path = os.getenv("DIAG_FILE", DIAG_FILE)
+    if not path:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = ["DIAGNOSTIC REPORT — %s" % now, ""]
+    for r in results:
+        lines.extend(gate_table(r, min_score))
+        lines.append("")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        log.warning("could not write diag report %s: %s", path, e)
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
     ap.add_argument("--min-score", type=float, default=MIN_SCORE)
     ap.add_argument("--dry-run", action="store_true", help="print only, do not send to Telegram")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--diag", action="store_true", help="also write per-gate diagnostic report")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1183,6 +1251,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.dry_run:
         save_state(state)
         append_scan_log(results)
+    if args.diag or args.dry_run:
+        write_diag(results, args.min_score)
     send(format_report(results, errors, sent))
     write_report_file(outbox)
     return 0
