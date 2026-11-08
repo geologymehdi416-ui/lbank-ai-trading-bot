@@ -33,6 +33,7 @@ Environment variables:
   DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
   FIB_CONFIRM        1 = Fibonacci affects score/TP; 0 (default) = diagnostics only
   SWING_MIN_AMP      0 (default, off) or a swing needs a move >= this x ATR
+  CARD_MIN_RR        display only: hide conditional cards whose TP1 net RR is below this (default 0 = all)
 
 Usage:
   python signal_scanner.py
@@ -102,6 +103,7 @@ MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees
 WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
+CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)  # display only: hide cards whose TP1 net RR is below this (0 = show all)
 STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
 MAX_SAME_DIR = 2            # max signals in the same direction per scan
 MSS_MAX_DELAY = 8           # MSS must happen within N candles after the sweep
@@ -835,10 +837,13 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "rr1n": rr1n, "rr2n": rr2n, "cost_pct": cost,
             "stop_pct": risk_pct, "order_type": order_type,
             "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
+            "tp2_ok": len(targets) > 1,
         }
         if not targets:
             trade = None
             blockers.append("تارگت معتبر با RR خالص مثبت پیدا نشد")
+        elif len(targets) < 2:
+            blockers.append("تارگت دوم معتبر پیدا نشد")
         elif rr2n < MIN_RR2_NET:
             blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
         htf = collect_levels(D, htf_only=True)
@@ -1023,25 +1028,22 @@ def no_signal_reason(res: Dict[str, Any]) -> str:
 
 
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
-    """Complete trade plan for the dominant side. Single source of truth: the scanner's own
-    trade object (same entry, SL, targets and leverage the signal engine uses). Targets are
-    structural and net-RR positive only. Incomplete confirmations never remove the plan;
-    they are listed as missing items."""
+    """Complete trade plan for the dominant side, taken from the scanner's own trade object.
+    Targets are structural and net-RR positive only; a second target is shown only if it is
+    valid. Incomplete confirmations never remove the plan: they are listed as missing items."""
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
     short = dom == "SHORT"
     sc = ss if short else ls
     price = res["price"]
     t = sc["trade"]
+    missing = list(sc["soft_blockers"]) + list(sc["blockers"])
     if res.get("signal") and res["signal"]["side"] == dom:
         status = "سیگنال صادر شد"
-    elif sc["soft_blockers"]:
-        status = "ستاپ ناقص: " + sc["soft_blockers"][0]
-    elif sc["blockers"]:
-        status = "در انتظار رفع مانع: " + sc["blockers"][0]
+    elif missing:
+        status = "در انتظار: " + missing[0]
     else:
-        status = "شرط‌ها تقریباً کامل؛ منتظر تأیید نهایی"
-    missing = list(sc["soft_blockers"]) + list(sc["blockers"])
+        status = "شرط‌ها کامل؛ منتظر تأیید نهایی"
     if t:
         when = "ورود %s به %s" % ("لیمیت" if t["order_type"] == "LIMIT" else "بازار", fmt_price(t["entry"]))
         retest = (short and t["entry"] > price) or ((not short) and t["entry"] < price)
@@ -1071,16 +1073,19 @@ def format_card(res: Dict[str, Any]) -> List[str]:
     if t:
         lines.append("ورود: %s (%s)" % (f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار"))
         lines.append("حد ضرر: %s (فاصله %.2f%%)" % (f(t["sl"]), t["stop_pct"]))
-        lines.append("تارگت اول: %s (RR خالص %.2f) | تارگت دوم: %s (RR خالص %.2f)" % (
-            f(t["tp1"]), t["rr1n"], f(t["tp2"]), t["rr2n"]))
+        tp1 = "تارگت اول: %s (RR خالص %.2f)" % (f(t["tp1"]), t["rr1n"])
+        if t.get("tp2_ok", True):
+            tp1 += " | تارگت دوم: %s (RR خالص %.2f)" % (f(t["tp2"]), t["rr2n"])
+        else:
+            tp1 += " | تارگت دوم: — (معتبر پیدا نشد)"
+        lines.append(tp1)
         lines.append("اهرم: تا %.2fx (ریسک %.2f%% ÷ فاصله‌ی حد ضرر + کارمزد)" % (t["notional_x"], RISK_PCT))
     else:
         lines.append("طرح معامله: — (تارگت یا حد ضرر معتبر پیدا نشد)")
     lines.append("شرط فعال‌سازی: " + html.escape(c["activation"]))
-    if c["missing"]:
-        lines.append("نواقص تأیید: " + html.escape(" | ".join(c["missing"])))
-    else:
-        lines.append("نواقص تأیید: ندارد")
+    rest = c["missing"][1:]
+    if rest:
+        lines.append("نواقص دیگر: " + html.escape(" | ".join(rest)))
     return lines
 
 
@@ -1105,7 +1110,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             lines.append("شرط فعال‌سازی: " + html.escape(w["condition"]))
             lines.append("سناریو: ورود %s | SL %s | TP1 %s | TP2 %s | RR خالص %.2f" % (
                 fmt_price(t["entry"]), fmt_price(t["sl"]), fmt_price(t["tp1"]),
-                fmt_price(t["tp2"]), t["rr2n"]))
+                (fmt_price(t["tp2"]) if t.get("tp2_ok", True) else "—"), t["rr2n"]))
             if w["extra"]:
                 lines.append("توضیح: " + html.escape(w["extra"]))
     breakouts = [r for r in results if r["regime"]["breakout"]]
@@ -1127,8 +1132,16 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                 html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
                 q["range_atr"], q["range_rank"] * 100.0))
         lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
+
+    def _card_ok(r: Dict[str, Any]) -> bool:
+        c = build_card(r)
+        if c["trade"] is None or CARD_MIN_RR <= 0:
+            return True
+        return c["trade"]["rr1n"] >= CARD_MIN_RR
+
     cards = sorted([r for r in results
-                    if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN],
+                    if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
+                    and _card_ok(r)],
                    key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     lines.append("")
     lines.append("🧭 <b>فرصت‌های شرطی (امتیاز ≥ %d)</b>" % WATCH_MIN)
