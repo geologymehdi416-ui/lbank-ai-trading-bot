@@ -28,6 +28,7 @@ Environment variables:
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
   FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
   REPORT_FILE        plain-text report output, default report.txt
+  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
 
 Usage:
   python signal_scanner.py
@@ -36,6 +37,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import json
 import logging
@@ -72,6 +74,7 @@ MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
+SCAN_LOG_FILE = os.getenv("SCAN_LOG_FILE", "scan_log.csv")   # empty string disables logging
 
 MAX_STOP_PCT = 3.0          # max stop distance, % of entry
 MAX_STOP_ATR = 3.0          # max stop distance in 15m ATR
@@ -729,16 +732,38 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "zone": zone, "sweep": sweep}
 
 
+PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
+            "momentum": 10, "rr": 10, "volume": 5, "room": 5}
+PART_HINT = {
+    "htf": "هم‌راستاشدن روند 4H/1H",
+    "sweep": "Sweep نقدینگی",
+    "mss": "MSS قوی",
+    "zone": "برگشت قیمت به ناحیه OB/FVG",
+    "momentum": "هم‌راستاشدن مومنتوم 15m",
+    "rr": "RR خالص بهتر",
+    "volume": "افزایش حجم",
+    "room": "فضای بیشتر تا مانع HTF",
+}
+
+
 def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
     liq = res["liq"]
-    if sc["side"] == "LONG":
-        lvl = liq["ssl"]
-        cond = ("جاروب زیر SSL≈%s، بسته‌شدن دوباره بالای آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
-                if lvl is not None else "منتظر Sweep نقدینگی فروش + MSS قوی")
+    if sc["soft_blockers"]:
+        if sc["side"] == "LONG":
+            lvl = liq["ssl"]
+            cond = ("جاروب زیر SSL≈%s، بسته‌شدن دوباره بالای آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                    if lvl is not None else "منتظر Sweep نقدینگی فروش + MSS قوی")
+        else:
+            lvl = liq["bsl"]
+            cond = ("جاروب بالای BSL≈%s، بسته‌شدن دوباره زیر آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                    if lvl is not None else "منتظر Sweep نقدینگی خرید + MSS قوی")
+    elif sc["score"] >= MIN_SCORE:
+        cond = "امتیاز و ساختار برقرار است؛ فقط محدودیت‌های اسکن مانع صدور شده"
     else:
-        lvl = liq["bsl"]
-        cond = ("جاروب بالای BSL≈%s، بسته‌شدن دوباره زیر آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
-                if lvl is not None else "منتظر Sweep نقدینگی خرید + MSS قوی")
+        gaps = [(PART_MAX[k] - sc["parts"].get(k, 0.0), k) for k in PART_MAX]
+        gaps = sorted([g for g in gaps if g[0] > 0], reverse=True)[:2]
+        txt = "، ".join("%s (−%d)" % (PART_HINT[k], round(g)) for g, k in gaps)
+        cond = "ساختار تأیید شده؛ امتیاز %d از %d. برای تکمیل: %s" % (sc["score"], MIN_SCORE, txt)
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
             "condition": cond, "extra": extra}
 
@@ -966,6 +991,53 @@ def write_report_file(parts: List[str]) -> None:
         log.warning("could not write %s: %s", path, e)
 
 
+SCAN_LOG_FIELDS = [
+    "ts_utc", "symbol", "price", "last_candle_utc", "trend_4h", "trend_1h", "trend_15m",
+    "long_score", "short_score", "status", "side", "entry", "sl", "tp1", "tp2",
+    "rr2_net", "stop_pct", "reason",
+]
+
+
+def append_scan_log(results: List[Dict[str, Any]]) -> None:
+    """Append one row per symbol so Watchlist/Signal outcomes can be reviewed later."""
+    path = os.getenv("SCAN_LOG_FILE", SCAN_LOG_FILE)
+    if not path:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=SCAN_LOG_FIELDS)
+            if new_file:
+                w.writeheader()
+            for r in results:
+                D = r["D"]
+                lg, sh = r["scenarios"]["LONG"], r["scenarios"]["SHORT"]
+                if r["signal"]:
+                    status, sc = "SIGNAL", r["signal"]
+                elif r.get("watch"):
+                    status, sc = "WATCH", r["scenarios"][r["watch"]["side"]]
+                else:
+                    status, sc = "NONE", (lg if lg["score"] >= sh["score"] else sh)
+                t = sc["trade"] or {}
+                last_t = D["5m"]["cs"].t[-1] + TF_MAP["5m"][1]
+                row = {
+                    "ts_utc": now, "symbol": r["symbol"], "price": r["price"],
+                    "last_candle_utc": datetime.fromtimestamp(last_t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "trend_4h": D["4h"]["trend"], "trend_1h": D["1h"]["trend"], "trend_15m": D["15m"]["trend"],
+                    "long_score": lg["score"], "short_score": sh["score"],
+                    "status": status, "side": sc["side"],
+                    "entry": t.get("entry", ""), "sl": t.get("sl", ""),
+                    "tp1": t.get("tp1", ""), "tp2": t.get("tp2", ""),
+                    "rr2_net": round(t["rr2n"], 3) if t else "",
+                    "stop_pct": round(t["stop_pct"], 3) if t else "",
+                    "reason": "" if r["signal"] else no_signal_reason(r),
+                }
+                w.writerow(row)
+    except OSError as e:
+        log.warning("could not write scan log %s: %s", path, e)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
@@ -1034,6 +1106,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sent += 1
     if not args.dry_run:
         save_state(state)
+        append_scan_log(results)
     send(format_report(results, errors, sent))
     write_report_file(outbox)
     return 0
