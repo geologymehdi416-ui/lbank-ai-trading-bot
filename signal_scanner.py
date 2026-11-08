@@ -1003,6 +1003,121 @@ def no_signal_reason(res: Dict[str, Any]) -> str:
     return "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
 
 
+def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Scenario card for the dominant side. Every number comes from candles:
+    key level = broken structural level (retest) or nearest level still to break,
+    SL = beyond the nearest structural extreme on the far side of the entry,
+    targets = next structural levels in the trade direction, leverage from SL distance."""
+    D = res["D"]
+    price = res["price"]
+    ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+    dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
+    short = dom == "SHORT"
+    d15, d1, d4 = D["15m"], D["1h"], D["4h"]
+    atr = d15["atr"]
+    cost = 2.0 * FEE_PCT
+    lows = sorted({p for _, p in d15["lows"] + d1["lows"] + d4["lows"]})
+    highs = sorted({p for _, p in d15["highs"] + d1["highs"] + d4["highs"]})
+    window = d15["cs"].c[-12:]
+    margin = 0.1 * atr
+    status = "بدون سطح ساختاری نزدیک"
+    key = None
+    if short:
+        broken = [L for L in lows if L > price + margin and min(window) < L - margin]
+        below = [L for L in lows if L < price]
+        if broken:
+            key = min(broken)
+            status = "شکست انجام شد؛ منتظر پولبک به سطح شکسته"
+        elif below:
+            key = max(below)
+            status = "منتظر شکست حمایت" if price - key <= 1.0 * atr else "دور از سطح کلیدی"
+    else:
+        broken = [H for H in highs if H < price - margin and max(window) > H + margin]
+        above = [H for H in highs if H > price]
+        if broken:
+            key = max(broken)
+            status = "شکست انجام شد؛ منتظر پولبک به سطح شکسته"
+        elif above:
+            key = min(above)
+            status = "منتظر شکست مقاومت" if key - price <= 1.0 * atr else "دور از سطح کلیدی"
+    sig = res.get("signal")
+    if sig and sig["side"] == dom:
+        status = "سیگنال صادر شد"
+
+    entry = key
+    sl_base = None
+    tps: List[float] = []
+    sl = None
+    if entry is not None:
+        if short:
+            sl_base = min([p for p in highs if p > entry], default=None)
+            tps = sorted([p for p in lows if p < entry], reverse=True)[:2]
+            sl = sl_base + 0.25 * atr if sl_base is not None else None
+        else:
+            sl_base = max([p for p in lows if p < entry], default=None)
+            tps = sorted([p for p in highs if p > entry])[:2]
+            sl = sl_base - 0.25 * atr if sl_base is not None else None
+    tp1 = tps[0] if len(tps) > 0 else None
+    tp2 = tps[1] if len(tps) > 1 else None
+    risk_pct = lev = rr1n = rr2n = None
+    if entry and sl:
+        if abs(sl - entry) / entry * 100.0 < MIN_STOP_PCT:      # same minimum width as the scanner
+            sl = entry + MIN_STOP_PCT / 100.0 * entry if short else entry - MIN_STOP_PCT / 100.0 * entry
+        risk_pct = abs(sl - entry) / entry * 100.0
+        if risk_pct > 0:
+            lev = min(MAX_LEVERAGE, (RISK_PCT / 100.0) / ((risk_pct + cost) / 100.0))
+        if tp1:
+            rr1n = (abs(tp1 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+        if tp2:
+            rr2n = (abs(tp2 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+    if key is None:
+        activation = "—"
+    elif short:
+        activation = ("تأیید: کندل 15m بسته‌شده زیر %s با حجم ≥ %.1f× میانگین، سپس پولبک و رد سطح"
+                      % (fmt_price(key), BREAKOUT_MIN_VOL))
+    else:
+        activation = ("تأیید: کندل 15m بسته‌شده بالای %s با حجم ≥ %.1f× میانگین، سپس پولبک و رد سطح"
+                      % (fmt_price(key), BREAKOUT_MIN_VOL))
+    return {"side": dom, "score_short": ss["score"], "score_long": ls["score"], "status": status,
+            "entry": entry, "sl": sl, "sl_base": sl_base, "tp1": tp1, "tp2": tp2, "key": key,
+            "risk_pct": risk_pct, "lev": lev, "rr1n": rr1n, "rr2n": rr2n,
+            "activation": activation, "short": short}
+
+
+def format_card(res: Dict[str, Any]) -> List[str]:
+    c = build_card(res)
+    f = lambda v: fmt_price(v) if v is not None else "—"
+    lines = [
+        "<b>%s</b> | قیمت %s" % (html.escape(res["symbol"]), fmt_price(res["price"])),
+        "جهت غالب: %s" % c["side"],
+        "امتیاز شورت: %d | امتیاز لانگ: %d" % (c["score_short"], c["score_long"]),
+        "وضعیت: " + html.escape(c["status"]),
+    ]
+    if c["entry"] is not None:
+        if c["status"].startswith("شکست"):
+            when = "بعد از پولبک به"
+        else:
+            when = "بعد از شکست و پولبک به"
+        lines.append("ورود احتمالی: %s %s (فقط بعد از تأیید)" % (when, f(c["entry"])))
+    else:
+        lines.append("ورود احتمالی: — (سطح کلیدی مشخص نیست)")
+    if c["sl"] is not None:
+        where = "بالای سقف ساختاری" if c["short"] else "پایین کف ساختاری"
+        lines.append("حد ضرر: %s (%s %s؛ فاصله %.2f%%)" % (
+            f(c["sl"]), where, f(c["sl_base"]), c["risk_pct"]))
+    else:
+        lines.append("حد ضرر: — (سقف/کف ساختاری نزدیک نیست)")
+    lines.append("تارگت اول: %s (RR خالص %s) | تارگت دوم: %s (RR خالص %s)" % (
+        f(c["tp1"]), "%.2f" % c["rr1n"] if c["rr1n"] is not None else "—",
+        f(c["tp2"]), "%.2f" % c["rr2n"] if c["rr2n"] is not None else "—"))
+    if c["lev"] is not None:
+        lines.append("اهرم: تا %.2fx (ریسک %.2f%% سرمایه با فاصله‌ی حد ضرر و کارمزد)" % (c["lev"], RISK_PCT))
+    else:
+        lines.append("اهرم: — ")
+    lines.append("شرط فعال‌سازی: " + html.escape(c["activation"]))
+    return lines
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1046,6 +1161,14 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                 html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
                 q["range_atr"], q["range_rank"] * 100.0))
         lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
+    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))[:5]
+    if top:
+        lines.append("")
+        lines.append("🧭 <b>کارت سناریو — ۵ ارز با امتیاز برتر</b>")
+        lines.append("اعداد از داده‌ی بازار محاسبه شده‌اند و پیش‌بینی نیستند.")
+        for r in top:
+            lines.append("")
+            lines.extend(format_card(r))
     lines.append("")
     lines.append("🔎 <b>خلاصه‌ی بازار</b>")
     for r in results:
@@ -1076,8 +1199,6 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("")
     lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
-
-
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
@@ -1140,6 +1261,8 @@ def save_state(state: Dict[str, float]) -> None:
             json.dump(state, f)
     except OSError as e:
         log.warning("could not save state: %s", e)
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
