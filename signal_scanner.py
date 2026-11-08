@@ -101,7 +101,7 @@ MIN_CANDLES = 100
 MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees
-WATCH_MIN = 60              # minimum score for the Watchlist
+WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
 STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
 MAX_SAME_DIR = 2            # max signals in the same direction per scan
 MSS_MAX_DELAY = 8           # MSS must happen within N candles after the sweep
@@ -694,6 +694,27 @@ def fib_info(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Dict[str,
     return out
 
 
+def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
+                 fee_pct: float) -> List[Tuple[float, float]]:
+    """Nearest structural levels in the trade direction whose NET reward/risk is positive.
+    Returns up to two (price, rr_net). Invalid or negative-RR levels are skipped."""
+    cost = 2.0 * fee_pct
+    risk_pct = risk / entry * 100.0
+    pool = sorted([p for p in levels if (p > entry if long else p < entry)], reverse=not long)
+    out: List[Tuple[float, float]] = []
+    last = 0.0
+    for p in pool:
+        dist = abs(p - entry) / entry * 100.0
+        rr = (dist - cost) / (risk_pct + cost)
+        if rr <= 0 or dist <= last:
+            continue
+        out.append((p, rr))
+        last = dist
+        if len(out) == 2:
+            break
+    return out
+
+
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
     want, opp = ("UP", "DOWN") if long else ("DOWN", "UP")
@@ -795,14 +816,9 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         levels = collect_levels(D)
         if FIB_CONFIRM and fib["valid"]:
             levels = levels + [p for _, p in fib["targets"]]
-        cands = [p for p in levels if (p > entry if long else p < entry)]
-        if not long:
-            cands.sort(reverse=True)
-        sign = 1.0 if long else -1.0
-        tp1 = next((p for p in cands if 1.2 * risk <= sign * (p - entry) <= 2.2 * risk),
-                   entry + sign * 1.5 * risk)
-        tp2 = next((p for p in cands if 2.5 * risk <= sign * (p - entry) <= 4.0 * risk),
-                   entry + sign * 3.0 * risk)
+        targets = pick_targets(levels, entry, risk, long, FEE_PCT)
+        tp1 = targets[0][0] if targets else (entry + (1.0 if long else -1.0) * risk)
+        tp2 = targets[1][0] if len(targets) > 1 else tp1
         rr1 = abs(tp1 - entry) / risk
         rr2 = abs(tp2 - entry) / risk
         risk_pct = risk / entry * 100.0
@@ -820,7 +836,10 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "stop_pct": risk_pct, "order_type": order_type,
             "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
         }
-        if rr2n < MIN_RR2_NET:
+        if not targets:
+            trade = None
+            blockers.append("تارگت معتبر با RR خالص مثبت پیدا نشد")
+        elif rr2n < MIN_RR2_NET:
             blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
         htf = collect_levels(D, htf_only=True)
         obst = [p for p in htf if (p > entry if long else p < entry)]
@@ -1004,117 +1023,64 @@ def no_signal_reason(res: Dict[str, Any]) -> str:
 
 
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
-    """Scenario card for the dominant side. Every number comes from candles:
-    key level = broken structural level (retest) or nearest level still to break,
-    SL = beyond the nearest structural extreme on the far side of the entry,
-    targets = next structural levels in the trade direction, leverage from SL distance."""
-    D = res["D"]
-    price = res["price"]
+    """Complete trade plan for the dominant side. Single source of truth: the scanner's own
+    trade object (same entry, SL, targets and leverage the signal engine uses). Targets are
+    structural and net-RR positive only. Incomplete confirmations never remove the plan;
+    they are listed as missing items."""
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
     short = dom == "SHORT"
-    d15, d1, d4 = D["15m"], D["1h"], D["4h"]
-    atr = d15["atr"]
-    cost = 2.0 * FEE_PCT
-    lows = sorted({p for _, p in d15["lows"] + d1["lows"] + d4["lows"]})
-    highs = sorted({p for _, p in d15["highs"] + d1["highs"] + d4["highs"]})
-    window = d15["cs"].c[-12:]
-    margin = 0.1 * atr
-    status = "بدون سطح ساختاری نزدیک"
-    key = None
-    if short:
-        broken = [L for L in lows if L > price + margin and min(window) < L - margin]
-        below = [L for L in lows if L < price]
-        if broken:
-            key = min(broken)
-            status = "شکست انجام شد؛ منتظر پولبک به سطح شکسته"
-        elif below:
-            key = max(below)
-            status = "منتظر شکست حمایت" if price - key <= 1.0 * atr else "دور از سطح کلیدی"
-    else:
-        broken = [H for H in highs if H < price - margin and max(window) > H + margin]
-        above = [H for H in highs if H > price]
-        if broken:
-            key = max(broken)
-            status = "شکست انجام شد؛ منتظر پولبک به سطح شکسته"
-        elif above:
-            key = min(above)
-            status = "منتظر شکست مقاومت" if key - price <= 1.0 * atr else "دور از سطح کلیدی"
-    sig = res.get("signal")
-    if sig and sig["side"] == dom:
+    sc = ss if short else ls
+    price = res["price"]
+    t = sc["trade"]
+    if res.get("signal") and res["signal"]["side"] == dom:
         status = "سیگنال صادر شد"
-
-    entry = key
-    sl_base = None
-    tps: List[float] = []
-    sl = None
-    if entry is not None:
-        if short:
-            sl_base = min([p for p in highs if p > entry], default=None)
-            tps = sorted([p for p in lows if p < entry], reverse=True)[:2]
-            sl = sl_base + 0.25 * atr if sl_base is not None else None
-        else:
-            sl_base = max([p for p in lows if p < entry], default=None)
-            tps = sorted([p for p in highs if p > entry])[:2]
-            sl = sl_base - 0.25 * atr if sl_base is not None else None
-    tp1 = tps[0] if len(tps) > 0 else None
-    tp2 = tps[1] if len(tps) > 1 else None
-    risk_pct = lev = rr1n = rr2n = None
-    if entry and sl:
-        if abs(sl - entry) / entry * 100.0 < MIN_STOP_PCT:      # same minimum width as the scanner
-            sl = entry + MIN_STOP_PCT / 100.0 * entry if short else entry - MIN_STOP_PCT / 100.0 * entry
-        risk_pct = abs(sl - entry) / entry * 100.0
-        if risk_pct > 0:
-            lev = min(MAX_LEVERAGE, (RISK_PCT / 100.0) / ((risk_pct + cost) / 100.0))
-        if tp1:
-            rr1n = (abs(tp1 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
-        if tp2:
-            rr2n = (abs(tp2 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
-    if key is None:
-        activation = "—"
-    elif short:
-        activation = ("تأیید: کندل 15m بسته‌شده زیر %s با حجم ≥ %.1f× میانگین، سپس پولبک و رد سطح"
-                      % (fmt_price(key), BREAKOUT_MIN_VOL))
+    elif sc["soft_blockers"]:
+        status = "ستاپ ناقص: " + sc["soft_blockers"][0]
+    elif sc["blockers"]:
+        status = "در انتظار رفع مانع: " + sc["blockers"][0]
     else:
-        activation = ("تأیید: کندل 15m بسته‌شده بالای %s با حجم ≥ %.1f× میانگین، سپس پولبک و رد سطح"
-                      % (fmt_price(key), BREAKOUT_MIN_VOL))
+        status = "شرط‌ها تقریباً کامل؛ منتظر تأیید نهایی"
+    missing = list(sc["soft_blockers"]) + list(sc["blockers"])
+    if t:
+        when = "ورود %s به %s" % ("لیمیت" if t["order_type"] == "LIMIT" else "بازار", fmt_price(t["entry"]))
+        retest = (short and t["entry"] > price) or ((not short) and t["entry"] < price)
+        if retest:
+            activation = ("پولبک به %s و رد سطح با کندل 15m هم‌جهت و حجم ≥ %.1f× میانگین (%s)"
+                          % (fmt_price(t["entry"]), BREAKOUT_MIN_VOL, when))
+        else:
+            side_word = "زیر" if short else "بالای"
+            activation = ("تأیید: کندل 15m بسته‌شده %s %s با حجم ≥ %.1f× میانگین (%s)"
+                          % (side_word, fmt_price(t["entry"]), BREAKOUT_MIN_VOL, when))
+    else:
+        activation = "—"
     return {"side": dom, "score_short": ss["score"], "score_long": ls["score"], "status": status,
-            "entry": entry, "sl": sl, "sl_base": sl_base, "tp1": tp1, "tp2": tp2, "key": key,
-            "risk_pct": risk_pct, "lev": lev, "rr1n": rr1n, "rr2n": rr2n,
-            "activation": activation, "short": short}
+            "trade": t, "missing": missing, "short": short, "activation": activation,
+            "price": price, "best_score": max(ls["score"], ss["score"])}
 
 
 def format_card(res: Dict[str, Any]) -> List[str]:
     c = build_card(res)
-    f = lambda v: fmt_price(v) if v is not None else "—"
+    t = c["trade"]
+    f = fmt_price
     lines = [
-        "<b>%s</b> | قیمت %s" % (html.escape(res["symbol"]), fmt_price(res["price"])),
-        "جهت غالب: %s" % c["side"],
-        "امتیاز شورت: %d | امتیاز لانگ: %d" % (c["score_short"], c["score_long"]),
+        "<b>%s</b> | قیمت %s" % (html.escape(res["symbol"]), f(c["price"])),
+        "جهت غالب: %s | امتیاز شورت: %d | امتیاز لانگ: %d" % (c["side"], c["score_short"], c["score_long"]),
         "وضعیت: " + html.escape(c["status"]),
     ]
-    if c["entry"] is not None:
-        if c["status"].startswith("شکست"):
-            when = "بعد از پولبک به"
-        else:
-            when = "بعد از شکست و پولبک به"
-        lines.append("ورود احتمالی: %s %s (فقط بعد از تأیید)" % (when, f(c["entry"])))
+    if t:
+        lines.append("ورود: %s (%s)" % (f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار"))
+        lines.append("حد ضرر: %s (فاصله %.2f%%)" % (f(t["sl"]), t["stop_pct"]))
+        lines.append("تارگت اول: %s (RR خالص %.2f) | تارگت دوم: %s (RR خالص %.2f)" % (
+            f(t["tp1"]), t["rr1n"], f(t["tp2"]), t["rr2n"]))
+        lines.append("اهرم: تا %.2fx (ریسک %.2f%% ÷ فاصله‌ی حد ضرر + کارمزد)" % (t["notional_x"], RISK_PCT))
     else:
-        lines.append("ورود احتمالی: — (سطح کلیدی مشخص نیست)")
-    if c["sl"] is not None:
-        where = "بالای سقف ساختاری" if c["short"] else "پایین کف ساختاری"
-        lines.append("حد ضرر: %s (%s %s؛ فاصله %.2f%%)" % (
-            f(c["sl"]), where, f(c["sl_base"]), c["risk_pct"]))
-    else:
-        lines.append("حد ضرر: — (سقف/کف ساختاری نزدیک نیست)")
-    lines.append("تارگت اول: %s (RR خالص %s) | تارگت دوم: %s (RR خالص %s)" % (
-        f(c["tp1"]), "%.2f" % c["rr1n"] if c["rr1n"] is not None else "—",
-        f(c["tp2"]), "%.2f" % c["rr2n"] if c["rr2n"] is not None else "—"))
-    if c["lev"] is not None:
-        lines.append("اهرم: تا %.2fx (ریسک %.2f%% سرمایه با فاصله‌ی حد ضرر و کارمزد)" % (c["lev"], RISK_PCT))
-    else:
-        lines.append("اهرم: — ")
+        lines.append("طرح معامله: — (تارگت یا حد ضرر معتبر پیدا نشد)")
     lines.append("شرط فعال‌سازی: " + html.escape(c["activation"]))
+    if c["missing"]:
+        lines.append("نواقص تأیید: " + html.escape(" | ".join(c["missing"])))
+    else:
+        lines.append("نواقص تأیید: ندارد")
     return lines
 
 
@@ -1161,14 +1127,17 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                 html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
                 q["range_atr"], q["range_rank"] * 100.0))
         lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
-    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))[:5]
-    if top:
+    cards = sorted([r for r in results
+                    if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN],
+                   key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
+    lines.append("")
+    lines.append("🧭 <b>فرصت‌های شرطی (امتیاز ≥ %d)</b>" % WATCH_MIN)
+    lines.append("این‌ها سیگنال نیستند؛ اعداد از داده‌ی بازار محاسبه شده‌اند و پیش‌بینی نیستند.")
+    if not cards:
+        lines.append("در این اسکن فرصت شرطی وجود ندارد.")
+    for r in cards[:10]:
         lines.append("")
-        lines.append("🧭 <b>کارت سناریو — ۵ ارز با امتیاز برتر</b>")
-        lines.append("اعداد از داده‌ی بازار محاسبه شده‌اند و پیش‌بینی نیستند.")
-        for r in top:
-            lines.append("")
-            lines.extend(format_card(r))
+        lines.extend(format_card(r))
     lines.append("")
     lines.append("🔎 <b>خلاصه‌ی بازار</b>")
     for r in results:
