@@ -27,10 +27,17 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
+  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
+  REPORT_FILE        plain-text report output, default report.txt
+  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
+  DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
+  FIB_CONFIRM        1 = Fibonacci affects score/TP; 0 (default) = diagnostics only
+  SWING_MIN_AMP      0 (default, off) or a swing needs a move >= this x ATR
 
 Usage:
   python signal_scanner.py
   python signal_scanner.py --symbols BTC_USDT,ETH_USDT --dry-run
+  python signal_scanner.py --diag
 """
 from __future__ import annotations
 
@@ -76,6 +83,12 @@ COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
 SCAN_LOG_FILE = os.getenv("SCAN_LOG_FILE", "scan_log.csv")   # empty string disables logging
 DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")        # per-gate diagnostic report (never sent to Telegram)
+
+FIB_CONFIRM = os.getenv("FIB_CONFIRM", "0").strip() == "1"   # 1 = Fibonacci affects score/TP; 0 = diagnostics only
+SWING_MIN_AMP = _env_float("SWING_MIN_AMP", 0.0)              # 0 = off; else a swing needs a move >= this x ATR
+FIB_EXT_LEVELS = (1.272, 1.618)   # extension targets measured from the pullback point
+FIB_PTS_OVERLAP = 5               # fib pullback zone overlaps an OB/FVG and price is in it
+FIB_PTS_ZONE = 2                  # price inside the fib pullback zone only
 
 MAX_STOP_PCT = 3.0          # max stop distance, % of entry
 MAX_STOP_ATR = 3.0          # max stop distance in 15m ATR
@@ -175,8 +188,6 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
             log.warning("%s - retry %d/%d", last_err, attempt, retries)
             time.sleep(min(2 ** attempt, 20))
     raise ScanError("request failed after %d tries (%s)" % (retries, last_err))
-
-
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
@@ -287,6 +298,8 @@ def volume_ratio(v: List[float]) -> float:
     if base <= 0:
         return 1.0
     return recent / base
+
+
 # --------------------------------------------------------------------------
 # Structure helpers
 # --------------------------------------------------------------------------
@@ -337,10 +350,30 @@ def structure_trend(c: List[float], highs: List[Tuple[int, float]],
     return "RANGE"
 
 
+def filter_swings_amp(h: List[float], l: List[float], highs, lows, at: List[float], min_amp: float):
+    """Keep only swings followed by a real move (>= min_amp x ATR) within 10 candles.
+    min_amp <= 0 disables the filter (default)."""
+    if min_amp <= 0:
+        return highs, lows
+
+    def amp_ok(i: int, price: float, is_high: bool) -> bool:
+        a = at[i] if i < len(at) else at[-1]
+        for j in range(i + 1, min(len(h), i + 11)):
+            if is_high and price - min(l[i:j + 1]) >= min_amp * a:
+                return True
+            if (not is_high) and max(h[i:j + 1]) - price >= min_amp * a:
+                return True
+        return False
+
+    return ([p for p in highs if amp_ok(p[0], p[1], True)],
+            [p for p in lows if amp_ok(p[0], p[1], False)])
+
+
 def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     c, h, l = cs.c, cs.h, cs.l
     at = atr(h, l, c)
     highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
+    highs, lows = filter_swings_amp(h, l, highs, lows, at, SWING_MIN_AMP)
     st = structure_dir(highs, lows)
     recent_atr = at[-100:]
     atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
@@ -524,8 +557,6 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
         out["ssl"] = s
         out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
     return out
-
-
 # --------------------------------------------------------------------------
 # Scenario evaluation
 # --------------------------------------------------------------------------
@@ -609,6 +640,60 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
     if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"] or (cs15.h[-1] - cs15.l[-1]) > 4.0 * d15["atr"]:
         out.append("کندل اسپایک اخیر؛ صبر برای آرام‌شدن بازار")
     return out
+
+
+def fib_info(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Dict[str, Any]:
+    """Fibonacci layer on the 1H impulse: pullback zone (0.618-0.786), extension
+    targets (1.272 / 1.618 from the pullback point) and overlap with 15m/5m OB/FVG.
+    Always computed; affects decisions only when FIB_CONFIRM=1."""
+    long = side == "LONG"
+    out: Dict[str, Any] = {"valid": False, "retr": None, "zone": None, "targets": [],
+                           "overlap": False, "in_zone": False, "pts": 0}
+    d1, d15, d5 = D["1h"], D["15m"], D["5m"]
+    if long:
+        if not d1["highs"] or not d1["lows"]:
+            return out
+        bi, bp = d1["highs"][-1]
+        prev = [p for p in d1["lows"] if p[0] < bi]
+        after = [p for p in d1["lows"] if p[0] > bi]
+        if not prev or not after:
+            return out
+        ap, cp = prev[-1][1], after[-1][1]
+        diff = bp - ap
+        if diff <= 0:
+            return out
+        retr = (bp - cp) / diff
+        zone = (bp - 0.786 * diff, bp - 0.618 * diff)
+        targets = [(k, cp + k * diff) for k in FIB_EXT_LEVELS if cp + k * diff > price]
+    else:
+        if not d1["lows"] or not d1["highs"]:
+            return out
+        bi, bp = d1["lows"][-1]
+        prev = [p for p in d1["highs"] if p[0] < bi]
+        after = [p for p in d1["highs"] if p[0] > bi]
+        if not prev or not after:
+            return out
+        ap, cp = prev[-1][1], after[-1][1]
+        diff = ap - bp
+        if diff <= 0:
+            return out
+        retr = (cp - bp) / diff
+        zone = (bp + 0.618 * diff, bp + 0.786 * diff)
+        targets = [(k, cp - k * diff) for k in FIB_EXT_LEVELS if cp - k * diff < price]
+    zlo, zhi = zone
+    valid = 0.3 <= retr <= 0.9
+    atr15 = d15["atr"]
+    overlap = any(max(z["bottom"], zlo) < min(z["top"], zhi)
+                  for z in _zones_for(d15, side) + _zones_for(d5, side))
+    in_zone = (zlo - 0.25 * atr15) <= price <= (zhi + 0.25 * atr15)
+    pts = 0
+    if valid and in_zone:
+        pts = FIB_PTS_OVERLAP if overlap else FIB_PTS_ZONE
+    out.update({"valid": valid, "retr": retr, "zone": zone, "targets": targets,
+                "overlap": overlap, "in_zone": in_zone, "pts": pts})
+    return out
+
+
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
     want, opp = ("UP", "DOWN") if long else ("DOWN", "UP")
@@ -668,6 +753,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
     if not structure_ok:
         soft.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
+    fib = fib_info(D, side, price)
 
     zone = pick_zone([d15, d5], side, price, atr15)
     if zone:
@@ -707,6 +793,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         blockers.append("فاصله حد ضرر بیش از حد مجاز است (%.2f%%)" % (risk / entry * 100.0))
     else:
         levels = collect_levels(D)
+        if FIB_CONFIRM and fib["valid"]:
+            levels = levels + [p for _, p in fib["targets"]]
         cands = [p for p in levels if (p > entry if long else p < entry)]
         if not long:
             cands.sort(reverse=True)
@@ -763,7 +851,10 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         mom += 4
     if d5["struct"] == (1 if long else -1):
         mom += 5
+    if FIB_CONFIRM:
+        mom = min(mom, 10.0)
     parts["momentum"] = mom
+    parts["fib"] = float(fib["pts"]) if FIB_CONFIRM else 0.0
     if mom >= 10:
         notes.append("مومنتوم پرایس‌اکشن: جابه‌جایی هم‌جهت و ساختار 5m هم‌راستا")
     if d15["vol_ratio"] >= 1.2:
@@ -774,11 +865,10 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         score = min(score, STRUCT_CAP)
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
-            "zone": zone, "sweep": sweep}
-
-
+            "zone": zone, "sweep": sweep, "fib": fib}
 PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
-            "momentum": 15, "rr": 10, "room": 5}
+            "momentum": 10 if FIB_CONFIRM else 15, "rr": 10, "room": 5,
+            "fib": FIB_PTS_OVERLAP if FIB_CONFIRM else 0}
 PART_HINT = {
     "htf": "هم‌راستاشدن روند 4H/1H",
     "sweep": "Sweep نقدینگی",
@@ -787,6 +877,7 @@ PART_HINT = {
     "momentum": "کندل‌های جابه‌جایی هم‌جهت و ساختار 5m",
     "rr": "RR خالص بهتر",
     "room": "فضای بیشتر تا مانع HTF",
+    "fib": "تأیید فیبوناچی (ناحیه پولبک + OB/FVG)",
 }
 
 
@@ -896,6 +987,8 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     lines.append("اگر قبل از فعال‌شدن ورود، حد ضرر لمس شود سیگنال باطل است.")
     lines.append("⚠️ فقط تحلیل است؛ سفارشی به‌صورت خودکار ثبت نمی‌شود.")
     return "\n".join(lines)
+
+
 def no_signal_reason(res: Dict[str, Any]) -> str:
     if res.get("reason_override"):
         return res["reason_override"]
@@ -1047,8 +1140,6 @@ def save_state(state: Dict[str, float]) -> None:
             json.dump(state, f)
     except OSError as e:
         log.warning("could not save state: %s", e)
-
-
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -1068,7 +1159,7 @@ def write_report_file(parts: List[str]) -> None:
 SCAN_LOG_FIELDS = [
     "ts_utc", "symbol", "price", "last_candle_utc", "trend_4h", "trend_1h", "trend_15m",
     "long_score", "short_score", "regime", "status", "side", "entry", "sl", "tp1", "tp2",
-    "rr2_net", "stop_pct", "reason",
+    "rr2_net", "stop_pct", "reason", "fib_valid", "fib_overlap",
 ]
 
 
@@ -1106,6 +1197,8 @@ def append_scan_log(results: List[Dict[str, Any]]) -> None:
                     "rr2_net": round(t["rr2n"], 3) if t else "",
                     "stop_pct": round(t["stop_pct"], 3) if t else "",
                     "reason": "" if r["signal"] else no_signal_reason(r),
+                    "fib_valid": sc.get("fib", {}).get("valid", ""),
+                    "fib_overlap": sc.get("fib", {}).get("overlap", ""),
                 }
                 w.writerow(row)
     except OSError as e:
@@ -1151,6 +1244,14 @@ def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
         else:
             out.append("    [trade levels]     FAIL  (no trade built)")
         out.append("    [score>=min]       %s  (%d)" % ("PASS" if sc["score"] >= min_score else "FAIL", sc["score"]))
+        fb = sc.get("fib", {})
+        fz = fb.get("zone")
+        out.append("    [FIB] valid=%s retr=%s zone=%s overlap=%s in_zone=%s pts=%d (%s) targets=%s" % (
+            fb.get("valid"), ("%.2f" % fb["retr"]) if fb.get("retr") is not None else "-",
+            ("%s..%s" % (fmt_price(fz[0]), fmt_price(fz[1]))) if fz else "-",
+            fb.get("overlap"), fb.get("in_zone"), fb.get("pts", 0),
+            "APPLIED" if FIB_CONFIRM else "info only",
+            ", ".join("%.3f->%s" % (k, fmt_price(p)) for k, p in fb.get("targets", [])) or "-"))
         if sc["blockers"]:
             out.append("    blockers: " + " | ".join(sc["blockers"]))
     out.append("  global: " + (" | ".join(res["global_blockers"]) if res["global_blockers"] else "none"))
@@ -1176,6 +1277,8 @@ def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
             f.write("\n".join(lines) + "\n")
     except OSError as e:
         log.warning("could not write diag report %s: %s", path, e)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
