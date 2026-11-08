@@ -7,7 +7,8 @@ Analysis-only crypto futures signal scanner (NO order execution).
 
 Pipeline per symbol:
   1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
-  2. Higher-timeframe trend, EMA20/50/200, RSI, MACD, ATR, volume ratio.
+  2. Higher-timeframe STRUCTURE trend (HH/HL, LH/LL, CHoCH); ATR and volume
+     are used only as market filters. No EMA/RSI/MACD (pure price action).
   3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
@@ -236,52 +237,8 @@ def fetch_price(symbol: str) -> Optional[float]:
 
 
 # --------------------------------------------------------------------------
-# Indicators
+# ATR / volume (filters only)
 # --------------------------------------------------------------------------
-def ema(values: List[float], n: int) -> List[float]:
-    if not values:
-        return []
-    k = 2.0 / (n + 1)
-    out = [values[0]]
-    for x in values[1:]:
-        out.append(x * k + out[-1] * (1 - k))
-    return out
-
-
-def _rsi_val(ag: float, al: float) -> float:
-    if al == 0:
-        return 100.0 if ag > 0 else 50.0
-    return 100.0 - 100.0 / (1.0 + ag / al)
-
-
-def rsi(closes: List[float], n: int = 14) -> List[float]:
-    if len(closes) <= n:
-        return [50.0] * len(closes)
-    gains = losses = 0.0
-    for i in range(1, n + 1):
-        d = closes[i] - closes[i - 1]
-        gains += max(d, 0.0)
-        losses += max(-d, 0.0)
-    ag, al = gains / n, losses / n
-    out = [50.0] * n
-    out.append(_rsi_val(ag, al))
-    for i in range(n + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        ag = (ag * (n - 1) + max(d, 0.0)) / n
-        al = (al * (n - 1) + max(-d, 0.0)) / n
-        out.append(_rsi_val(ag, al))
-    return out
-
-
-def macd(closes: List[float], fast: int = 12, slow: int = 26, sig: int = 9
-         ) -> Tuple[List[float], List[float], List[float]]:
-    ef, es = ema(closes, fast), ema(closes, slow)
-    line = [a - b for a, b in zip(ef, es)]
-    signal = ema(line, sig)
-    hist = [a - b for a, b in zip(line, signal)]
-    return line, signal, hist
-
-
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
     for i in range(1, len(c)):
@@ -340,30 +297,38 @@ def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]])
     return 0
 
 
+def structure_trend(c: List[float], highs: List[Tuple[int, float]],
+                    lows: List[Tuple[int, float]]) -> str:
+    """Pure price-action trend: HH/HL = UP, LH/LL = DOWN; a close beyond the last
+    opposite swing (CHoCH) turns the trend into RANGE."""
+    if not highs or not lows:
+        return "RANGE"
+    st = structure_dir(highs, lows)
+    last = c[-1]
+    if st == 1:
+        return "RANGE" if last < lows[-1][1] else "UP"
+    if st == -1:
+        return "RANGE" if last > highs[-1][1] else "DOWN"
+    if last > highs[-1][1]:
+        return "UP"
+    if last < lows[-1][1]:
+        return "DOWN"
+    return "RANGE"
+
+
 def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     c, h, l = cs.c, cs.h, cs.l
-    e20, e50, e200 = ema(c, 20), ema(c, 50), ema(c, 200)
-    rs = rsi(c)
-    ml, ms, mh = macd(c)
     at = atr(h, l, c)
     highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
     st = structure_dir(highs, lows)
     recent_atr = at[-100:]
     atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
-    pts = 0
-    pts += 1 if c[-1] > e50[-1] else -1
-    pts += 1 if e20[-1] > e50[-1] else -1
-    pts += 1 if c[-1] > e200[-1] else -1
-    pts += 2 * st
-    trend = "UP" if pts >= 3 else "DOWN" if pts <= -3 else "RANGE"
+    trend = structure_trend(c, highs, lows)
     return {
         "name": name, "cs": cs, "close": c[-1],
-        "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
-        "rsi": rs[-1], "macd": ml[-1], "macd_sig": ms[-1],
-        "hist": mh[-1], "hist_prev": mh[-2] if len(mh) > 1 else mh[-1],
         "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
         "highs": highs, "lows": lows, "struct": st, "trend": trend,
-        "trend_pts": pts, "atr_rank": atr_rank,
+        "atr_rank": atr_rank,
     }
 
 
@@ -704,25 +669,21 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     else:
         parts["rr"] = 0.0
 
+    cs15: Candles = d15["cs"]
+    n15 = len(cs15)
+    sgn = 1.0 if long else -1.0
     mom = 0.0
-    if (d15["ema20"] > d15["ema50"]) == long:
-        mom += 3
-    r = d15["rsi"]
-    if (long and 45 <= r <= 70) or (not long and 30 <= r <= 55):
-        mom += 3
-    hist, hprev = d15["hist"], d15["hist_prev"]
-    if long:
-        mom += 4 if hist > 0 and hist >= hprev else 2 if hist > 0 else 0
-    else:
-        mom += 4 if hist < 0 and hist <= hprev else 2 if hist < 0 else 0
+    if any(sgn * (cs15.c[k] - cs15.o[k]) >= 0.8 * atr15 for k in range(n15 - 6, n15)):
+        mom += 6
+    if sum(sgn * (cs15.c[k] - cs15.o[k]) for k in range(n15 - 3, n15)) >= 0.3 * atr15:
+        mom += 4
+    if d5["struct"] == (1 if long else -1):
+        mom += 5
     parts["momentum"] = mom
-    if mom >= 7:
-        notes.append("مومنتوم 15m تأیید می‌کند (RSI %.0f)" % r)
-
-    vr = d15["vol_ratio"]
-    parts["volume"] = 5.0 if vr >= 1.2 else 3.0 if vr >= 0.8 else 1.0 if vr >= MIN_VOL_RATIO else 0.0
-    if vr >= 1.2:
-        notes.append("حجم بالاتر از میانگین (x%.2f)" % vr)
+    if mom >= 10:
+        notes.append("مومنتوم پرایس‌اکشن: جابه‌جایی هم‌جهت و ساختار 5m هم‌راستا")
+    if d15["vol_ratio"] >= 1.2:
+        notes.append("حجم بالاتر از میانگین (x%.2f)" % d15["vol_ratio"])
 
     score = int(round(sum(parts.values())))
     if not structure_ok:
@@ -733,15 +694,14 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
 
 PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
-            "momentum": 10, "rr": 10, "volume": 5, "room": 5}
+            "momentum": 15, "rr": 10, "room": 5}
 PART_HINT = {
     "htf": "هم‌راستاشدن روند 4H/1H",
     "sweep": "Sweep نقدینگی",
     "mss": "MSS قوی",
     "zone": "برگشت قیمت به ناحیه OB/FVG",
-    "momentum": "هم‌راستاشدن مومنتوم 15m",
+    "momentum": "کندل‌های جابه‌جایی هم‌جهت و ساختار 5m",
     "rr": "RR خالص بهتر",
-    "volume": "افزایش حجم",
     "room": "فضای بیشتر تا مانع HTF",
 }
 
@@ -760,10 +720,13 @@ def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict
     elif sc["score"] >= MIN_SCORE:
         cond = "امتیاز و ساختار برقرار است؛ فقط محدودیت‌های اسکن مانع صدور شده"
     else:
-        gaps = [(PART_MAX[k] - sc["parts"].get(k, 0.0), k) for k in PART_MAX]
+        soon = ("zone", "momentum", "rr", "room")
+        gaps = [(PART_MAX[k] - sc["parts"].get(k, 0.0), k) for k in soon]
         gaps = sorted([g for g in gaps if g[0] > 0], reverse=True)[:2]
-        txt = "، ".join("%s (−%d)" % (PART_HINT[k], round(g)) for g, k in gaps)
-        cond = "ساختار تأیید شده؛ امتیاز %d از %d. برای تکمیل: %s" % (sc["score"], MIN_SCORE, txt)
+        txt = ("، ".join("%s (−%d)" % (PART_HINT[k], round(g)) for g, k in gaps)
+               if gaps else "Sweep/MSS یا هم‌راستایی بهتر HTF")
+        cond = "ساختار تأیید شده؛ امتیاز %d از %d (کمبود %d). برای تکمیل: %s" % (
+            sc["score"], MIN_SCORE, MIN_SCORE - sc["score"], txt)
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
             "condition": cond, "extra": extra}
 
