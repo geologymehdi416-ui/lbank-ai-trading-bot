@@ -36,7 +36,8 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
-MIN_SCORE = _env_float("MIN_SCORE", 75.0)
+# کاهش پیش‌فرض حداقل امتیاز به 65 برای تسهیل صدور سیگنال قطعی (ENTER)
+MIN_SCORE = _env_float("MIN_SCORE", 65.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
@@ -334,7 +335,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: SMC Pattern Detection and Smart Decision Engine
+# Part 4/5: SMC Pattern Detection and Facilitated Decision Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -564,10 +565,13 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     s4 = 12 if d4["trend"] == want else 4 if d4["trend"] == "RANGE" else 0
     s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
     parts["htf"] = s4 + s1
+    
     aligned = (d4["trend"] == want) + (d1["trend"] == want)
     against = (d4["trend"] == opp) + (d1["trend"] == opp)
-    if aligned == 0 or against > 0:
-        blockers.append("روند 4H/1H با جهت سناریو هم‌راستا نیست")
+    
+    # تسهیل شرط روند: به جای بلوک کامل، فقط در صورت مخالفت شدید روند کلان بلاک می‌شود
+    if against > 1:
+        blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
     else:
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
@@ -647,17 +651,14 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     parts["momentum"] = 10.0
 
     # -------------------------------------------------------------------------
-    # محاسبه پایه امتیاز و اعمال فیلتر هوشمند خودکار
+    # محاسبه پایه امتیاز و اعمال فیلتر هوشمند خودکار و پاداش لانگ
     # -------------------------------------------------------------------------
     base_score = int(round(sum(parts.values())))
     score = base_score
     
-    # فیلتر هوشمند: جریمه سنگین خودکار برای شورت‌های خلاف روند صعودی اصلی بازار
     if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
         score -= 25
         blockers.append("شورت خلاف روند صعودی اصلی بازار (فیلتر خودکار)")
-
-    # پاداش خودکار به پوزیشن‌های لانگ هم‌راستا با رشد بازار
     elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
         score += 10
 
@@ -686,7 +687,10 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        if s["score"] >= min_score and not s["blockers"] and not gb and s["trade"]:
+        # تسهیل صدور سیگنال قطعی: اجازه می‌دهد با وجود بلاکرهای غیربحرانی، سیگنال ENTER صادر شود
+        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "RR" in b]
+        
+        if s["score"] >= min_score and not critical_blockers and not gb and s["trade"]:
             signal = s
             break
             
@@ -698,7 +702,7 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
         "liq": liquidity_map(D["15m"], price),
     }
     if not signal and not gb:
-        cands = [s for s in scenarios.values() if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN]
+        cands = [s for s in scenarios.values() if s["trade"] and s["score"] >= WATCH_MIN]
         if cands:
             res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
     return res
