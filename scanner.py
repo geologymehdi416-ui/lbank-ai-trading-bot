@@ -1,2199 +1,756 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-LBANK AI FUTURES SCANNER
-Hybrid ICT / SMC / Liquidity Model
-
-Timeframes:
-4H  : Higher timeframe bias
-1H  : Market structure and liquidity pools
-15M : Liquidity sweep and MSS confirmation
-5M  : FVG / Order Block entry zone
-
-Risk:
-Maximum leverage: 2x
-Margin mode: ISOLATED
-Maximum planned account risk: 0.5%
-
-IMPORTANT:
-OHLCV-based liquidity is an estimate, not actual order-book liquidity.
-This scanner does not execute trades.
+signal_scanner.py (Part 1/5)
+-----------------
+Smart Market Analyst V3 - Final Production Grade with Strict Validator.
 """
+from __future__ import annotations
 
-import os
+import argparse
+import csv
+import html
 import json
+import logging
 import math
+import os
+import re
+import sys
 import time
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-from pathlib import Path
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+log = logging.getLogger("signal_scanner")
 
+LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
+DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
+                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,"
+                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT")
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-DATA_FILE = Path("data/prices.jsonl")
-REPORT_FILE = Path("report.txt")
-
-OKX_URL = "https://www.okx.com/api/v5/market/candles"
-
-CORE_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "LINKUSDT", "AVAXUSDT", "LTCUSDT",
-]
-
-MAX_SNAPSHOT_AGE_MINUTES = 20
-MIN_TURNOVER = 100000
-PRICE_DIFF_LIMIT = 0.75
-
-MAX_RETRIES = 3
-MAX_WORKERS = 5
-
-MAX_LEVERAGE = 2
-RISK_PER_TRADE_PERCENT = 0.5
-MARGIN_MODE = "ISOLATED"
-
-MIN_RR = 2.0
-MIN_STOP_PERCENT = 0.15
-MAX_STOP_PERCENT = 3.0
-
-MIN_5M_VOLUME_RATIO = 1.0
-MIN_15M_VOLUME_RATIO = 0.8
-
-PIVOT_LEFT = 3
-PIVOT_RIGHT = 3
-
-EQUAL_LEVEL_ATR_TOLERANCE = 0.20
-SWEEP_ATR_BUFFER = 0.05
-STOP_ATR_BUFFER = 0.15
-
-MAX_SWEEP_AGE_15M = 8
-MAX_ENTRY_ZONE_AGE_5M = 20
-
-MIN_SIGNAL_SCORE = 75
-MIN_WATCH_SCORE = 45
-
-INTERVALS = {
-    "5m": "5m",
-    "15m": "15m",
-    "1h": "1H",
-    "4h": "4H",
-}
-
-BLOCKED_SYMBOLS = {
-    "SOXSUSDT", "SOXLUSDT", "QQQUSDT",
-    "TQQQUSDT", "SKHYNIXUSDT", "SKHYUSDT",
-    "SNXXUSDT", "MUSTOCKUSDT",
-}
-
-HEADERS = {
-    "User-Agent": "LBank-ICT-SMC-Liquidity-Scanner/13.0"
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-
-class SkipSymbol(Exception):
-    pass
-
-
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def number(value, default=None):
-
+def _env_float(name: str, default: float) -> float:
     try:
-        if value is None:
-            return default
-
-        result = float(value)
-
-        if not math.isfinite(result):
-            return default
-
-        return result
-
-    except (TypeError, ValueError, OverflowError):
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
         return default
 
+MIN_SCORE = _env_float("MIN_SCORE", 65.0)
+RISK_PCT = _env_float("RISK_PCT", 0.5)
+MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
+REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
+MAX_STOP_PCT = 3.0
+MIN_CANDLES = 100
+FEE_PCT = _env_float("FEE_PCT", 0.06)
+WATCH_MIN = 60
+STRUCT_CAP = 70
+MSS_MAX_DELAY = 8
+MSS_MIN_BODY = 0.8
 
-def fmt(value):
+TF_MAP: Dict[str, Tuple[str, int]] = {
+    "5m": ("minute5", 300),
+    "15m": ("minute15", 900),
+    "1h": ("hour1", 3600),
+    "4h": ("hour4", 14400),
+}
 
-    value = number(value)
+TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
+TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (ممیزی شده)", "NO_ENTRY": "ورود نکن"}
 
-    if value is None:
-        return "N/A"
+class ScanError(Exception):
+    """Recoverable error for a single symbol / request."""
+# --------------------------------------------------------------------------
+# Part 2/5: Robust Network Requests & Data Sanitization
+# --------------------------------------------------------------------------
+_last_req = 0.0
 
-    return f"{value:,.8g}"
+def _throttle() -> None:
+    global _last_req
+    wait = REQUEST_INTERVAL - (time.monotonic() - _last_req)
+    if wait > 0:
+        time.sleep(wait)
+    _last_req = time.monotonic()
 
+def http_json(url: str, params: Optional[Dict[str, Any]] = None,
+              body: Optional[Dict[str, Any]] = None,
+              retries: int = 4, timeout: float = 15.0) -> Any:
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    data = None
+    headers = {"User-Agent": "signal-scanner/3.0", "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    last_err = "unknown"
+    for attempt in range(1, retries + 1):
+        _throttle()
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s" % e.code
+            if e.code == 429 or e.code >= 500:
+                time.sleep(min(float(2 ** attempt), 30))
+                continue
+            raise ScanError("Network HTTP Error: %s" % last_err)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            last_err = "network timeout/connection: %s" % (getattr(e, "reason", None) or e)
+            time.sleep(min(float(2 ** attempt), 20))
+        except (json.JSONDecodeError, ValueError):
+            last_err = "invalid JSON payload"
+            time.sleep(min(float(2 ** attempt), 20))
+    raise ScanError("Request failed after %d attempts (%s)" % (retries, last_err))
 
-def safe_div(a, b):
+class Candles:
+    def __init__(self, rows: List[Tuple[float, float, float, float, float, float]]):
+        self.t = [r[0] for r in rows]
+        self.o = [r[1] for r in rows]
+        self.h = [r[2] for r in rows]
+        self.l = [r[3] for r in rows]
+        self.c = [r[4] for r in rows]
+        self.v = [r[5] for r in rows]
 
-    a = number(a)
-    b = number(b)
+    def __len__(self) -> int:
+        return len(self.c)
 
-    if a is None or b is None or b == 0:
-        return None
+def fetch_klines(symbol: str, tf: str, size: int = 300) -> Candles:
+    typ, sec = TF_MAP[tf]
+    now = int(time.time())
+    start = now - size * sec
+    data = http_json(LBANK_BASE + "/v2/kline.do",
+                     {"symbol": symbol.lower(), "size": size, "type": typ, "time": start})
+    if not isinstance(data, dict) or str(data.get("result", "")).lower() != "true":
+        raise ScanError("Invalid API kline response for %s [%s]" % (symbol, tf))
+    rows_raw = data.get("data")
+    if not isinstance(rows_raw, list):
+        raise ScanError("Empty data array for %s [%s]" % (symbol, tf))
+    parsed: Dict[int, Tuple[float, float, float, float, float, float]] = {}
+    for r in rows_raw:
+        try:
+            ts = int(float(r[0]))
+            if ts > 10 ** 11:
+                ts //= 1000
+            o, h, l, c, v = (float(x) for x in r[1:6])
+        except (ValueError, TypeError, IndexError):
+            continue
+        if min(o, h, l, c) <= 0 or h < l or v < 0:
+            continue
+        parsed[ts] = (ts, o, h, l, c, v)
+    rows = [parsed[k] for k in sorted(parsed)]
+    if rows and rows[-1][0] + sec > time.time():
+        rows.pop()
+    if len(rows) < MIN_CANDLES:
+        raise ScanError("Insufficient candles: got %d (required %d)" % (len(rows), MIN_CANDLES))
+    return Candles(rows)
 
-    return a / b
-
-
-def get_first(row, keys):
-
-    if not isinstance(row, dict):
-        return None
-
-    for key in keys:
-        if row.get(key) is not None:
-            return row[key]
-
+def fetch_price(symbol: str) -> Optional[float]:
+    try:
+        data = http_json(LBANK_BASE + "/v2/ticker/24hr.do", {"symbol": symbol.lower()})
+        items = data.get("data") if isinstance(data, dict) else None
+        if isinstance(items, list) and items:
+            tk = items[0].get("ticker", {})
+            p = float(tk.get("latest"))
+            if p > 0:
+                return p
+    except Exception:
+        pass
     return None
 
-
-def parse_timestamp(value):
-
-    if value is None:
-        return None
-
+def fetch_pairs() -> Optional[set]:
     try:
-
-        if isinstance(value, (int, float)):
-
-            x = float(value)
-
-            return x / 1000 if x > 1e12 else x
-
-        text = str(value).strip()
-
-        if text.isdigit():
-            return parse_timestamp(int(text))
-
-        dt = datetime.fromisoformat(
-            text.replace("Z", "+00:00")
-        )
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        return dt.timestamp()
-
-    except Exception:
+        data = http_json(LBANK_BASE + "/v2/currencyPairs.do")
+    except ScanError:
         return None
-
-
-def candle_body(candle):
-
-    return abs(candle[4] - candle[1])
-
-
-def candle_range(candle):
-
-    return candle[2] - candle[3]
-
-
-def is_bullish_candle(candle):
-
-    return candle[4] > candle[1]
-
-
-def is_bearish_candle(candle):
-
-    return candle[4] < candle[1]
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema_series(values, period):
-
-    out = [None] * len(values)
-
-    if len(values) < period:
-        return out
-
-    current = sum(values[:period]) / period
-
-    out[period - 1] = current
-
-    alpha = 2 / (period + 1)
-
-    for i in range(period, len(values)):
-
-        current = (
-            values[i] * alpha
-            + current * (1 - alpha)
-        )
-
-        out[i] = current
-
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    pairs = {str(x).lower() for x in items if isinstance(x, str)}
+    return pairs if "btc_usdt" in pairs else None
+# --------------------------------------------------------------------------
+# Part 3/5: Structure Calculations, Liquidity Map & Strict Trade Plan Validator
+# --------------------------------------------------------------------------
+def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
+    trs = [h[0] - l[0]]
+    for i in range(1, len(c)):
+        trs.append(max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])))
+    out: List[float] = []
+    a = 0.0
+    for i, tr in enumerate(trs):
+        if i < n - 1:
+            out.append(sum(trs[:i + 1]) / (i + 1))
+        elif i == n - 1:
+            a = sum(trs[:n]) / n
+            out.append(a)
+        else:
+            a = (a * (n - 1) + tr) / n
+            out.append(a)
     return out
 
-
-def rsi(values, period=14):
-
-    if len(values) <= period:
-        return None
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(changes)):
-
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        return 50 if avg_gain == 0 else 100
-
-    return 100 - 100 / (
-        1 + avg_gain / avg_loss
-    )
-
-
-def macd(values):
-
-    fast = ema_series(values, 12)
-    slow = ema_series(values, 26)
-
-    line = [
-        f - s
-        for f, s in zip(fast, slow)
-        if f is not None and s is not None
-    ]
-
-    if len(line) < 9:
-        return None, None, None
-
-    signal_series = ema_series(line, 9)
-
-    signal = signal_series[-1]
-
-    if signal is None:
-        return None, None, None
-
-    return (
-        line[-1],
-        signal,
-        line[-1] - signal
-    )
-
-
-def atr(candles, period=14):
-
-    if len(candles) <= period:
-        return None
-
-    trs = []
-
-    for i in range(1, len(candles)):
-
-        high = candles[i][2]
-        low = candles[i][3]
-        previous_close = candles[i - 1][4]
-
-        trs.append(max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close)
-        ))
-
-    return sum(trs[-period:]) / period
-
-
-# ============================================================
-# LOAD LBANK SNAPSHOTS
-# ============================================================
-
-def load_latest_lbank():
-
-    if not DATA_FILE.exists():
-
-        raise RuntimeError(
-            f"Data file not found: {DATA_FILE}"
-        )
-
-    latest = {}
-
-    with DATA_FILE.open(
-        "r",
-        encoding="utf-8"
-    ) as fh:
-
-        for line_no, line in enumerate(fh, 1):
-
-            if not line.strip():
-                continue
-
-            try:
-
-                row = json.loads(line)
-
-                symbol = str(
-                    get_first(
-                        row,
-                        ["symbol", "instId", "instrument"]
-                    ) or ""
-                ).strip().upper()
-
-                if symbol not in CORE_SYMBOLS:
-                    continue
-
-                price = number(get_first(
-                    row,
-                    [
-                        "lastPrice",
-                        "price",
-                        "last",
-                        "close",
-                        "last_price"
-                    ]
-                ))
-
-                turnover = number(get_first(
-                    row,
-                    [
-                        "turnover24h",
-                        "turnover",
-                        "quoteVolume",
-                        "quote_volume",
-                        "volValue",
-                        "amount",
-                        "volume_usdt"
-                    ]
-                ))
-
-                timestamp = parse_timestamp(get_first(
-                    row,
-                    [
-                        "timestamp",
-                        "ts",
-                        "time",
-                        "updated_at",
-                        "updateTime"
-                    ]
-                ))
-
-                if (
-                    not symbol
-                    or price is None
-                    or price <= 0
-                    or timestamp is None
-                ):
-                    continue
-
-                item = {
-                    "symbol": symbol,
-                    "price": price,
-                    "turnover": turnover or 0,
-                    "timestamp": timestamp,
-                }
-
-                if (
-                    symbol not in latest
-                    or timestamp >= latest[symbol]["timestamp"]
-                ):
-                    latest[symbol] = item
-
-            except Exception as exc:
-
-                print(
-                    f"Invalid JSONL line {line_no}: {exc}"
-                )
-
-    now = time.time()
-    valid = {}
-
-    for symbol, item in latest.items():
-
-        age = (
-            now - item["timestamp"]
-        ) / 60
-
-        if (
-            -5 <= age <= MAX_SNAPSHOT_AGE_MINUTES
-            and item["turnover"] >= MIN_TURNOVER
-            and symbol not in BLOCKED_SYMBOLS
-        ):
-            valid[symbol] = item
-
-    print(
-        f"Fresh LBank snapshots: "
-        f"{len(valid)}/{len(CORE_SYMBOLS)}"
-    )
-
-    return valid
-
-
-# ============================================================
-# OKX CANDLES
-# ============================================================
-
-def convert_symbol(symbol):
-
-    if not symbol.endswith("USDT"):
-
-        raise SkipSymbol(
-            f"Unsupported symbol: {symbol}"
-        )
-
-    return f"{symbol[:-4]}-USDT-SWAP"
-
-
-def get_candles(symbol, timeframe):
-
-    params = {
-        "instId": convert_symbol(symbol),
-        "bar": INTERVALS[timeframe],
-        "limit": "250",
-    }
-
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-
-        try:
-
-            response = SESSION.get(
-                OKX_URL,
-                params=params,
-                timeout=15
-            )
-
-            response.raise_for_status()
-
-            payload = response.json()
-
-            if payload.get("code") != "0":
-
-                raise SkipSymbol(
-                    payload.get("msg", "OKX API error")
-                )
-
-            candles = []
-
-            # OKX returns newest candles first.
-            for row in reversed(payload.get("data", [])):
-
-                if len(row) < 9:
-                    continue
-
-                # Only completed candles.
-                if str(row[8]) != "1":
-                    continue
-
-                candle = [
-                    number(row[0]),
-                    number(row[1]),
-                    number(row[2]),
-                    number(row[3]),
-                    number(row[4]),
-                    number(row[5]),
-                ]
-
-                if all(
-                    x is not None
-                    for x in candle
-                ):
-                    candles.append(candle)
-
-            if len(candles) < 205:
-
-                raise SkipSymbol(
-                    f"Insufficient completed {timeframe} candles: "
-                    f"{len(candles)}"
-                )
-
-            return candles
-
-        except SkipSymbol:
-            raise
-
-        except Exception as exc:
-
-            last_error = exc
-
-            time.sleep(1 + attempt)
-
-    raise SkipSymbol(
-        f"OKX data unavailable: {last_error}"
-    )
-
-
-# ============================================================
-# CONFIRMED PIVOTS
-# ============================================================
-
-def find_pivots(
-    candles,
-    left=PIVOT_LEFT,
-    right=PIVOT_RIGHT
-):
-
-    highs = []
-    lows = []
-
-    # A pivot is used only after its right-side candles
-    # have closed. No future candle is used at decision time.
-
-    for i in range(
-        left,
-        len(candles) - right
-    ):
-
-        high = candles[i][2]
-        low = candles[i][3]
-
-        left_highs = [
-            candles[j][2]
-            for j in range(i - left, i)
-        ]
-
-        right_highs = [
-            candles[j][2]
-            for j in range(i + 1, i + right + 1)
-        ]
-
-        left_lows = [
-            candles[j][3]
-            for j in range(i - left, i)
-        ]
-
-        right_lows = [
-            candles[j][3]
-            for j in range(i + 1, i + right + 1)
-        ]
-
-        if (
-            high > max(left_highs)
-            and high >= max(right_highs)
-        ):
-
-            highs.append({
-                "index": i,
-                "time": candles[i][0],
-                "price": high,
-            })
-
-        if (
-            low < min(left_lows)
-            and low <= min(right_lows)
-        ):
-
-            lows.append({
-                "index": i,
-                "time": candles[i][0],
-                "price": low,
-            })
-
+def volume_ratio(v: List[float]) -> float:
+    if len(v) < 24:
+        return 1.0
+    recent = sum(v[-3:]) / 3.0
+    base = sum(v[-23:-3]) / 20.0
+    if base <= 0:
+        return 1.0
+    return recent / base
+
+def find_swings(h: List[float], l: List[float], n: int = 3
+                ) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    highs: List[Tuple[int, float]] = []
+    lows: List[Tuple[int, float]] = []
+    for i in range(n, len(h) - n):
+        if all(h[i] > h[i - k] for k in range(1, n + 1)) and \
+           all(h[i] >= h[i + k] for k in range(1, n + 1)):
+            highs.append((i, h[i]))
+        if all(l[i] < l[i - k] for k in range(1, n + 1)) and \
+           all(l[i] <= l[i + k] for k in range(1, n + 1)):
+            lows.append((i, l[i]))
     return highs, lows
 
+def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> int:
+    if len(highs) < 2 or len(lows) < 2:
+        return 0
+    hh = highs[-1][1] > highs[-2][1]
+    hl = lows[-1][1] > lows[-2][1]
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1] < lows[-2][1]
+    if hh and hl:
+        return 1
+    if lh and ll:
+        return -1
+    return 0
 
-def find_equal_levels(
-    pivots,
-    tolerance
-):
+def structure_trend(c: List[float], highs: List[Tuple[int, float]],
+                    lows: List[Tuple[int, float]]) -> str:
+    if not highs or not lows:
+        return "RANGE"
+    st = structure_dir(highs, lows)
+    last = c[-1]
+    if st == 1:
+        return "RANGE" if last < lows[-1][1] else "UP"
+    if st == -1:
+        return "RANGE" if last > highs[-1][1] else "DOWN"
+    if last > highs[-1][1]:
+        return "UP"
+    if last < lows[-1][1]:
+        return "DOWN"
+    return "RANGE"
 
-    levels = []
-
-    for i in range(len(pivots)):
-
-        first = pivots[i]
-
-        for second in pivots[i + 1:]:
-
-            if abs(
-                first["price"] - second["price"]
-            ) <= tolerance:
-
-                level = (
-                    first["price"] + second["price"]
-                ) / 2
-
-                levels.append({
-                    "price": level,
-                    "first_index": first["index"],
-                    "second_index": second["index"],
-                })
-
-    # Remove approximate duplicates.
-    unique = []
-
-    for item in levels:
-
-        if not any(
-            abs(item["price"] - x["price"]) <= tolerance
-            for x in unique
-        ):
-
-            unique.append(item)
-
-    return unique
-
-
-# ============================================================
-# TIMEFRAME ANALYSIS
-# ============================================================
-
-def timeframe_analysis(candles):
-
-    closes = [c[4] for c in candles]
-    volumes = [c[5] for c in candles]
-
-    ema20 = ema_series(closes, 20)
-    ema50 = ema_series(closes, 50)
-    ema200 = ema_series(closes, 200)
-
-    current = closes[-1]
-
-    rsi_value = rsi(closes)
-
-    macd_value, macd_signal, macd_hist = macd(closes)
-
-    avg_volume = (
-        sum(volumes[-21:-1]) / 20
-        if len(volumes) >= 21
-        else None
-    )
-
-    volume_ratio = (
-        safe_div(volumes[-1], avg_volume)
-        if avg_volume
-        else None
-    )
-
-    current_atr = atr(candles)
-
-    bullish = (
-        ema20[-1] is not None
-        and ema50[-1] is not None
-        and ema200[-1] is not None
-        and current > ema20[-1]
-        and ema20[-1] > ema50[-1]
-        and ema50[-1] > ema200[-1]
-    )
-
-    bearish = (
-        ema20[-1] is not None
-        and ema50[-1] is not None
-        and ema200[-1] is not None
-        and current < ema20[-1]
-        and ema20[-1] < ema50[-1]
-        and ema50[-1] < ema200[-1]
-    )
-
-    highs, lows = find_pivots(candles)
-
-    recent_highs = [
-        x["price"] for x in highs[-10:]
-    ]
-
-    recent_lows = [
-        x["price"] for x in lows[-10:]
-    ]
-
-    support = (
-        max(
-            [x for x in recent_lows if x < current],
-            default=min(c[3] for c in candles[-50:])
-        )
-    )
-
-    resistance = (
-        min(
-            [x for x in recent_highs if x > current],
-            default=max(c[2] for c in candles[-50:])
-        )
-    )
-
-    atr_value = current_atr or 0
-
-    equal_highs = find_equal_levels(
-        highs[-15:],
-        atr_value * EQUAL_LEVEL_ATR_TOLERANCE
-    )
-
-    equal_lows = find_equal_levels(
-        lows[-15:],
-        atr_value * EQUAL_LEVEL_ATR_TOLERANCE
-    )
-
+def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
+    c, h, l = cs.c, cs.h, cs.l
+    at = atr(h, l, c)
+    highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
+    st = structure_dir(highs, lows)
+    recent_atr = at[-100:]
+    atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
+    trend = structure_trend(c, highs, lows)
     return {
-        "price": current,
-        "ema20": ema20[-1],
-        "ema50": ema50[-1],
-        "ema200": ema200[-1],
-        "rsi": rsi_value,
-        "macd": macd_value,
-        "macd_signal": macd_signal,
-        "macd_hist": macd_hist,
-        "volume_ratio": volume_ratio,
-        "atr": current_atr,
-        "bullish": bullish,
-        "bearish": bearish,
-        "support": support,
-        "resistance": resistance,
-        "pivots_high": highs,
-        "pivots_low": lows,
-        "equal_highs": equal_highs,
-        "equal_lows": equal_lows,
+        "name": name, "cs": cs, "close": c[-1],
+        "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
+        "highs": highs, "lows": lows, "struct": st, "trend": trend,
+        "atr_rank": atr_rank, "atr_list": at,
     }
 
-
-# ============================================================
-# HIGHER TIMEFRAME BIAS
-# ============================================================
-
-def get_market_bias(data):
-
-    h4 = data["4h"]
-    h1 = data["1h"]
-
-    if h4["bullish"] and h1["bullish"]:
-        return "BULLISH"
-
-    if h4["bearish"] and h1["bearish"]:
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-# ============================================================
-# LIQUIDITY SWEEP
-# ============================================================
-
-def detect_liquidity_sweep(
-    candles,
-    timeframe_data,
-    direction
-):
-
-    highs = timeframe_data["pivots_high"]
-    lows = timeframe_data["pivots_low"]
-
-    atr_value = timeframe_data["atr"] or 0
-
-    if atr_value <= 0:
-        return None
-
-    start = max(
-        0,
-        len(candles) - MAX_SWEEP_AGE_15M - 1
-    )
-
-    for i in range(
-        len(candles) - 1,
-        start - 1,
-        -1
-    ):
-
-        candle = candles[i]
-
-        # Only pivots confirmed before the sweep candle.
-        previous_highs = [
-            x for x in highs
-            if x["index"] < i
-        ]
-
-        previous_lows = [
-            x for x in lows
-            if x["index"] < i
-        ]
-
-        if direction == "SHORT":
-
-            levels = [
-                x["price"]
-                for x in previous_highs[-12:]
-            ]
-
-            levels += [
-                x["price"]
-                for x in timeframe_data["equal_highs"]
-                if x["second_index"] < i
-            ]
-
-            for level in sorted(
-                set(levels),
-                reverse=True
-            ):
-
-                swept = (
-                    candle[2] > level + atr_value * SWEEP_ATR_BUFFER
-                    and candle[4] < level
-                )
-
-                if swept:
-
-                    return {
-                        "direction": direction,
-                        "index": i,
-                        "time": candle[0],
-                        "level": level,
-                        "wick": candle[2],
-                        "type": "BSL SWEEP",
-                    }
-
-        else:
-
-            levels = [
-                x["price"]
-                for x in previous_lows[-12:]
-            ]
-
-            levels += [
-                x["price"]
-                for x in timeframe_data["equal_lows"]
-                if x["second_index"] < i
-            ]
-
-            for level in sorted(levels):
-
-                swept = (
-                    candle[3] < level - atr_value * SWEEP_ATR_BUFFER
-                    and candle[4] > level
-                )
-
-                if swept:
-
-                    return {
-                        "direction": direction,
-                        "index": i,
-                        "time": candle[0],
-                        "level": level,
-                        "wick": candle[3],
-                        "type": "SSL SWEEP",
-                    }
-
-    return None
-
-
-# ============================================================
-# MSS / BOS / CHoCH
-# ============================================================
-
-def detect_structure_shift(
-    candles,
-    timeframe_data,
-    sweep
-):
-
-    if not sweep:
-        return None
-
-    direction = sweep["direction"]
-    sweep_index = sweep["index"]
-
-    highs = timeframe_data["pivots_high"]
-    lows = timeframe_data["pivots_low"]
-
-    # Structure pivots must have been confirmed before sweep.
-    prior_highs = [
-        x for x in highs
-        if x["index"] < sweep_index
-    ]
-
-    prior_lows = [
-        x for x in lows
-        if x["index"] < sweep_index
-    ]
-
-    if direction == "LONG":
-
-        if not prior_highs:
-            return None
-
-        broken_level = prior_highs[-1]["price"]
-
-        for i in range(
-            sweep_index + 1,
-            len(candles)
-        ):
-
-            candle = candles[i]
-
-            if candle[4] > broken_level:
-
-                return {
-                    "direction": "LONG",
-                    "index": i,
-                    "time": candle[0],
-                    "level": broken_level,
-                    "type": "BULLISH MSS",
-                }
-
-    else:
-
-        if not prior_lows:
-            return None
-
-        broken_level = prior_lows[-1]["price"]
-
-        for i in range(
-            sweep_index + 1,
-            len(candles)
-        ):
-
-            candle = candles[i]
-
-            if candle[4] < broken_level:
-
-                return {
-                    "direction": "SHORT",
-                    "index": i,
-                    "time": candle[0],
-                    "level": broken_level,
-                    "type": "BEARISH MSS",
-                }
-
-    return None
-
-
-# ============================================================
-# FVG
-# ============================================================
-
-def detect_fvgs(candles, direction, start_index=0):
-
-    zones = []
-
-    start = max(
-        2,
-        start_index
-    )
-
-    for i in range(
-        start,
-        len(candles)
-    ):
-
-        first = candles[i - 2]
-        middle = candles[i - 1]
-        third = candles[i]
-
-        middle_range = candle_range(middle)
-
-        if middle_range <= 0:
-            continue
-
-        if direction == "LONG":
-
-            # Bullish three-candle imbalance.
-            if first[2] < third[3]:
-
-                zones.append({
-                    "low": first[2],
-                    "high": third[3],
-                    "index": i,
-                    "time": third[0],
-                    "type": "BULLISH FVG",
-                })
-
-        else:
-
-            # Bearish three-candle imbalance.
-            if first[3] > third[2]:
-
-                zones.append({
-                    "low": third[2],
-                    "high": first[3],
-                    "index": i,
-                    "time": third[0],
-                    "type": "BEARISH FVG",
-                })
-
-    return zones
-
-
-# ============================================================
-# ORDER BLOCK
-# ============================================================
-
-def detect_order_block(
-    candles,
-    direction,
-    start_index=0
-):
-
-    for i in range(
-        len(candles) - 1,
-        max(start_index, 0),
-        -1
-    ):
-
-        candle = candles[i]
-
-        if direction == "LONG" and is_bearish_candle(candle):
-
-            return {
-                "low": candle[3],
-                "high": candle[2],
-                "index": i,
-                "time": candle[0],
-                "type": "BULLISH ORDER BLOCK",
-            }
-
-        if direction == "SHORT" and is_bullish_candle(candle):
-
-            return {
-                "low": candle[3],
-                "high": candle[2],
-                "index": i,
-                "time": candle[0],
-                "type": "BEARISH ORDER BLOCK",
-            }
-
-    return None
-
-
-# ============================================================
-# PREMIUM / DISCOUNT
-# ============================================================
-
-def premium_discount(candles):
-
-    recent = candles[-50:]
-
-    high = max(c[2] for c in recent)
-    low = min(c[3] for c in recent)
-
-    midpoint = (high + low) / 2
-    price = candles[-1][4]
-
-    if price > midpoint:
-        zone = "PREMIUM"
-
-    elif price < midpoint:
-        zone = "DISCOUNT"
-
-    else:
-        zone = "EQUILIBRIUM"
+def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
+    tol = 0.15 * d["atr"]
+    above = [p for _, p in d["highs"] if p > price]
+    below = [p for _, p in d["lows"] if p < price]
+    out: Dict[str, Any] = {"bsl": None, "bsl_eq": False, "ssl": None, "ssl_eq": False}
+    if above:
+        b = min(above)
+        out["bsl"] = b
+        out["bsl_eq"] = sum(1 for _, p in d["highs"] if abs(p - b) <= tol) >= 2
+    if below:
+        s = max(below)
+        out["ssl"] = s
+        out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
+    return out
+
+def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
+    errors = []
+    
+    if recovery_lvl:
+        if direction == 'LONG' and entry < recovery_lvl:
+            entry = recovery_lvl
+        elif direction == 'SHORT' and entry > recovery_lvl:
+            entry = recovery_lvl
+
+    if direction == 'LONG':
+        intermediate_highs = [h for _, h in swings_h if tp1 < h < tp2]
+        if intermediate_highs:
+            tp2 = min(intermediate_highs)
+            if tp2 <= tp1:
+                tp2 = tp1 * 1.02
+    elif direction == 'SHORT':
+        intermediate_lows = [l for _, l in swings_l if tp1 > l > tp2]
+        if intermediate_lows:
+            tp2 = max(intermediate_lows)
+            if tp2 >= tp1:
+                tp2 = tp1 * 0.98
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        risk = entry * 0.01
+        
+    risk_pct = (risk / entry) * 100.0
+    if risk_pct > MAX_STOP_PCT:
+        errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
+
+    reward1 = abs(tp1 - entry)
+    reward2 = abs(tp2 - entry)
+    net_rr1 = round(reward1 / risk, 2)
+    net_rr2 = round(reward2 / risk, 2)
+    
+    valid = net_rr2 >= 1.5 and not errors
 
     return {
-        "high": high,
-        "low": low,
-        "midpoint": midpoint,
-        "zone": zone,
+        "SL": round(sl, 4), "TP1": round(tp1, 4), "TP2": round(tp2, 4),
+        "Net_RR1": net_rr1, "Net_RR2": net_rr2, "Valid": valid, "Entry": round(entry, 4),
+        "Validator_Errors": errors
     }
 
-
-# ============================================================
-# ENTRY ZONE
-# ============================================================
-
-def find_entry_zone(
-    candles_5m,
-    direction,
-    mss
-):
-
-    if not mss:
-        return None
-
-    mss_time = mss["time"]
-
-    start_index = next(
-        (
-            i for i, candle in enumerate(candles_5m)
-            if candle[0] >= mss_time
-        ),
-        None
-    )
-
-    if start_index is None:
-        return None
-
-    if start_index >= len(candles_5m) - 1:
-        return None
-
-    zones = detect_fvgs(
-        candles_5m,
-        direction,
-        start_index
-    )
-
-    if not zones:
-        return None
-
-    # Prefer the most recent FVG.
-    fvg = zones[-1]
-
-    ob = detect_order_block(
-        candles_5m,
-        direction,
-        start_index
-    )
-
-    selected = fvg
-    zone_type = fvg["type"]
-
-    # Use overlap between FVG and OB when available.
-    if ob:
-
-        overlap_low = max(
-            fvg["low"],
-            ob["low"]
-        )
-
-        overlap_high = min(
-            fvg["high"],
-            ob["high"]
-        )
-
-        if overlap_low < overlap_high:
-
-            selected = {
-                "low": overlap_low,
-                "high": overlap_high,
-                "index": fvg["index"],
-                "time": fvg["time"],
-                "type": "FVG + ORDER BLOCK",
-            }
-
-            zone_type = "FVG + ORDER BLOCK"
-
-    if (
-        len(candles_5m) - 1 - selected["index"]
-        > MAX_ENTRY_ZONE_AGE_5M
-    ):
-        return None
-
-    return {
-        "low": selected["low"],
-        "high": selected["high"],
-        "type": zone_type,
-        "fvg": fvg,
-        "order_block": ob,
-        "index": selected["index"],
-        "time": selected["time"],
-    }
-
-
-# ============================================================
-# LIQUIDITY TARGET
-# ============================================================
-
-def find_liquidity_target(
-    data,
-    direction,
-    entry
-):
-
-    h1 = data["1h"]
-
-    if direction == "LONG":
-
-        candidates = [
-            x["price"]
-            for x in h1["pivots_high"]
-            if x["price"] > entry
-        ]
-
-        candidates += [
-            x["price"]
-            for x in h1["equal_highs"]
-            if x["price"] > entry
-        ]
-
-        return min(candidates) if candidates else None
-
-    candidates = [
-        x["price"]
-        for x in h1["pivots_low"]
-        if x["price"] < entry
-    ]
-
-    candidates += [
-        x["price"]
-        for x in h1["equal_lows"]
-        if x["price"] < entry
-    ]
-
-    return max(candidates) if candidates else None
-
-
-# ============================================================
-# TRADE PLAN
-# ============================================================
-
-def make_trade(
-    symbol,
-    price,
-    data,
-    direction,
-    sweep,
-    mss,
-    zone
-):
-
-    if not all([sweep, mss, zone]):
-        return None
-
-    entry_low = zone["low"]
-    entry_high = zone["high"]
-
-    if entry_low <= 0 or entry_high <= entry_low:
-        return None
-
-    entry = (
-        entry_low + entry_high
-    ) / 2
-
-    atr_value = data["15m"]["atr"]
-
-    if not atr_value:
-        return None
-
-    buffer = atr_value * STOP_ATR_BUFFER
-
-    if direction == "LONG":
-
-        stop = sweep["wick"] - buffer
-
-        risk = entry - stop
-
+def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, swings_h=None, swings_l=None):
+    lookback = 60
+    highs_raw = cs.h[-lookback:]
+    lows_raw = cs.l[-lookback:]
+    
+    if swings_h is None or swings_l is None:
+        swings_h, swings_l = find_swings(cs.h, cs.l, n=3)
+    
+    structural_highs = [p[1] for p in swings_h if p[1] > entry_price]
+    structural_lows = [p[1] for p in swings_l if p[1] < entry_price]
+    
+    structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
+    structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
+    
+    if direction == 'LONG':
+        sl = structural_low * 0.992
+        risk = entry_price - sl
         if risk <= 0:
-            return None
+            risk = entry_price * 0.01
 
-        tp1 = entry + risk
-        tp2 = entry + risk * 2
-        tp3 = entry + risk * 3
-
+        tp1 = min(structural_highs) if structural_highs else entry_price + (risk * 1.5)
+        external_highs = [h for _, h in swings_h if h > entry_price]
+        tp2 = max(external_highs) if external_highs else entry_price + (risk * 2.5)
     else:
-
-        stop = sweep["wick"] + buffer
-
-        risk = stop - entry
-
+        sl = structural_high * 1.008
+        risk = sl - entry_price
         if risk <= 0:
-            return None
-
-        tp1 = entry - risk
-        tp2 = entry - risk * 2
-        tp3 = entry - risk * 3
-
-    stop_percent = (
-        risk / entry
-    ) * 100
-
-    if not (
-        MIN_STOP_PERCENT
-        <= stop_percent
-        <= MAX_STOP_PERCENT
-    ):
-        return None
-
-    liquidity_target = find_liquidity_target(
-        data,
-        direction,
-        entry
-    )
-
-    # TP2 is the minimum planned target.
-    # A nearby liquidity pool may be used only
-    # if it still provides at least 2R.
-
-    if liquidity_target is not None:
-
-        if direction == "LONG":
-
-            if liquidity_target >= tp2:
-                tp2 = min(tp2, liquidity_target)
-
-        else:
-
-            if liquidity_target <= tp2:
-                tp2 = max(tp2, liquidity_target)
-
-    rr2 = abs(tp2 - entry) / risk
-
-    if rr2 < MIN_RR:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "entry_low": entry_low,
-        "entry_high": entry_high,
-        "stop": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr1": 1.0,
-        "rr2": rr2,
-        "rr3": 3.0,
-        "stop_percent": stop_percent,
-        "leverage": MAX_LEVERAGE,
-        "margin_mode": MARGIN_MODE,
-        "sweep": sweep,
-        "mss": mss,
-        "zone": zone,
-        "liquidity_target": liquidity_target,
-        "risk_per_trade_percent": RISK_PER_TRADE_PERCENT,
-        "current_price": price,
-    }
-
-
-# ============================================================
-# PREMIUM / DISCOUNT FILTER
-# ============================================================
-
-def premium_discount_ok(
-    candles,
-    direction,
-    price
-):
-
-    pd = premium_discount(candles)
-
-    if direction == "LONG":
-
-        return (
-            pd["zone"] == "DISCOUNT",
-            pd
-        )
-
-    return (
-        pd["zone"] == "PREMIUM",
-        pd
-    )
-
-
-# ============================================================
-# MAIN SYMBOL ANALYSIS
-# ============================================================
-
-def analyze_symbol(item):
-
-    symbol = item["symbol"]
-    lbank_price = item["price"]
-
-    result = {
-        "symbol": symbol,
-        "status": "REJECTED",
-        "reason": "",
-        "price": lbank_price,
-    }
-
-    try:
-
-        candles = {
-            tf: get_candles(symbol, tf)
-            for tf in INTERVALS
-        }
-
-        data = {
-            tf: timeframe_analysis(candles[tf])
-            for tf in INTERVALS
-        }
-
-        okx_price = data["5m"]["price"]
-
-        price_difference = (
-            abs(lbank_price - okx_price)
-            / okx_price
-        ) * 100
-
-        if price_difference > PRICE_DIFF_LIMIT:
-
-            result["reason"] = (
-                f"LBank/OKX price difference "
-                f"{price_difference:.2f}%"
-            )
-
-            return result
-
-        bias = get_market_bias(data)
-
-        if bias == "NEUTRAL":
-
-            result.update({
-                "status": "WATCH",
-                "reason": "4H/1H trend alignment missing.",
-                "data": data,
-                "bias": bias,
-            })
-
-            return result
-
-        direction = (
-            "LONG"
-            if bias == "BULLISH"
-            else "SHORT"
-        )
-
-        # 15M liquidity sweep.
-        sweep = detect_liquidity_sweep(
-            candles["15m"],
-            data["15m"],
-            direction
-        )
-
-        if not sweep:
-
-            result.update({
-                "status": "WATCH",
-                "direction": direction,
-                "bias": bias,
-                "reason": "No confirmed recent liquidity sweep.",
-                "data": data,
-            })
-
-            return result
-
-        # 15M structure confirmation.
-        mss = detect_structure_shift(
-            candles["15m"],
-            data["15m"],
-            sweep
-        )
-
-        if not mss:
-
-            result.update({
-                "status": "WATCH",
-                "direction": direction,
-                "bias": bias,
-                "sweep": sweep,
-                "reason": "Liquidity sweep detected; MSS not confirmed.",
-                "data": data,
-            })
-
-            return result
-
-        # 5M FVG / OB entry zone.
-        zone = find_entry_zone(
-            candles["5m"],
-            direction,
-            mss
-        )
-
-        if not zone:
-
-            result.update({
-                "status": "WATCH",
-                "direction": direction,
-                "bias": bias,
-                "sweep": sweep,
-                "mss": mss,
-                "reason": "MSS confirmed; valid 5M FVG/OB zone unavailable.",
-                "data": data,
-            })
-
-            return result
-
-        # Premium / Discount.
-        pd_ok, pd_data = premium_discount_ok(
-            candles["1h"],
-            direction,
-            lbank_price
-        )
-
-        # Momentum confirmation.
-        h1 = data["1h"]
-        m15 = data["15m"]
-        m5 = data["5m"]
-
-        if direction == "LONG":
-
-            momentum_ok = (
-                h1["macd_hist"] is not None
-                and h1["macd_hist"] > 0
-                and h1["rsi"] is not None
-                and h1["rsi"] > 45
-            )
-
-            volume_ok = (
-                m5["volume_ratio"] is not None
-                and m5["volume_ratio"] >= MIN_5M_VOLUME_RATIO
-                and m15["volume_ratio"] is not None
-                and m15["volume_ratio"] >= MIN_15M_VOLUME_RATIO
-            )
-
-        else:
-
-            momentum_ok = (
-                h1["macd_hist"] is not None
-                and h1["macd_hist"] < 0
-                and h1["rsi"] is not None
-                and h1["rsi"] < 55
-            )
-
-            volume_ok = (
-                m5["volume_ratio"] is not None
-                and m5["volume_ratio"] >= MIN_5M_VOLUME_RATIO
-                and m15["volume_ratio"] is not None
-                and m15["volume_ratio"] >= MIN_15M_VOLUME_RATIO
-            )
-
-        # Entry is valid only if current LBank price
-        # is inside the 5M entry zone.
-        price_in_zone = (
-            zone["low"] <= lbank_price <= zone["high"]
-        )
-
-        score = 40
-
-        score += 20  # HTF bias
-        score += 20  # Sweep + MSS
-
-        if pd_ok:
-            score += 10
-
-        if momentum_ok:
-            score += 5
-
-        if volume_ok:
-            score += 5
-
-        score = min(100, score)
-
-        result.update({
-            "direction": direction,
-            "bias": bias,
-            "score": score,
-            "data": data,
-            "sweep": sweep,
-            "mss": mss,
-            "zone": zone,
-            "premium_discount": pd_data,
-            "price_in_zone": price_in_zone,
-            "momentum_ok": momentum_ok,
-            "volume_ok": volume_ok,
-            "price_difference": price_difference,
-        })
-
-        if not pd_ok:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                f"Price is not in preferred {direction} "
-                "Premium/Discount location."
-            )
-
-            return result
-
-        if not momentum_ok:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                "MACD/RSI momentum confirmation missing."
-            )
-
-            return result
-
-        if not volume_ok:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                "Volume confirmation missing."
-            )
-
-            return result
-
-        if not price_in_zone:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                "Structure confirmed; waiting for price "
-                "to return to the entry zone."
-            )
-
-            return result
-
-        trade = make_trade(
-            symbol,
-            lbank_price,
-            data,
-            direction,
-            sweep,
-            mss,
-            zone
-        )
-
-        if not trade:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                "Trade plan failed risk or minimum R:R validation."
-            )
-
-            return result
-
-        if score < MIN_SIGNAL_SCORE:
-
-            result["status"] = "WATCH"
-
-            result["reason"] = (
-                "Final setup score below signal threshold."
-            )
-
-            return result
-
-        result["status"] = "SIGNAL"
-        result["trade"] = trade
-        result["reason"] = "Liquidity + MSS + entry confirmation."
-
-        return result
-
-    except SkipSymbol as exc:
-
-        result["status"] = "REJECTED"
-        result["reason"] = str(exc)
-
-        return result
-
-    except Exception as exc:
-
-        result["status"] = "ERROR"
-        result["reason"] = str(exc)
-
-        return result
-
-
-# ============================================================
-# REPORT HELPERS
-# ============================================================
-
-def trend_text(item):
-
-    if item.get("bullish"):
-        return "BULLISH"
-
-    if item.get("bearish"):
-        return "BEARISH"
-
-    return "NEUTRAL"
-
-
-def volume_text(item):
-
-    value = number(item.get("volume_ratio"))
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.2f}x"
-
-
-def rsi_text(item):
-
-    value = number(item.get("rsi"))
-
-    if value is None:
-        return "N/A"
-
-    return f"{value:.1f}"
-
-
-def format_trade(trade):
-
-    return "\n".join([
-        f"Direction: {trade['direction']}",
-        (
-            f"Entry Zone: {fmt(trade['entry_low'])} - "
-            f"{fmt(trade['entry_high'])}"
-        ),
-        f"Entry Midpoint: {fmt(trade['entry'])}",
-        f"Stop Loss: {fmt(trade['stop'])}",
-        f"TP1: {fmt(trade['tp1'])} | 1R",
-        f"TP2: {fmt(trade['tp2'])} | {trade['rr2']:.2f}R",
-        f"TP3: {fmt(trade['tp3'])} | 3R",
-        f"Stop distance: {trade['stop_percent']:.2f}%",
-        f"Leverage: {trade['leverage']}x {trade['margin_mode']}",
-        (
-            "Maximum planned account risk: "
-            f"{trade['risk_per_trade_percent']:.2f}%"
-        ),
-    ])
-
-
-def format_market_status(item):
-
-    symbol = item.get("symbol", "UNKNOWN")
-
-    status = item.get("status", "UNKNOWN")
-
-    direction = item.get("direction", "-")
-
-    score = number(item.get("score"), 0)
-
-    lines = [
-        f"• {symbol} | {status}",
-        f"Price: {fmt(item.get('price'))}",
-        f"Direction: {direction} | Score: {score:.1f}/100",
-        f"HTF Bias: {item.get('bias', 'N/A')}",
-    ]
-
-    reason = item.get("reason")
-
-    if reason:
-        lines.append(f"Reason: {reason}")
-
-    data = item.get("data") or {}
-
-    if data:
-
-        h4 = data.get("4h", {})
-        h1 = data.get("1h", {})
-        m15 = data.get("15m", {})
-        m5 = data.get("5m", {})
-
-        lines.extend([
-            (
-                f"Trend 4H/1H: "
-                f"{trend_text(h4)} / {trend_text(h1)}"
-            ),
-            (
-                f"RSI 4H/1H: "
-                f"{rsi_text(h4)} / {rsi_text(h1)}"
-            ),
-            (
-                f"Volume 15M/5M: "
-                f"{volume_text(m15)} / {volume_text(m5)}"
-            ),
-            (
-                f"1H Support/Resistance: "
-                f"{fmt(h1.get('support'))} / "
-                f"{fmt(h1.get('resistance'))}"
-            ),
-        ])
-
-        pd_data = item.get("premium_discount")
-
-        if pd_data:
-            lines.append(
-                f"Premium/Discount: {pd_data['zone']}"
-            )
-
-    sweep = item.get("sweep")
-
-    if sweep:
-
-        lines.append(
-            f"Liquidity: {sweep['type']} "
-            f"at {fmt(sweep['level'])}"
-        )
-
-    mss = item.get("mss")
-
-    if mss:
-
-        lines.append(
-            f"Structure: {mss['type']} "
-            f"at {fmt(mss['level'])}"
-        )
-
-    zone = item.get("zone")
-
-    if zone:
-
-        lines.append(
-            f"Entry Zone ({zone['type']}): "
-            f"{fmt(zone['low'])} - {fmt(zone['high'])}"
-        )
-
-    if status == "SIGNAL" and item.get("trade"):
-
-        lines.append(
-            format_trade(item["trade"])
-        )
-
-    else:
-
-        lines.append("NO ENTRY — WAIT FOR CONFIRMATION.")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# COMPLETE REPORT
-# ============================================================
-
-def build_report(
-    results,
-    total_symbols,
-    missing_symbols
-):
-
-    results = results or []
-    missing_symbols = missing_symbols or []
-
-    result_map = {
-        item.get("symbol"): item
-        for item in results
-        if isinstance(item, dict)
-        and item.get("symbol")
-    }
-
-    signals = [
-        x for x in results
-        if x.get("status") == "SIGNAL"
-    ]
-
-    watches = [
-        x for x in results
-        if x.get("status") == "WATCH"
-    ]
-
-    lines = [
-        "LBANK ICT/SMC LIQUIDITY SCANNER",
-        "4H / 1H / 15M / 5M",
-        "=" * 40,
-        f"Core symbols: {len(CORE_SYMBOLS)}",
-        f"Valid snapshots: {total_symbols}",
-        f"Confirmed signals: {len(signals)}",
-        f"Watch candidates: {len(watches)}",
-        "",
-        "ALL SYMBOLS",
-        "-" * 40,
-    ]
-
-    for symbol in CORE_SYMBOLS:
-
-        item = result_map.get(symbol)
-
-        if item:
-
-            lines.append(
-                format_market_status(item)
-            )
-
-        else:
-
-            lines.append(
-                f"{symbol}: NO DATA — NO ENTRY"
-            )
-
-        lines.append("")
-
-    lines.extend([
-        "=" * 40,
-        "CONFIRMED SIGNALS",
-        "-" * 40,
-    ])
-
-    if signals:
-
-        for item in signals:
-
-            lines.append(
-                format_market_status(item)
-            )
-
-            lines.append("")
-
-    else:
-
-        lines.append(
-            "NO CONFIRMED SETUP — NO ENTRY."
-        )
-
-    lines.extend([
-        "",
-        "WATCHLIST",
-        "-" * 40,
-    ])
-
-    if watches:
-
-        for item in watches:
-
-            lines.append(
-                f"{item.get('symbol')}: "
-                f"{item.get('direction', '-')}"
-            )
-
-            lines.append(
-                f"Reason: {item.get('reason', '-')}"
-            )
-
-            lines.append(
-                "WATCH ONLY — DO NOT ENTER."
-            )
-
-            lines.append("")
-
-    else:
-
-        lines.append("No watch candidates.")
-
-    lines.extend([
-        "=" * 40,
-        "RISK MANAGEMENT",
-        "-" * 40,
-        "Maximum leverage: 2x.",
-        "Margin mode: ISOLATED.",
-        (
-            "Maximum planned account risk per trade: "
-            f"{RISK_PER_TRADE_PERCENT:.2f}%."
-        ),
-        "Position size must be calculated from stop distance.",
-        "This scanner does NOT read account equity.",
-        "This scanner does NOT place or manage orders.",
-        "OHLCV liquidity zones are estimates, not actual order-book depth.",
-        "Entry prices are indicative and may differ from executable bid/ask.",
-        "Use exchange-side stop orders and account for fees/slippage.",
-        "High leverage increases liquidation risk.",
-        "Technical analysis is not a guarantee of profit.",
-    ])
-
-    if missing_symbols:
-
-        lines.extend([
-            "",
-            "MISSING / STALE SNAPSHOTS",
-            "-" * 40,
-            ", ".join(missing_symbols),
-        ])
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_telegram(message):
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-
-        print(
-            "Telegram credentials missing. "
-            "Report was not sent."
-        )
-
-        return False
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{token}/sendMessage"
-    )
-
-    max_length = 3900
-
-    chunks = []
-    remaining = str(message)
-
-    while remaining:
-
-        if len(remaining) <= max_length:
-
-            chunks.append(remaining)
-            break
-
-        split_at = remaining.rfind(
-            "\n",
-            0,
-            max_length
-        )
-
-        if split_at < max_length // 2:
-            split_at = max_length
-
-        chunks.append(
-            remaining[:split_at]
-        )
-
-        remaining = remaining[split_at:].lstrip()
-
-    success = True
-
-    for index, chunk in enumerate(chunks, 1):
-
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "disable_web_page_preview": True,
-        }
-
-        try:
-
-            response = SESSION.post(
-                url,
-                json=payload,
-                timeout=20
-            )
-
-            if response.status_code != 200:
-
-                success = False
-
-                print(
-                    f"Telegram error {index}: "
-                    f"{response.status_code} "
-                    f"{response.text[:300]}"
-                )
-
+            risk = entry_price * 0.01
+
+        tp1 = max(structural_lows) if structural_lows else entry_price - (risk * 1.5)
+        external_lows = [l for _, l in swings_l if l < entry_price]
+        tp2 = min(external_lows) if external_lows else entry_price - (risk * 2.5)
+
+    return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
+# --------------------------------------------------------------------------
+# Part 4/5: Structural Analysis & Setup Recovery Engine
+# --------------------------------------------------------------------------
+def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
+    cs: Candles = d["cs"]
+    n = len(cs)
+    a = d["atr"]
+    long = side == "LONG"
+    pts = [p for p in (d["lows"] if long else d["highs"]) if p[0] >= n - 150]
+    for j in range(n - 1, max(n - 1 - lookback, 2), -1):
+        for si, lvl in reversed(pts):
+            if si >= j - 1:
+                continue
+            if long:
+                ok = cs.l[j] < lvl - 0.03 * a and cs.c[j] > lvl and \
+                    all(x >= lvl for x in cs.c[si + 1:j])
+                ext = min(cs.l[j:]) if ok else 0.0
             else:
+                ok = cs.h[j] > lvl + 0.03 * a and cs.c[j] < lvl and \
+                    all(x <= lvl for x in cs.c[si + 1:j])
+                ext = max(cs.h[j:]) if ok else 0.0
+            if ok:
+                return {"idx": j, "level": lvl, "extreme": ext, "age": n - 1 - j, "tf": d["name"]}
+    return None
 
-                result = response.json()
+def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    cs: Candles = d["cs"]
+    a = d["atr"]
+    j = sweep["idx"]
+    end = min(len(cs), j + MSS_MAX_DELAY + 1)
+    if side == "LONG":
+        prior = [p for p in d["highs"] if p[0] < j]
+        if not prior:
+            return None
+        lvl = prior[-1][1]
+        for k in range(j, end):
+            if cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
+                return {"idx": k, "level": lvl, "tf": d["name"]}
+    else:
+        prior = [p for p in d["lows"] if p[0] < j]
+        if not prior:
+            return None
+        lvl = prior[-1][1]
+        for k in range(j, end):
+            if cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
+                return {"idx": k, "level": lvl, "tf": d["name"]}
+    return None
 
-                if not result.get("ok", False):
+def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 50) -> List[Dict[str, float]]:
+    n = len(cs)
+    out: List[Dict[str, float]] = []
+    for i in range(max(2, n - lookback), n):
+        if side == "LONG":
+            lo, hi = cs.h[i - 2], cs.l[i]
+            if hi > lo and hi - lo >= 0.1 * atr_v:
+                later = min(cs.l[i + 1:]) if i + 1 < n else float("inf")
+                if later > lo:
+                    out.append({"bottom": lo, "top": hi})
+        else:
+            hi, lo = cs.l[i - 2], cs.h[i]
+            if hi > lo and hi - lo >= 0.1 * atr_v:
+                later = max(cs.h[i + 1:]) if i + 1 < n else float("-inf")
+                if later < hi:
+                    out.append({"bottom": lo, "top": hi})
+    return out
 
-                    success = False
+def find_obs(cs: Candles, atr_v: float, side: str, lookback: int = 60) -> List[Dict[str, float]]:
+    n = len(cs)
+    out: List[Dict[str, float]] = []
+    for i in range(max(1, n - lookback), n - 3):
+        if side == "LONG" and cs.c[i] < cs.o[i]:
+            move = max(cs.h[i + 1:i + 4]) - cs.h[i]
+            if move >= 0.8 * atr_v and min(cs.c[i + 1:]) > cs.l[i]:
+                out.append({"bottom": cs.l[i], "top": cs.o[i]})
+        elif side == "SHORT" and cs.c[i] > cs.o[i]:
+            move = cs.l[i] - min(cs.l[i + 1:i + 4])
+            if move >= 0.8 * atr_v and max(cs.c[i + 1:]) < cs.h[i]:
+                out.append({"bottom": cs.o[i], "top": cs.h[i]})
+    return out
 
-                    print(
-                        f"Telegram rejected message {index}: "
-                        f"{result}"
-                    )
+def _zones_for(d: Dict[str, Any], side: str) -> List[Dict[str, Any]]:
+    zs: List[Dict[str, Any]] = []
+    for z in find_fvgs(d["cs"], d["atr"], side):
+        zs.append({"bottom": z["bottom"], "top": z["top"], "kind": "FVG", "tf": d["name"]})
+    for z in find_obs(d["cs"], d["atr"], side):
+        zs.append({"bottom": z["bottom"], "top": z["top"], "kind": "OB", "tf": d["name"]})
+    return zs
 
-        except Exception as exc:
+def pick_zone(ds: List[Dict[str, Any]], side: str, price: float, atr15: float
+              ) -> Optional[Dict[str, Any]]:
+    long = side == "LONG"
+    allz: List[Dict[str, Any]] = []
+    for d in ds:
+        allz.extend(_zones_for(d, side))
 
-            success = False
+    def dist(z: Dict[str, Any]) -> float:
+        return max(0.0, price - z["top"]) if long else max(0.0, z["bottom"] - price)
 
-            print(
-                f"Telegram send error: {exc}"
-            )
+    def valid(z: Dict[str, Any]) -> bool:
+        if z["top"] <= z["bottom"]:
+            return False
+        if long:
+            return z["top"] <= price + 0.1 * atr15 and z["bottom"] < price and dist(z) <= 1.5 * atr15
+        return z["bottom"] >= price - 0.1 * atr15 and z["top"] > price and dist(z) <= 1.5 * atr15
 
-        time.sleep(0.5)
+    cands: List[Tuple[int, float, Dict[str, Any]]] = []
+    fvgs = [z for z in allz if z["kind"] == "FVG"]
+    obs = [z for z in allz if z["kind"] == "OB"]
+    for f in fvgs:
+        for o in obs:
+            lo, hi = max(f["bottom"], o["bottom"]), min(f["top"], o["top"])
+            if hi > lo:
+                z = {"bottom": lo, "top": hi, "kind": "OB+FVG", "tf": f["tf"]}
+                if valid(z):
+                    cands.append((0, dist(z), z))
+    for z in allz:
+        if valid(z):
+            cands.append((1, dist(z), z))
+    if not cands:
+        return None
+    cands.sort(key=lambda x: (x[0], x[1]))
+    return cands[0][2]
 
-    return success
+def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
+    long = side == "LONG"
+    want, opp = ("UP", "DOWN") if long else ("DOWN", "UP")
+    d4, d1, d15, d5 = D["4h"], D["1h"], D["15m"], D["5m"]
+    atr15 = d15["atr"]
+    notes: List[str] = []
+    blockers: List[str] = []
+    soft: List[str] = []
+    parts: Dict[str, float] = {}
 
+    s4 = 12 if d4["trend"] == want else 4 if d4["trend"] == "RANGE" else 0
+    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
+    parts["htf"] = s4 + s1
+    
+    against = (d4["trend"] == opp) + (d1["trend"] == opp)
+    if against > 1:
+        blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
+    else:
+        notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
-# ============================================================
-# MAIN
-# ============================================================
+    v_ratio = d15["vol_ratio"]
+    if v_ratio < 0.5:
+        soft.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % v_ratio)
+    else:
+        notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
 
-def main():
+    sw15 = detect_sweep(d15, side, 12)
+    sw5 = detect_sweep(d5, side, 24)
+    chosen = None
+    chosen_mss = None
+    
+    if sw15:
+        m15 = detect_mss(d15, side, sw15)
+        if m15:
+            chosen, chosen_mss = (d15, sw15, 15), (m15, 15)
+    if not chosen and sw5:
+        m5 = detect_mss(d5, side, sw5)
+        if m5:
+            chosen, chosen_mss = (d5, sw5, 8), (m5, 8)
 
-    print("=" * 60)
-    print("LBank ICT/SMC Liquidity Scanner starting...")
-    print("=" * 60)
+    sweep = chosen[1] if chosen else (sw15 or sw5)
+    parts["sweep"] = float(chosen[2]) if chosen else 0.0
+    parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
+    
+    structure_ok = bool(chosen and chosen_mss)
+    
+    recovery_level = None
+    if not structure_ok:
+        if sweep:
+            recovery_level = d15["highs"][-1][1] if not long else d15["lows"][-1][1]
+            soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی (%s)" % datetime.now(timezone.utc).strftime("%H:%M"))
+        else:
+            soft.append("ستاپ ساختاری در حال شکل‌گیری")
 
-    snapshots = load_latest_lbank()
+    zone = pick_zone([d15, d5], side, price, atr15)
+    if zone:
+        entry = price if (zone["bottom"] <= price <= zone["top"]) else (zone["bottom"] + zone["top"]) / 2.0
+        parts["zone"] = 15.0 if zone["kind"] == "OB+FVG" else 10.0
+    else:
+        entry = price
+        parts["zone"] = 3.0
 
-    if not isinstance(snapshots, dict):
-        snapshots = {}
-
-    missing_symbols = [
-        symbol
-        for symbol in CORE_SYMBOLS
-        if symbol not in snapshots
-    ]
-
-    results = []
-
-    print(
-        f"Valid snapshots: "
-        f"{len(snapshots)} / {len(CORE_SYMBOLS)}"
+    swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
+    raw_levels = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry, swings_h=swings_h, swings_l=swings_l)
+    
+    validated_plan = validate_and_correct_trade_plan(
+        direction=side, entry=entry, sl=raw_levels["SL"], tp1=raw_levels["TP1"], tp2=raw_levels["TP2"],
+        recovery_lvl=recovery_level, swings_h=swings_h, swings_l=swings_l
     )
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                analyze_symbol,
-                item
-            ): symbol
-            for symbol, item in snapshots.items()
+    trade = None
+    if validated_plan["Validator_Errors"]:
+        blockers.extend(validated_plan["Validator_Errors"])
+    elif not validated_plan["Valid"]:
+        blockers.append("RR خالص کمتر از حد نصاب یا نامعتبر است")
+    else:
+        cost = 2.0 * FEE_PCT
+        risk_pct = abs(validated_plan["Entry"] - validated_plan["SL"]) / validated_plan["Entry"] * 100.0
+        notional_mult = (RISK_PCT / 100.0) / ((risk_pct + cost) / 100.0)
+        lev = min(MAX_LEVERAGE, notional_mult)
+        trade = {
+            "entry": validated_plan["Entry"], "sl": validated_plan["SL"],
+            "tp1": validated_plan["TP1"], "tp2": validated_plan["TP2"],
+            "rr1": validated_plan["Net_RR1"], "rr2": validated_plan["Net_RR2"],
+            "rr1n": validated_plan["Net_RR1"], "rr2n": validated_plan["Net_RR2"],
+            "cost_pct": cost, "stop_pct": risk_pct, "order_type": "LIMIT",
+            "notional_x": lev, "eff_risk_pct": lev * ((risk_pct + cost) / 100.0) * 100.0,
+            "capped": notional_mult > MAX_LEVERAGE, "tp2_ok": True,
         }
 
-        for future in as_completed(futures):
+    parts["room"] = 5.0
+    parts["rr"] = 10.0 if validated_plan["Net_RR2"] >= 2.0 else 6.0
+    parts["momentum"] = 10.0
 
-            symbol = futures[future]
+    base_score = int(round(sum(parts.values())))
+    score = base_score
+    if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
+        score -= 25
+        blockers.append("شورت خلاف روند صعودی اصلی بازار")
+    elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
+        score += 10
 
-            try:
+    score = max(0, min(100, score))
+    if not structure_ok:
+        score = min(score, STRUCT_CAP)
+        
+    return {"side": side, "score": score, "parts": parts, "notes": notes,
+            "blockers": blockers, "soft_blockers": soft, "trade": trade,
+            "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
+            "structure_ok": structure_ok}
+# --------------------------------------------------------------------------
+# Part 5/5: Fully Audited Reporting & Main Execution
+# --------------------------------------------------------------------------
+def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
+    return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
+            "condition": "در حال بازیابی ستاپ (Trade Plan Validator Active)", "extra": extra}
 
-                result = future.result()
+def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
+    C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
+    price = fetch_price(symbol) or C["5m"].c[-1]
+    D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
+    regime = {"name": "NORMAL"}
+    gb = []
+    
+    scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
+    
+    signal = None
+    for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
+        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "RR" in b]
+        if s["score"] >= min_score and not critical_blockers and not gb and s["trade"] and s["structure_ok"]:
+            signal = s
+            break
+            
+    age_min = (time.time() - (D["5m"].get("cs", C["5m"]).t[-1] + TF_MAP["5m"][1])) / 60.0
+    res: Dict[str, Any] = {
+        "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
+        "global_blockers": gb, "signal": signal, "watch": None,
+        "reason_override": None, "data_age_min": age_min, "regime": regime,
+        "liq": liquidity_map(D["15m"], price),
+    }
+    if not signal and not gb:
+        cands = [s for s in scenarios.values() if s["trade"] and s["score"] >= WATCH_MIN]
+        if cands:
+            res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
+    return res
 
-                if not isinstance(result, dict):
+def fmt_price(p: float) -> str:
+    if p >= 1000:
+        return "%.2f" % p
+    if p >= 1:
+        return "%.4f" % p
+    if p >= 0.01:
+        return "%.5f" % p
+    return "%.8f" % p
 
-                    result = {
-                        "symbol": symbol,
-                        "status": "ERROR",
-                        "reason": "Invalid analyzer result.",
-                    }
+def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
+    ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+    dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
+    short = dom == "SHORT"
+    sc = ss if short else ls
+    t = sc["trade"]
+    missing = list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"])
+    if sc["score"] < MIN_SCORE:
+        missing.append("امتیاز %d از %d" % (sc["score"], MIN_SCORE))
+    decision = "ENTER" if (res.get("signal") and res["signal"]["side"] == dom) else ("CONDITIONAL" if t else "NO_ENTRY")
+    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("ممیزی طرح: " + (missing[0] if missing else "شرایط")),
+            "trade": t, "missing": missing, "short": short, "decision": decision}
 
-                result.setdefault(
-                    "symbol",
-                    symbol
-                )
+def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
+    c = build_card(res)
+    t = c["trade"]
+    exp_t = datetime.now(timezone.utc) + timedelta(hours=4.0)
+    expiry = exp_t.strftime("%Y-%m-%d %H:%M") + " (محلی)"
+    f = {"side": c["side"], "decision": DECISION_FA[c["decision"]], "expiry": expiry,
+         "missing": c["missing"], "status": c["status"], "trade": t}
+    if t is None:
+        f.update({"activation": None, "confirmation": "—", "zone": None,
+                  "invalidation": "—", "sl": None, "tp1": None, "tp2": None,
+                  "rr1": None, "rr2": None, "leverage": None})
+        return f
+    f.update({
+        "activation": t["entry"],
+        "confirmation": "تأیید ممیزی و تست مقاومت میانی",
+        "zone": (t["entry"] * 0.999, t["entry"] * 1.001),
+        "invalidation": "حد ضرر ساختاری (تایید شده)",
+        "sl": t["sl"], "tp1": t["tp1"], "tp2": t["tp2"],
+        "rr1": t["rr1"], "rr2": t["rr2"], "leverage": t["notional_x"],
+    })
+    return f
 
-                results.append(result)
-
-                print(
-                    f"{symbol}: "
-                    f"{result.get('status', 'UNKNOWN')} | "
-                    f"Score: {result.get('score', 0)}"
-                )
-
-            except Exception as exc:
-
-                print(
-                    f"{symbol} analysis error: {exc}"
-                )
-
-                results.append({
-                    "symbol": symbol,
-                    "status": "ERROR",
-                    "reason": str(exc),
-                })
-
-    report = build_report(
-        results=results,
-        total_symbols=len(snapshots),
-        missing_symbols=missing_symbols,
-    )
-
-    REPORT_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    REPORT_FILE.write_text(
-        report,
-        encoding="utf-8"
-    )
-
-    print("\n" + report)
-
-    sent = send_telegram(report)
-
-    if sent:
-
-        print(
-            "\nTelegram report sent successfully."
-        )
-
+def format_brief(res: Dict[str, Any]) -> List[str]:
+    p = plan_fields(res)
+    f = fmt_price
+    D = res["D"]
+    side_key = "LONG" if p["side"] == "LONG" else "SHORT"
+    sc = res["scenarios"][side_key]
+    read = [n for n in sc["notes"] if not n.startswith("حجم")][:3]
+    lines = [
+        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"],
+                                          p["decision"], html.escape(p["expiry"])),
+        "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
+                                     TREND_ARROW[D["15m"]["trend"]]),
+    ]
+    if read:
+        lines.append("تحلیل: " + html.escape(" | ".join(read)))
+    if sc.get("recovery_level"):
+        lines.append("🔄 سطح بازیابی (Recovery): <b>%s</b>" % f(sc["recovery_level"]))
+    if p["trade"] is None:
+        lines.append("طرح معامله: — (توسط اعتبارسنج مسدود شد)")
     else:
+        lines.append("Activation: %s | Entry Zone: %s – %s" % (
+            f(p["activation"]), f(p["zone"][0]), f(p["zone"][1])))
+        lines.append("SL: %s (%.2f%%) | TP1: %s | TP2: %s" % (
+            f(p["sl"]), p["trade"]["stop_pct"], f(p["tp1"]), f(p["tp2"])))
+        lines.append("Net RR: TP1 %.2f / TP2 %.2f | Leverage ≤ %.2fx" % (p["rr1"], p["rr2"], p["leverage"]))
+    if p["decision"] != DECISION_FA["ENTER"] and p["missing"]:
+        lines.append("علت ممیزی: " + html.escape(" | ".join(p["missing"][:2])))
+    return lines
 
-        print(
-            "\nTelegram report could not be fully delivered."
-        )
+def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
+    sigs = [r for r in results if r["signal"]]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator</b> — %s" % now]
+    if sigs:
+        lines.append("🎯 سیگنال تأییدشده: %d" % len(sigs))
+    else:
+        lines.append("NO TRADE — هیچ طرح معامله‌ای از فیلتر سخت‌گیرانه اعتبارسنج عبور نکرد (%d ارز بررسی شد)." % len(results))
+    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
+    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
+             and not r["signal"]][:5]
+    if shown:
+        lines.append("")
+        lines.append("🧭 <b>واچ‌لیست و ممیزی طرح‌ها (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        for r in shown:
+            lines.append("")
+            lines.extend(format_brief(r))
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
+    lines.append("")
+    lines.append("حداقل امتیاز: %d | Trade Plan Validator فعال" % MIN_SCORE)
+    return "\n".join(lines)
 
-    print("\nScanner finished.")
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
+    ap.add_argument("--min-score", type=float, default=MIN_SCORE)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
 
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    results = []
+    errors = []
+    pairs = fetch_pairs()
+    if pairs:
+        for sym in [x for x in symbols if x.lower() not in pairs]:
+            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد؛ نادیده گرفته شد"))
+        symbols = [x for x in symbols if x.lower() in pairs]
+        
+    for sym in symbols:
+        try:
+            results.append(analyze_symbol(symbol=sym, min_score=args.min_score))
+        except ScanError as e:
+            errors.append((sym, str(e)))
+        except Exception as e:
+            errors.append((sym, "خطای سیستمی غیرمنتظره: %s" % str(e)))
+
+    report_text = format_report(results, errors)
+    
+    report_file_path = os.getenv("REPORT_FILE", "report.txt")
+    try:
+        with open(report_file_path, "w", encoding="utf-8") as f:
+            f.write(report_text + "\n")
+        print("Successfully generated %s" % report_file_path)
+    except OSError as e:
+        print("Failed to write report file: %s" % e)
+
+    if args.dry_run:
+        print(report_text)
+        
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
