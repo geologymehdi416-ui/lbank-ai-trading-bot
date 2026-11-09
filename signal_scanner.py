@@ -48,9 +48,6 @@ DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")
 INDICATOR_FILTER = os.getenv("INDICATOR_FILTER", "0").strip() == "1"
 FIB_CONFIRM = os.getenv("FIB_CONFIRM", "0").strip() == "1"
 SWING_MIN_AMP = _env_float("SWING_MIN_AMP", 0.0)
-FIB_EXT_LEVELS = (1.272, 1.618)
-FIB_PTS_OVERLAP = 5
-FIB_PTS_ZONE = 2
 
 MAX_STOP_PCT = 3.0
 MAX_STOP_ATR = 3.0
@@ -75,7 +72,7 @@ MIN_ATR_RANK = 0.10
 QUIET_RANGE_RANK = 0.10
 BREAKOUT_WINDOW = 20
 BREAKOUT_MAX_RANK = 0.30
-BREAKOUT_MIN_VOL = 1.2
+BREAKOUT_MIN_VOL = 1.2  # می‌توانید این مقدار را برای حساسیت حجم کم/زیاد کنید (مثلا 1.0)
 
 TF_MAP: Dict[str, Tuple[str, int]] = {
     "5m": ("minute5", 300),
@@ -202,7 +199,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Technical analysis, Structure & Advanced SL/TP Calculation
+# Part 3/5: Technical Analysis, Structure & Advanced SL/TP Calculation
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -336,7 +333,7 @@ def calculate_levels_and_targets(df, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: Scenario Evaluation, SMC patterns and Trade Execution Logic
+# Part 4/5: SMC Pattern Detection and Decision Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -656,7 +653,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "fib": {"valid": False}, "ind": {}}
 # --------------------------------------------------------------------------
-# Part 5/5: Reporting, Telegram delivery and Main execution
+# Part 5/5: Reporting, Telegram Delivery and Main Execution
 # --------------------------------------------------------------------------
 def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
