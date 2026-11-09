@@ -64,7 +64,7 @@ EXPIRY_H = _env_float("EXPIRY_H", 4.0)
 TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)
 WATCH_MIN = 60
 CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)
-STRUCT_CAP = 70  # افزایش سقف امتیاز ساختار برای جلوگیری از قفل شدن روی ۶۰
+STRUCT_CAP = 70
 MAX_SAME_DIR = 2
 MSS_MAX_DELAY = 8
 MSS_MIN_BODY = 0.8
@@ -285,10 +285,6 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     }
 
 def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
-    """
-    محاسبه حد ضرر (SL) و تارگت‌ها (TP1, TP2) بر اساس سقف‌ها، کف‌ها و استخرهای نقدینگی ساختاری بازار
-    به همراه مکانیزم محافظتی (Fallback) برای تضمین حداقل ریوارد.
-    """
     lookback = 60
     highs_raw = cs.h[-lookback:]
     lows_raw = cs.l[-lookback:]
@@ -307,7 +303,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         if risk <= 0:
             risk = entry_price * 0.01
 
-        # استخراج TP1 از نزدیک‌ترین مقاومت ساختاری (سقف داخلی)
         if structural_highs:
             tp1 = min(structural_highs)
             if tp1 < entry_price + (risk * 1.2):
@@ -315,7 +310,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         else:
             tp1 = entry_price + (risk * 1.5)
 
-        # استخراج TP2 از بالاترین نقدینگی یا سقف کلان بازار (BSL)
         external_highs = [h for _, h in swings_h if h > entry_price]
         if external_highs:
             tp2 = max(external_highs)
@@ -342,7 +336,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         if risk <= 0:
             risk = entry_price * 0.01
 
-        # استخراج TP1 از نزدیک‌ترین حمایت ساختاری (کف داخلی)
         if structural_lows:
             tp1 = max(structural_lows)
             if tp1 > entry_price - (risk * 1.2):
@@ -350,7 +343,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         else:
             tp1 = entry_price - (risk * 1.5)
 
-        # استخراج TP2 از عمیق‌ترین استخر نقدینگی پایین بازار (SSL)
         external_lows = [l for _, l in swings_l if l < entry_price]
         if external_lows:
             tp2 = min(external_lows)
@@ -371,7 +363,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: SMC Pattern Detection and Facilitated Decision Engine
+# Part 4/5: SMC Pattern Detection and Independent Side Evaluation
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -579,13 +571,13 @@ def classify_regime(D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any
 def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
                     regime: Dict[str, Any]) -> List[str]:
     out: List[str] = []
-    d15, d5 = D["15m"], D["5m"]
+    d15 = D["15m"]
     if regime["name"] == "DEAD":
         out.append("نوسان بازار خیلی کم است (بازار مرده)")
     elif regime["name"] == "WILD":
         out.append("نوسان بازار بیش‌ازحد زیاد است")
     if d15["vol_ratio"] < MIN_VOL_RATIO and not regime["breakout"]:
-        out.append("حجم معاملات ضعیف است")
+        out.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % d15["vol_ratio"])
     return out
 
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
@@ -609,6 +601,13 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
     else:
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
+
+    # شفاف‌سازی عددی حجم معاملات در یادداشت‌ها یا نواقص
+    v_ratio = d15["vol_ratio"]
+    if v_ratio < MIN_VOL_RATIO:
+        blockers.append("حجم معاملات ضعیف است (نسبت: %.2fx میانگین)" % v_ratio)
+    else:
+        notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
 
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(d5, side, 24)
@@ -703,7 +702,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "fib": {"valid": False}, "ind": {}}
 # --------------------------------------------------------------------------
-# Part 5/5: Reporting, Telegram Delivery and Main Execution
+# Part 5/5: Reporting, Independent Watchlists and Main Execution
 # --------------------------------------------------------------------------
 def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
@@ -715,6 +714,8 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
     regime = classify_regime(D, price)
     gb = global_blockers(D, price, regime)
+    
+    # تحلیل کاملاً مستقل دو سویه LONG و SHORT برای هر ارز
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
     
     signal = None
