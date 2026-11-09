@@ -1740,3 +1740,37 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
+import requests
+
+def send_scan_report_to_telegram(token, chat_id, report_text):
+    """
+    تابع ارسال متن گزارش اسکن به بات تلگرام
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    
+    # تلگرام محدودیت کاراکتر دارد (هر پیام حداکثر 4096 کاراکتر). 
+    # اگر گزارش خیلی طولانی بود، می‌توان آن را تکه‌تکه کرد یا خلاصه فرستاد.
+    payload = {
+        "chat_id": chat_id,
+        "text": report_text,
+        "parse_mode": "Markdown" 
+    }
+    
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("📤 گزارش اسکن با موفقیت به تلگرام ارسال شد.")
+        else:
+            print(f"❌ خطا در ارسال گزارش به تلگرام: {response.text}")
+    except Exception as e:
+        print(f"❌ خطای شبکه در ارتباط با تلگرام: {e}")
+
+# نمونه نحوه استفاده در انتهای حلقه اسکنر شما:
+# if __name__ == "__main__":
+#     report = "📊 گزارش اسکن — ... \n (متن نهایی گزارش شما)"
+#     
+#     # اطلاعات بات خود را اینجا بگذارید
+#     TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+#     TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
+#     
+#     send_scan_report_to_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, report)
