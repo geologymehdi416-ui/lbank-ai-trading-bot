@@ -13,8 +13,8 @@ Pipeline per symbol:
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
   5. Build Entry / SL / TP1 / TP2 / RR; signal only if score >= MIN_SCORE and
-     all risk gates pass.
-  6. Send scan report + signals to Telegram.
+     all risk gates pass (5m structure and momentum included).
+  6. Send main report (signals or NO TRADE, with entry/SL/TP and coin read) to Telegram.
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
@@ -28,7 +28,9 @@ Environment variables:
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
   FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
-  REPORT_FILE        plain-text report output, default report.txt
+  TP_MIN_RR_NET      each structural target must have net RR >= this, default 0.5
+  REPORT_FILE        main Telegram output (plain text), default report.txt
+  DETAILS_FILE       full analysis for local review (never sent), default details_report.txt
   SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
   DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
   INDICATOR_FILTER   1 = indicator check can block signals; 0 (default) = diagnostics only
@@ -103,7 +105,8 @@ MIN_CANDLES = 100
 
 MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
-MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees
+MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
+TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)  # each structural target must have net RR >= this
 WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
 CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)  # display only: hide cards whose TP1 net RR is below this (0 = show all)
 STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
@@ -770,7 +773,7 @@ def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
     for p in pool:
         dist = abs(p - entry) / entry * 100.0
         rr = (dist - cost) / (risk_pct + cost)
-        if rr <= 0 or dist <= last:
+        if rr < TP_MIN_RR_NET or dist <= last:
             continue
         out.append((p, rr))
         last = dist
@@ -885,33 +888,31 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         if FIB_CONFIRM and fib["valid"]:
             levels = levels + [p for _, p in fib["targets"]]
         targets = pick_targets(levels, entry, risk, long, FEE_PCT)
-        tp1 = targets[0][0] if targets else (entry + (1.0 if long else -1.0) * risk)
-        tp2 = targets[1][0] if len(targets) > 1 else tp1
-        rr1 = abs(tp1 - entry) / risk
-        rr2 = abs(tp2 - entry) / risk
         risk_pct = risk / entry * 100.0
         cost = 2.0 * FEE_PCT
-        rr1n = (abs(tp1 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
-        rr2n = (abs(tp2 - entry) / entry * 100.0 - cost) / (risk_pct + cost)
         total_stop = (risk_pct + cost) / 100.0
         notional_mult = (RISK_PCT / 100.0) / total_stop
         lev = min(MAX_LEVERAGE, notional_mult)
         eff_risk = lev * total_stop * 100.0
         order_type = "LIMIT" if abs(entry - price) > 0.05 * atr15 else "MARKET"
-        trade = {
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2,
-            "rr1n": rr1n, "rr2n": rr2n, "cost_pct": cost,
-            "stop_pct": risk_pct, "order_type": order_type,
-            "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
-            "tp2_ok": len(targets) > 1,
-        }
         if not targets:
-            trade = None
             blockers.append("تارگت معتبر با RR خالص مثبت پیدا نشد")
-        elif len(targets) < 2:
-            blockers.append("تارگت دوم معتبر پیدا نشد")
-        elif rr2n < MIN_RR2_NET:
-            blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
+        else:
+            tp1, rr1n = targets[0]
+            tp2, rr2n = targets[1] if len(targets) > 1 else (None, None)
+            trade = {
+                "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "rr1": abs(tp1 - entry) / risk,
+                "rr2": (abs(tp2 - entry) / risk) if tp2 is not None else None,
+                "rr1n": rr1n, "rr2n": rr2n, "cost_pct": cost,
+                "stop_pct": risk_pct, "order_type": order_type,
+                "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
+                "tp2_ok": tp2 is not None,
+            }
+            if tp2 is None:
+                blockers.append("تارگت دوم معتبر پیدا نشد")
+            elif rr2n < MIN_RR2_NET:
+                blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
         htf = collect_levels(D, htf_only=True)
         obst = [p for p in htf if (p > entry if long else p < entry)]
         if obst:
@@ -925,7 +926,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         elif room_r < 1.2:
             notes.append("مانع HTF نسبتاً نزدیک است")
     parts.setdefault("room", 0.0)
-    if trade:
+    if trade and trade["rr2n"] is not None:
         rr = trade["rr2n"]
         parts["rr"] = 10.0 if rr >= 2.5 else 8.0 if rr >= 2.0 else 6.0 if rr >= 1.5 else 3.0 if rr >= 1.0 else 0.0
     else:
@@ -944,6 +945,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if FIB_CONFIRM:
         mom = min(mom, 10.0)
     parts["momentum"] = mom
+    if not (d5["struct"] == (1 if long else -1) and mom >= 10):
+        soft.append("تأیید ساختار 5m و مومنتوم کافی نیست")
     parts["fib"] = float(fib["pts"]) if FIB_CONFIRM else 0.0
     if mom >= 10:
         notes.append("مومنتوم پرایس‌اکشن: جابه‌جایی هم‌جهت و ساختار 5m هم‌راستا")
@@ -1112,6 +1115,8 @@ def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     for m in list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"]):
         if m not in missing:
             missing.append(m)
+    if sc["score"] < MIN_SCORE:
+        missing.append("امتیاز %d از %d (کمبود %d)" % (sc["score"], MIN_SCORE, MIN_SCORE - sc["score"]))
     if res.get("signal") and res["signal"]["side"] == dom:
         status = "سیگنال صادر شد"
     elif missing:
@@ -1169,7 +1174,69 @@ def format_card(res: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def format_brief(res: Dict[str, Any]) -> List[str]:
+    """Compact Telegram card: decision, entry, SL, targets and the coin's read."""
+    c = build_card(res)
+    t = c["trade"]
+    f = fmt_price
+    D = res["D"]
+    side_key = "LONG" if c["side"] == "LONG" else "SHORT"
+    sc = res["scenarios"][side_key]
+    read = [n for n in sc["notes"] if not n.startswith("حجم") and not n.startswith("مومنتوم")][:3]
+    lines = [
+        "<b>%s</b> | قیمت %s | %s" % (html.escape(res["symbol"]), f(res["price"]),
+                                      DECISION_FA[c["decision"]]),
+        "جهت: %s | امتیاز شورت %d / لانگ %d" % (c["side"], c["score_short"], c["score_long"]),
+        "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
+                                     TREND_ARROW[D["15m"]["trend"]]),
+    ]
+    if read:
+        lines.append("تحلیل: " + html.escape(" | ".join(read)))
+    if t:
+        lines.append("ورود: %s (%s) | حد ضرر: %s (%.2f%%)" % (
+            f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار", f(t["sl"]), t["stop_pct"]))
+        tp = "تارگت اول: %s (RR خالص %.2f)" % (f(t["tp1"]), t["rr1n"])
+        if t.get("tp2_ok"):
+            tp += " | تارگت دوم: %s (RR خالص %.2f)" % (f(t["tp2"]), t["rr2n"])
+        else:
+            tp += " | تارگت دوم: —"
+        lines.append(tp)
+        lines.append("اهرم: تا %.2fx" % t["notional_x"])
+    else:
+        lines.append("طرح معامله: — (تارگت معتبر نیست؛ ورود نکن)")
+    if c["decision"] != "ENTER" and c["missing"]:
+        lines.append("نواقص: " + html.escape(" | ".join(c["missing"][:2])))
+    return lines
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
+                  sent_signals: int) -> str:
+    """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
+    for the strongest symbols. Full analysis goes to details_report.txt."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sigs = [r for r in results if r["signal"]]
+    lines = ["📊 <b>گزارش اسکن</b> — %s" % now]
+    if sigs:
+        lines.append("🎯 سیگنال قطعی: %d (جزئیات در پیام جداگانه)" % len(sigs))
+    else:
+        lines.append("NO TRADE — هیچ سیگنال قطعی صادر نشد (%d ارز بررسی شد)." % len(results))
+    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
+    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
+             and not r["signal"]][:5]
+    if shown:
+        lines.append("")
+        lines.append("🧭 <b>طرح‌ها و تحلیل (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        for r in shown:
+            lines.append("")
+            lines.extend(format_brief(r))
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
+    lines.append("")
+    lines.append("حداقل امتیاز: %d | ترتیب روند: 4H/1H/15m" % MIN_SCORE)
+    return "\n".join(lines)
+
+
+def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now, ""]
@@ -1379,7 +1446,7 @@ def append_scan_log(results: List[Dict[str, Any]]) -> None:
                     "regime": r["regime"]["name"], "status": status, "side": sc["side"],
                     "entry": t.get("entry", ""), "sl": t.get("sl", ""),
                     "tp1": t.get("tp1", ""), "tp2": t.get("tp2", ""),
-                    "rr2_net": round(t["rr2n"], 3) if t else "",
+                    "rr2_net": round(t["rr2n"], 3) if (t and t.get("rr2n") is not None) else "",
                     "stop_pct": round(t["stop_pct"], 3) if t else "",
                     "reason": "" if r["signal"] else no_signal_reason(r),
                     "fib_valid": sc.get("fib", {}).get("valid", ""),
@@ -1422,7 +1489,7 @@ def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
                 "PASS" if not any("حد ضرر" in b for b in sc["blockers"]) else "FAIL",
                 t["stop_pct"], MAX_STOP_PCT))
             out.append("    [RR net to TP2]    %s  (%.2f, min %.1f, fee %.2f%%/side)" % (
-                "PASS" if t["rr2n"] >= MIN_RR2_NET else "FAIL", t["rr2n"], MIN_RR2_NET, FEE_PCT))
+                "PASS" if (t["rr2n"] or 0.0) >= MIN_RR2_NET else "FAIL", (t["rr2n"] or 0.0), MIN_RR2_NET, FEE_PCT))
             out.append("    [HTF obstacle]     %s  (room in R: %s)" % (
                 "FAIL" if any("مانع HTF" in b for b in sc["blockers"]) else "PASS",
                 "see blockers"))
@@ -1468,6 +1535,16 @@ def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
             f.write("\n".join(lines) + "\n")
     except OSError as e:
         log.warning("could not write diag report %s: %s", path, e)
+
+
+def write_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], sent: int) -> None:
+    """Full analysis (watchlist, conditional plans, market summary) for local review only."""
+    path = os.getenv("DETAILS_FILE", "details_report.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(to_plain(format_details(results, errors, sent)) + "\n")
+    except OSError as e:
+        log.warning("could not write details %s: %s", path, e)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1547,6 +1624,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         append_scan_log(results)
     if args.diag or args.dry_run:
         write_diag(results, args.min_score)
+    write_details(results, errors, sent)
     send(format_report(results, errors, sent))
     write_report_file(outbox)
     return 0
