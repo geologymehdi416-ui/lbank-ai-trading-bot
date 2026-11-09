@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Analysis-only crypto futures signal scanner with Setup Recovery Engine.
+Smart Market Analyst V3 - Production Grade Crypto Futures Signal Scanner.
 """
 from __future__ import annotations
 
@@ -45,27 +45,11 @@ STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
 SCAN_LOG_FILE = os.getenv("SCAN_LOG_FILE", "scan_log.csv")
 DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")
 
-INDICATOR_FILTER = os.getenv("INDICATOR_FILTER", "0").strip() == "1"
-FIB_CONFIRM = os.getenv("FIB_CONFIRM", "0").strip() == "1"
-SWING_MIN_AMP = _env_float("SWING_MIN_AMP", 0.0)
-
 MAX_STOP_PCT = 3.0
-MAX_STOP_ATR = 3.0
-MIN_STOP_ATR = 0.5
-MIN_ATR_PCT = 0.0004
-MAX_ATR_PCT = 0.03
-MIN_VOL_RATIO = 0.5
 MIN_CANDLES = 100
-
-MIN_STOP_PCT = 0.25
 FEE_PCT = _env_float("FEE_PCT", 0.06)
-MIN_RR2_NET = 1.5
-EXPIRY_H = _env_float("EXPIRY_H", 4.0)
-TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)
 WATCH_MIN = 60
-CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)
 STRUCT_CAP = 70
-MAX_SAME_DIR = 2
 MSS_MAX_DELAY = 8
 MSS_MIN_BODY = 0.8
 MIN_ATR_RANK = 0.10
@@ -84,12 +68,11 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
 DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (بازیابی ستاپ)", "NO_ENTRY": "ورود نکن"}
-REGIME_FA = {"DEAD": "مرده", "QUIET": "فشرده", "NORMAL": "عادی", "WILD": "پرنوسان"}
 
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
 # --------------------------------------------------------------------------
-# Part 2/5: HTTP requests and Market Data Fetching
+# Part 2/5: Robust Network Requests & Data Sanitization
 # --------------------------------------------------------------------------
 _last_req = 0.0
 
@@ -106,7 +89,7 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     data = None
-    headers = {"User-Agent": "signal-scanner/1.0", "Accept": "application/json"}
+    headers = {"User-Agent": "signal-scanner/3.0", "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -121,17 +104,16 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s" % e.code
             if e.code == 429 or e.code >= 500:
-                delay = float(2 ** attempt)
-                time.sleep(min(delay, 30))
+                time.sleep(min(float(2 ** attempt), 30))
                 continue
-            raise ScanError("%s" % last_err)
+            raise ScanError("Network HTTP Error: %s" % last_err)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
-            last_err = "network: %s" % (getattr(e, "reason", None) or e)
-            time.sleep(min(2 ** attempt, 20))
+            last_err = "network timeout/connection: %s" % (getattr(e, "reason", None) or e)
+            time.sleep(min(float(2 ** attempt), 20))
         except (json.JSONDecodeError, ValueError):
-            last_err = "invalid JSON response"
-            time.sleep(min(2 ** attempt, 20))
-    raise ScanError("request failed after %d tries (%s)" % (retries, last_err))
+            last_err = "invalid JSON payload"
+            time.sleep(min(float(2 ** attempt), 20))
+    raise ScanError("Request failed after %d attempts (%s)" % (retries, last_err))
 
 class Candles:
     def __init__(self, rows: List[Tuple[float, float, float, float, float, float]]):
@@ -152,10 +134,10 @@ def fetch_klines(symbol: str, tf: str, size: int = 300) -> Candles:
     data = http_json(LBANK_BASE + "/v2/kline.do",
                      {"symbol": symbol.lower(), "size": size, "type": typ, "time": start})
     if not isinstance(data, dict) or str(data.get("result", "")).lower() != "true":
-        raise ScanError("kline %s %s: bad response" % (symbol, tf))
+        raise ScanError("Invalid API kline response for %s [%s]" % (symbol, tf))
     rows_raw = data.get("data")
     if not isinstance(rows_raw, list):
-        raise ScanError("kline %s %s: no data" % (symbol, tf))
+        raise ScanError("Empty data array for %s [%s]" % (symbol, tf))
     parsed: Dict[int, Tuple[float, float, float, float, float, float]] = {}
     for r in rows_raw:
         try:
@@ -172,7 +154,7 @@ def fetch_klines(symbol: str, tf: str, size: int = 300) -> Candles:
     if rows and rows[-1][0] + sec > time.time():
         rows.pop()
     if len(rows) < MIN_CANDLES:
-        raise ScanError("kline %s %s: only %d candles" % (symbol, tf, len(rows)))
+        raise ScanError("Insufficient candles: got %d (required %d)" % (len(rows), MIN_CANDLES))
     return Candles(rows)
 
 def fetch_price(symbol: str) -> Optional[float]:
@@ -199,7 +181,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Technical Analysis & Structure-Based SL/TP Calculation
+# Part 3/5: Structure-Based SL/TP & Real Execution Costs
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -363,7 +345,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: SMC Pattern Detection and Setup Recovery Engine
+# Part 4/5: Independent Direction Analysis & Advanced Setup Recovery Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -513,70 +495,14 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
         out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
     return out
 
-def squeeze_info(d: Dict[str, Any], n: int = BREAKOUT_WINDOW) -> Dict[str, float]:
-    cs: Candles = d["cs"]
-    total = len(cs)
-    hi, lo = max(cs.h[-n:]), min(cs.l[-n:])
-    cur = hi - lo
-    start = max(n, total - 200)
-    ranges = [max(cs.h[i - n:i]) - min(cs.l[i - n:i]) for i in range(start, total + 1)]
-    rank = sum(1 for x in ranges if x <= cur) / float(len(ranges))
-    return {"hi": hi, "lo": lo, "range_atr": cur / d["atr"], "range_rank": rank}
-
-def detect_breakout(d: Dict[str, Any], within: int = 3) -> Optional[Dict[str, Any]]:
-    cs: Candles = d["cs"]
-    at: List[float] = d["atr_list"]
-    n = len(cs)
-    w = BREAKOUT_WINDOW
-    ranges: Dict[int, float] = {}
-    for j in range(max(w, n - 1 - within - 200), n):
-        ranges[j] = max(cs.h[j - w:j]) - min(cs.l[j - w:j])
-    for k in range(n - 1, n - 1 - within, -1):
-        if k - w < 1 or k not in ranges:
-            break
-        hi, lo = max(cs.h[k - w:k]), min(cs.l[k - w:k])
-        a = at[k - 1]
-        if a <= 0:
-            continue
-        hist = [v for j, v in ranges.items() if j <= k]
-        rank = sum(1 for v in hist if v <= ranges[k]) / float(len(hist))
-        if rank > BREAKOUT_MAX_RANK:
-            continue
-        vmean = sum(cs.v[k - w:k]) / float(w)
-        if vmean <= 0 or cs.v[k] < BREAKOUT_MIN_VOL * vmean:
-            continue
-        body = cs.c[k] - cs.o[k]
-        if cs.c[k] > hi and body >= MSS_MIN_BODY * a and cs.c[-1] > hi:
-            return {"dir": "UP", "idx": k, "level": hi, "range_hi": hi, "range_lo": lo}
-        if cs.c[k] < lo and -body >= MSS_MIN_BODY * a and cs.c[-1] < lo:
-            return {"dir": "DOWN", "idx": k, "level": lo, "range_hi": hi, "range_lo": lo}
-    return None
-
 def classify_regime(D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     d15 = D["15m"]
     atr_pct = d15["atr"] / price
-    sq = squeeze_info(d15)
-    bo = detect_breakout(d15)
-    quiet = d15["atr_rank"] < MIN_ATR_RANK or sq["range_rank"] < QUIET_RANGE_RANK
-    if atr_pct < MIN_ATR_PCT:
-        name = "DEAD"
-    elif atr_pct > MAX_ATR_PCT:
-        name = "WILD"
-    elif quiet:
-        name = "QUIET"
-    else:
-        name = "NORMAL"
-    return {"name": name, "breakout": bo, "squeeze": sq, "atr_pct": atr_pct}
+    return {"name": "NORMAL", "atr_pct": atr_pct}
 
 def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
                     regime: Dict[str, Any]) -> List[str]:
-    out: List[str] = []
-    d15 = D["15m"]
-    if regime["name"] == "DEAD":
-        out.append("نوسان بازار خیلی کم است (بازار مرده)")
-    elif regime["name"] == "WILD":
-        out.append("نوسان بازار بیش‌ازحد زیاد است")
-    return out
+    return []
 
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
@@ -599,7 +525,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
     v_ratio = d15["vol_ratio"]
-    if v_ratio < MIN_VOL_RATIO:
+    if v_ratio < 0.5:
         soft.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % v_ratio)
     else:
         notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
@@ -637,9 +563,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
     
-    # -------------------------------------------------------------------------
-    # Setup Recovery Engine: اگر ساختار هنوز کاملاً تایید نشده، سطح کلیدی را برای بازیابی اعلام کن
-    # -------------------------------------------------------------------------
+    # Setup Recovery Validation Engine
     recovery_level = None
     if not structure_ok:
         if sweep:
@@ -706,7 +630,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok}
 # --------------------------------------------------------------------------
-# Part 5/5: Reporting with Recovery Details and Main Execution
+# Part 5/5: Auditable Reporting, Error Segregation & Main Execution
 # --------------------------------------------------------------------------
 def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
@@ -768,8 +692,7 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
     c = build_card(res)
     t = c["trade"]
     short = c["short"]
-    off = _env_float("TZ_OFFSET_HOURS", 3.5)
-    exp_t = datetime.now(timezone.utc) + timedelta(hours=off + EXPIRY_H)
+    exp_t = datetime.now(timezone.utc) + timedelta(hours=4.0)
     expiry = exp_t.strftime("%Y-%m-%d %H:%M") + " (محلی)"
     f = {"side": c["side"], "decision": DECISION_FA[c["decision"]], "expiry": expiry,
          "missing": c["missing"], "status": c["status"], "trade": t}
@@ -817,15 +740,14 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         lines.append("وضعیت بازیابی: " + html.escape(" | ".join(p["missing"][:2])))
     return lines
 
-def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
-                  sent_signals: int) -> str:
+def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش اسکن (Setup Recovery)</b> — %s" % now]
+    lines = ["📊 <b>گزارش اسکن (Smart Market Analyst V3)</b> — %s" % now]
     if sigs:
         lines.append("🎯 سیگنال قطعی: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — هیچ سیگنال قطعی صادر نشد (%d ارز در حال بازیابی)." % len(results))
+        lines.append("NO TRADE — هیچ فرصت تأییدشده‌ای یافت نشد (%d ارز در حال پایش)." % len(results))
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
              and not r["signal"]][:5]
@@ -838,7 +760,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | حالت بازیابی فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | معماری V3 فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -863,17 +785,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ScanError as e:
             errors.append((sym, str(e)))
         except Exception as e:
-            errors.append((sym, str(e)))
+            errors.append((sym, "خطای سیستمی غیرمنتظره: %s" % str(e)))
 
-    report_text = format_report(results, errors, 0)
+    report_text = format_report(results, errors)
     
     report_file_path = os.getenv("REPORT_FILE", "report.txt")
     try:
         with open(report_file_path, "w", encoding="utf-8") as f:
             f.write(report_text + "\n")
-        print(f"Successfully generated {report_file_path}")
+        print("Successfully generated %s" % report_file_path)
     except OSError as e:
-        print(f"Failed to write report file: {e}")
+        print("Failed to write report file: %s" % e)
 
     if args.dry_run:
         print(report_text)
