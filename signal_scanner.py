@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Analysis-only crypto futures signal scanner (NO order execution).
+Analysis-only crypto futures signal scanner with Setup Recovery Engine.
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
-DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (هنوز ورود نکن)", "NO_ENTRY": "ورود نکن"}
+DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (بازیابی ستاپ)", "NO_ENTRY": "ورود نکن"}
 REGIME_FA = {"DEAD": "مرده", "QUIET": "فشرده", "NORMAL": "عادی", "WILD": "پرنوسان"}
 
 class ScanError(Exception):
@@ -199,7 +199,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Technical Analysis, Structure & Market-Structure Based SL/TP Calculation
+# Part 3/5: Technical Analysis & Structure-Based SL/TP Calculation
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -363,7 +363,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: SMC Pattern Detection and Independent Side Evaluation
+# Part 4/5: SMC Pattern Detection and Setup Recovery Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -576,8 +576,6 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
         out.append("نوسان بازار خیلی کم است (بازار مرده)")
     elif regime["name"] == "WILD":
         out.append("نوسان بازار بیش‌ازحد زیاد است")
-    if d15["vol_ratio"] < MIN_VOL_RATIO and not regime["breakout"]:
-        out.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % d15["vol_ratio"])
     return out
 
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
@@ -594,18 +592,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
     parts["htf"] = s4 + s1
     
-    aligned = (d4["trend"] == want) + (d1["trend"] == want)
     against = (d4["trend"] == opp) + (d1["trend"] == opp)
-    
     if against > 1:
         blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
     else:
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
-    # شفاف‌سازی عددی حجم معاملات در یادداشت‌ها یا نواقص
     v_ratio = d15["vol_ratio"]
     if v_ratio < MIN_VOL_RATIO:
-        blockers.append("حجم معاملات ضعیف است (نسبت: %.2fx میانگین)" % v_ratio)
+        soft.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % v_ratio)
     else:
         notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
 
@@ -634,15 +629,24 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         notes.append("Liquidity Sweep در %s" % sweep["tf"])
     if chosen_mss:
         notes.append("MSS قوی تأیید شد (%s)" % chosen_mss[0]["tf"])
-    elif aligned == 2:
+    else:
         bos = detect_bos(d15, side, 6)
         if bos:
             parts["mss"] = 8.0
             notes.append("BOS ادامه‌دهنده در 15m")
             
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
+    
+    # -------------------------------------------------------------------------
+    # Setup Recovery Engine: اگر ساختار هنوز کاملاً تایید نشده، سطح کلیدی را برای بازیابی اعلام کن
+    # -------------------------------------------------------------------------
+    recovery_level = None
     if not structure_ok:
-        soft.append("ستاپ ساختاری تأیید نشده")
+        if sweep:
+            recovery_level = d15["highs"][-1][1] if not long else d15["lows"][-1][1]
+            soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی قیمت")
+        else:
+            soft.append("ستاپ ساختاری در حال شکل‌گیری (نیازمند Sweep/MSS)")
 
     zone = pick_zone([d15, d5], side, price, atr15)
     if zone:
@@ -651,7 +655,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         notes.append("ناحیه ورود %s" % zone["kind"])
     else:
         entry = price
-        parts["zone"] = 3.0 if structure_ok else 0.0
+        parts["zone"] = 3.0
 
     levels_data = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry)
     sl = levels_data["SL"]
@@ -666,7 +670,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if risk_pct > MAX_STOP_PCT:
         blockers.append("فاصله حد ضرر بیش از حد مجاز است (%.2f%%)" % risk_pct)
     elif not levels_data["Valid"]:
-        blockers.append("RR خالص بعد از کارمزد کمتر از حد نصاب است (%.2f)" % rr2n)
+        blockers.append("RR خالص کمتر از حد نصاب است (%.2f)" % rr2n)
     else:
         cost = 2.0 * FEE_PCT
         notional_mult = (RISK_PCT / 100.0) / ((risk_pct + cost) / 100.0)
@@ -689,24 +693,24 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     
     if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
         score -= 25
-        blockers.append("شورت خلاف روند صعودی اصلی بازار (فیلتر خودکار)")
+        blockers.append("شورت خلاف روند صعودی اصلی بازار")
     elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
         score += 10
 
     score = max(0, min(100, score))
-
     if not structure_ok:
         score = min(score, STRUCT_CAP)
         
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
-            "zone": zone, "sweep": sweep, "fib": {"valid": False}, "ind": {}}
+            "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
+            "structure_ok": structure_ok}
 # --------------------------------------------------------------------------
-# Part 5/5: Reporting, Independent Watchlists and Main Execution
+# Part 5/5: Reporting with Recovery Details and Main Execution
 # --------------------------------------------------------------------------
 def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
     return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
-            "condition": "منتظر تأیید کامل ساختار و شرایط بازار", "extra": extra}
+            "condition": "در حال بازیابی ستاپ (Setup Recovery)", "extra": extra}
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -715,14 +719,12 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     regime = classify_regime(D, price)
     gb = global_blockers(D, price, regime)
     
-    # تحلیل کاملاً مستقل دو سویه LONG و SHORT برای هر ارز
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
         critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "RR" in b]
-        
-        if s["score"] >= min_score and not critical_blockers and not gb and s["trade"]:
+        if s["score"] >= min_score and not critical_blockers and not gb and s["trade"] and s["structure_ok"]:
             signal = s
             break
             
@@ -748,19 +750,6 @@ def fmt_price(p: float) -> str:
         return "%.5f" % p
     return "%.8f" % p
 
-def no_signal_reason(res: Dict[str, Any]) -> str:
-    if res.get("reason_override"):
-        return res["reason_override"]
-    if res["global_blockers"]:
-        return res["global_blockers"][0]
-    lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
-    best = lg if lg["score"] >= sh["score"] else sh
-    if best["blockers"]:
-        return best["blockers"][0]
-    if best["soft_blockers"]:
-        return best["soft_blockers"][0]
-    return "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
-
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
@@ -772,7 +761,7 @@ def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     if sc["score"] < MIN_SCORE:
         missing.append("امتیاز %d از %d" % (sc["score"], MIN_SCORE))
     decision = "ENTER" if (res.get("signal") and res["signal"]["side"] == dom) else ("CONDITIONAL" if t else "NO_ENTRY")
-    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("در انتظار: " + (missing[0] if missing else "شرایط")),
+    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("بازیابی: " + (missing[0] if missing else "شرایط")),
             "trade": t, "missing": missing, "short": short, "decision": decision}
 
 def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -791,9 +780,9 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
         return f
     f.update({
         "activation": t["entry"],
-        "confirmation": "تأیید کندل 15m هم‌جهت",
+        "confirmation": "تأیید شکست ساختار (Recovery)",
         "zone": (t["entry"] * 0.999, t["entry"] * 1.001),
-        "invalidation": "حد ضرر ساختاری",
+        "invalidation": "حد ضرر ساختاری (دست‌نخورده)",
         "sl": t["sl"], "tp1": t["tp1"], "tp2": t["tp2"],
         "rr1": t["rr1n"], "rr2": t["rr2n"], "leverage": t["notional_x"],
     })
@@ -814,6 +803,8 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     ]
     if read:
         lines.append("تحلیل: " + html.escape(" | ".join(read)))
+    if sc.get("recovery_level"):
+        lines.append("🔄 سطح بازیابی (Recovery): <b>%s</b>" % f(sc["recovery_level"]))
     if p["trade"] is None:
         lines.append("طرح معامله: — (تارگت معتبر نیست)")
     else:
@@ -823,31 +814,31 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
             f(p["sl"]), p["trade"]["stop_pct"], f(p["tp1"]), f(p["tp2"])))
         lines.append("Net RR: TP1 %.2f / TP2 %.2f | Leverage ≤ %.2fx" % (p["rr1"], p["rr2"], p["leverage"]))
     if p["decision"] != DECISION_FA["ENTER"] and p["missing"]:
-        lines.append("نواقص: " + html.escape(" | ".join(p["missing"][:2])))
+        lines.append("وضعیت بازیابی: " + html.escape(" | ".join(p["missing"][:2])))
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش اسکن</b> — %s" % now]
+    lines = ["📊 <b>گزارش اسکن (Setup Recovery)</b> — %s" % now]
     if sigs:
         lines.append("🎯 سیگنال قطعی: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — هیچ سیگنال قطعی صادر نشد (%d ارز بررسی شد)." % len(results))
+        lines.append("NO TRADE — هیچ سیگنال قطعی صادر نشد (%d ارز در حال بازیابی)." % len(results))
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
              and not r["signal"]][:5]
     if shown:
         lines.append("")
-        lines.append("🧭 <b>طرح‌ها و تحلیل (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        lines.append("🧭 <b>واچ‌لیست و بازیابی ستاپ (امتیاز ≥ %d)</b>" % WATCH_MIN)
         for r in shown:
             lines.append("")
             lines.extend(format_brief(r))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | ترتیب روند: 4H/1H/15m" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | حالت بازیابی فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
