@@ -72,7 +72,7 @@ MIN_ATR_RANK = 0.10
 QUIET_RANGE_RANK = 0.10
 BREAKOUT_WINDOW = 20
 BREAKOUT_MAX_RANK = 0.30
-BREAKOUT_MIN_VOL = 1.2  # می‌توانید این مقدار را برای حساسیت حجم کم/زیاد کنید (مثلا 1.0)
+BREAKOUT_MIN_VOL = 1.2
 
 TF_MAP: Dict[str, Tuple[str, int]] = {
     "5m": ("minute5", 300),
@@ -284,12 +284,13 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
         "atr_rank": atr_rank, "atr_list": at,
     }
 
-def calculate_levels_and_targets(df, direction='LONG', entry_price=0):
+def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     lookback = 50
-    recent_df = df.tail(lookback)
+    highs = cs.h[-lookback:]
+    lows = cs.l[-lookback:]
     
-    structural_low = recent_df['low'].min()
-    structural_high = recent_df['high'].max()
+    structural_low = min(lows)
+    structural_high = max(highs)
     
     if direction == 'LONG':
         sl = structural_low * 0.992
@@ -652,7 +653,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "fib": {"valid": False}, "ind": {}}
-
 # --------------------------------------------------------------------------
 # Part 5/5: Reporting, Telegram Delivery and Main Execution
 # --------------------------------------------------------------------------
@@ -822,10 +822,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             errors.append((sym, str(e)))
 
-    # تولید متن گزارش
     report_text = format_report(results, errors, 0)
     
-    # 📌 ذخیره اجباری خروجی در فایل report.txt برای استفاده گیت‌هاب اکشن
     report_file_path = os.getenv("REPORT_FILE", "report.txt")
     try:
         with open(report_file_path, "w", encoding="utf-8") as f:
