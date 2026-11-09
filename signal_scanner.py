@@ -652,6 +652,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "fib": {"valid": False}, "ind": {}}
+
 # --------------------------------------------------------------------------
 # Part 5/5: Reporting, Telegram Delivery and Main Execution
 # --------------------------------------------------------------------------
@@ -797,37 +798,6 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("حداقل امتیاز: %d | ترتیب روند: 4H/1H/15m" % MIN_SCORE)
     return "\n".join(lines)
 
-def split_message(text: str, limit: int = 3800) -> List[str]:
-    chunks: List[str] = []
-    cur = ""
-    for line in text.split("\n"):
-        if len(cur) + len(line) + 1 > limit:
-            chunks.append(cur)
-            cur = line
-        else:
-            cur = cur + "\n" + line if cur else line
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-def send_telegram(text: str) -> bool:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat:
-        print(text)
-        return False
-    ok = True
-    url = "https://api.telegram.org/bot%s/sendMessage" % token
-    for chunk in split_message(text):
-        try:
-            resp = http_json(url, body={"chat_id": chat, "text": chunk, "parse_mode": "HTML",
-                                        "disable_web_page_preview": True})
-            if not isinstance(resp, dict) or not resp.get("ok"):
-                ok = False
-        except ScanError:
-            ok = False
-    return ok
-
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
@@ -852,11 +822,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception as e:
             errors.append((sym, str(e)))
 
+    # تولید متن گزارش
     report_text = format_report(results, errors, 0)
+    
+    # 📌 ذخیره اجباری خروجی در فایل report.txt برای استفاده گیت‌هاب اکشن
+    report_file_path = os.getenv("REPORT_FILE", "report.txt")
+    try:
+        with open(report_file_path, "w", encoding="utf-8") as f:
+            f.write(report_text + "\n")
+        print(f"Successfully generated {report_file_path}")
+    except OSError as e:
+        print(f"Failed to write report file: {e}")
+
     if args.dry_run:
         print(report_text)
-    else:
-        send_telegram(report_text)
+        
     return 0
 
 if __name__ == "__main__":
