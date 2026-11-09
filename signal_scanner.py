@@ -334,7 +334,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
             "Valid": net_rr2 >= 1.5
         }
 # --------------------------------------------------------------------------
-# Part 4/5: SMC Pattern Detection and Decision Engine
+# Part 4/5: SMC Pattern Detection and Smart Decision Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -646,7 +646,23 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     parts["rr"] = 10.0 if rr2n >= 2.0 else 6.0
     parts["momentum"] = 10.0
 
-    score = int(round(sum(parts.values())))
+    # -------------------------------------------------------------------------
+    # محاسبه پایه امتیاز و اعمال فیلتر هوشمند خودکار
+    # -------------------------------------------------------------------------
+    base_score = int(round(sum(parts.values())))
+    score = base_score
+    
+    # فیلتر هوشمند: جریمه سنگین خودکار برای شورت‌های خلاف روند صعودی اصلی بازار
+    if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
+        score -= 25
+        blockers.append("شورت خلاف روند صعودی اصلی بازار (فیلتر خودکار)")
+
+    # پاداش خودکار به پوزیشن‌های لانگ هم‌راستا با رشد بازار
+    elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
+        score += 10
+
+    score = max(0, min(100, score))
+
     if not structure_ok:
         score = min(score, STRUCT_CAP)
         
