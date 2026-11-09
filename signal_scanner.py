@@ -259,18 +259,16 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
 def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
     errors = []
     
-    # 1. حل کامل تناقض Recovery و Activation (توالی منطقی قیمت‌ها)
     if recovery_lvl:
         if direction == 'LONG' and entry < recovery_lvl:
-            entry = recovery_lvl  # تنظیم قیمت ورود روی سطح بازیابی پس از شکست
+            entry = recovery_lvl
         elif direction == 'SHORT' and entry > recovery_lvl:
             entry = recovery_lvl
 
-    # 2. حل مشکل تارگت‌های تخیلی BCH (بررسی مقاومت‌های میانی بین TP1 و TP2)
     if direction == 'LONG':
         intermediate_highs = [h for _, h in swings_h if tp1 < h < tp2]
         if intermediate_highs:
-            tp2 = min(intermediate_highs)  # قفل کردن TP2 روی اولین مقاومت ساختاری سر راه
+            tp2 = min(intermediate_highs)
             if tp2 <= tp1:
                 tp2 = tp1 * 1.02
     elif direction == 'SHORT':
@@ -280,7 +278,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
             if tp2 >= tp1:
                 tp2 = tp1 * 0.98
 
-    # 3. ممیزی حد ضرر (رد استاپ‌های گشاد مانند NEAR و ADA)
     risk = abs(entry - sl)
     if risk <= 0:
         risk = entry * 0.01
@@ -337,7 +334,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Structural Analysis (15m/1h MSS Confirmation) & Setup Recovery
+# Part 4/5: Structural Analysis & Setup Recovery Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -473,7 +470,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
     parts["htf"] = s4 + s1
     
-     against = (d4["trend"] == opp) + (d1["trend"] == opp)
+    against = (d4["trend"] == opp) + (d1["trend"] == opp)
     if against > 1:
         blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
     else:
@@ -485,7 +482,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     else:
         notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
 
-    # بررسی ساختار در 15m و 5m (جلوگیری از اتکا صرف به 5m)
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(d5, side, 24)
     chosen = None
@@ -506,7 +502,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     
     structure_ok = bool(chosen and chosen_mss)
     
-    # ثبت سطح Recovery همراه با تمبر زمانی آخرین کندل تحلیل‌شده
     recovery_level = None
     if not structure_ok:
         if sweep:
