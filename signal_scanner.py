@@ -8,13 +8,13 @@ Analysis-only crypto futures signal scanner (NO order execution).
 Pipeline per symbol:
   1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
   2. Higher-timeframe STRUCTURE trend (HH/HL, LH/LL, CHoCH); ATR and volume
-     are used only as market filters. No EMA/RSI/MACD (pure price action).
+     are used only as market filters. Price action is the primary method.
   3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
   5. Build Entry / SL / TP1 / TP2 / RR; signal only if score >= MIN_SCORE and
-     all risk gates pass.
-  6. Send scan report + signals to Telegram.
+     all risk gates pass (5m structure and momentum included).
+  6. Send main report (signals or NO TRADE, with entry/SL/TP and coin read) to Telegram.
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
@@ -27,10 +27,21 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
+  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
+  TP_MIN_RR_NET      each structural target must have net RR >= this, default 0.5
+  REPORT_FILE        main Telegram output (plain text), default report.txt
+  DETAILS_FILE       full analysis for local review (never sent), default details_report.txt
+  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
+  DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
+  INDICATOR_FILTER   1 = indicator check can block signals; 0 (default) = diagnostics only
+  FIB_CONFIRM        1 = Fibonacci affects score/TP; 0 (default) = diagnostics only
+  SWING_MIN_AMP      0 (default, off) or a swing needs a move >= this x ATR
+  CARD_MIN_RR        display only: hide conditional cards whose TP1 net RR is below this (default 0 = all)
 
 Usage:
   python signal_scanner.py
   python signal_scanner.py --symbols BTC_USDT,ETH_USDT --dry-run
+  python signal_scanner.py --diag
 """
 from __future__ import annotations
 
@@ -808,7 +819,8 @@ def fib_plan(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Optional[
 def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
                  fee_pct: float) -> List[Tuple[float, float]]:
     """Nearest structural levels in the trade direction whose NET reward/risk is positive.
-    Returns up to two (price, rr_net). Invalid or negative-RR levels are skipped."""
+    The second target must sit at least 0.5R beyond the first (no near-duplicate TP2).
+    Returns up to two (price, rr_net)."""
     cost = 2.0 * fee_pct
     risk_pct = risk / entry * 100.0
     pool = sorted([p for p in levels if (p > entry if long else p < entry)], reverse=not long)
@@ -817,7 +829,8 @@ def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
     for p in pool:
         dist = abs(p - entry) / entry * 100.0
         rr = (dist - cost) / (risk_pct + cost)
-        if rr < TP_MIN_RR_NET or dist <= last:
+        min_gap = 0.5 * risk_pct if out else 0.0
+        if rr < TP_MIN_RR_NET or dist <= last or dist < last + min_gap:
             continue
         out.append((p, rr))
         last = dist
