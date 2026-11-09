@@ -36,7 +36,6 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
-# کاهش پیش‌فرض حداقل امتیاز به 65 برای تسهیل صدور سیگنال قطعی (ENTER)
 MIN_SCORE = _env_float("MIN_SCORE", 65.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
@@ -65,7 +64,7 @@ EXPIRY_H = _env_float("EXPIRY_H", 4.0)
 TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)
 WATCH_MIN = 60
 CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)
-STRUCT_CAP = 60
+STRUCT_CAP = 70  # افزایش سقف امتیاز ساختار برای جلوگیری از قفل شدن روی ۶۰
 MAX_SAME_DIR = 2
 MSS_MAX_DELAY = 8
 MSS_MIN_BODY = 0.8
@@ -200,7 +199,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Technical Analysis, Structure & Advanced SL/TP Calculation
+# Part 3/5: Technical Analysis, Structure & Market-Structure Based SL/TP Calculation
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -286,21 +285,44 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     }
 
 def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
-    lookback = 50
-    highs = cs.h[-lookback:]
-    lows = cs.l[-lookback:]
+    """
+    محاسبه حد ضرر (SL) و تارگت‌ها (TP1, TP2) بر اساس سقف‌ها، کف‌ها و استخرهای نقدینگی ساختاری بازار
+    به همراه مکانیزم محافظتی (Fallback) برای تضمین حداقل ریوارد.
+    """
+    lookback = 60
+    highs_raw = cs.h[-lookback:]
+    lows_raw = cs.l[-lookback:]
     
-    structural_low = min(lows)
-    structural_high = max(highs)
+    swings_h, swings_l = find_swings(cs.h, cs.l, n=3)
+    
+    structural_highs = [p[1] for p in swings_h if p[1] > entry_price]
+    structural_lows = [p[1] for p in swings_l if p[1] < entry_price]
+    
+    structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
+    structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
     
     if direction == 'LONG':
         sl = structural_low * 0.992
         risk = entry_price - sl
-        tp1 = entry_price + (risk * 1.5)
-        tp2 = entry_price + (risk * 2.5)
-        
-        if structural_high > entry_price and structural_high > tp1:
-            tp2 = structural_high
+        if risk <= 0:
+            risk = entry_price * 0.01
+
+        # استخراج TP1 از نزدیک‌ترین مقاومت ساختاری (سقف داخلی)
+        if structural_highs:
+            tp1 = min(structural_highs)
+            if tp1 < entry_price + (risk * 1.2):
+                tp1 = entry_price + (risk * 1.5)
+        else:
+            tp1 = entry_price + (risk * 1.5)
+
+        # استخراج TP2 از بالاترین نقدینگی یا سقف کلان بازار (BSL)
+        external_highs = [h for _, h in swings_h if h > entry_price]
+        if external_highs:
+            tp2 = max(external_highs)
+            if tp2 < tp1 + (risk * 0.5):
+                tp2 = tp1 + (risk * 1.5)
+        else:
+            tp2 = entry_price + (risk * 2.5)
             
         reward1 = tp1 - entry_price
         net_rr1 = (reward1 / risk) if risk > 0 else 0
@@ -317,11 +339,25 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     elif direction == 'SHORT':
         sl = structural_high * 1.008
         risk = sl - entry_price
-        tp1 = entry_price - (risk * 1.5)
-        tp2 = entry_price - (risk * 2.5)
-        
-        if structural_low < entry_price and structural_low < tp1:
-            tp2 = structural_low
+        if risk <= 0:
+            risk = entry_price * 0.01
+
+        # استخراج TP1 از نزدیک‌ترین حمایت ساختاری (کف داخلی)
+        if structural_lows:
+            tp1 = max(structural_lows)
+            if tp1 > entry_price - (risk * 1.2):
+                tp1 = entry_price - (risk * 1.5)
+        else:
+            tp1 = entry_price - (risk * 1.5)
+
+        # استخراج TP2 از عمیق‌ترین استخر نقدینگی پایین بازار (SSL)
+        external_lows = [l for _, l in swings_l if l < entry_price]
+        if external_lows:
+            tp2 = min(external_lows)
+            if tp2 > tp1 - (risk * 0.5):
+                tp2 = tp1 - (risk * 1.5)
+        else:
+            tp2 = entry_price - (risk * 2.5)
             
         reward1 = entry_price - tp1
         net_rr1 = (reward1 / risk) if risk > 0 else 0
@@ -569,7 +605,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     aligned = (d4["trend"] == want) + (d1["trend"] == want)
     against = (d4["trend"] == opp) + (d1["trend"] == opp)
     
-    # تسهیل شرط روند: به جای بلوک کامل، فقط در صورت مخالفت شدید روند کلان بلاک می‌شود
     if against > 1:
         blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
     else:
@@ -650,9 +685,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     parts["rr"] = 10.0 if rr2n >= 2.0 else 6.0
     parts["momentum"] = 10.0
 
-    # -------------------------------------------------------------------------
-    # محاسبه پایه امتیاز و اعمال فیلتر هوشمند خودکار و پاداش لانگ
-    # -------------------------------------------------------------------------
     base_score = int(round(sum(parts.values())))
     score = base_score
     
@@ -687,7 +719,6 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        # تسهیل صدور سیگنال قطعی: اجازه می‌دهد با وجود بلاکرهای غیربحرانی، سیگنال ENTER صادر شود
         critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "RR" in b]
         
         if s["score"] >= min_score and not critical_blockers and not gb and s["trade"]:
