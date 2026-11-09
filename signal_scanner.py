@@ -126,6 +126,7 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (هنوز ورود نکن)", "NO_ENTRY": "ورود نکن"}
 REGIME_FA = {"DEAD": "مرده", "QUIET": "فشرده", "NORMAL": "عادی", "WILD": "پرنوسان"}
 
 
@@ -996,11 +997,15 @@ def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict
 
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
-    D: Dict[str, Dict[str, Any]] = {}
-    for tf in ("4h", "1h", "15m", "5m"):
-        D[tf] = build_tf(fetch_klines(symbol, tf), tf)
+    C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
+    price = fetch_price(symbol) or C["5m"].c[-1]
+    return analyze_candles(symbol, C, price, min_score)
+
+
+def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
+    """Same decision logic as the live scan, but on any candle set (live or historical)."""
+    D: Dict[str, Dict[str, Any]] = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
     last_close = D["5m"]["close"]
-    price = fetch_price(symbol) or last_close
     if abs(price - last_close) / last_close > 0.02:
         log.warning("%s ticker %.6f deviates from last close %.6f; using close", symbol, price, last_close)
         price = last_close
@@ -1095,20 +1100,30 @@ def no_signal_reason(res: Dict[str, Any]) -> str:
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     """Complete trade plan for the dominant side, taken from the scanner's own trade object.
     Targets are structural and net-RR positive only; a second target is shown only if it is
-    valid. Incomplete confirmations never remove the plan: they are listed as missing items."""
+    valid. Market-level and setup blockers are listed; incomplete confirmations never remove
+    the plan."""
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
     short = dom == "SHORT"
     sc = ss if short else ls
     price = res["price"]
     t = sc["trade"]
-    missing = list(sc["soft_blockers"]) + list(sc["blockers"])
+    missing: List[str] = []
+    for m in list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"]):
+        if m not in missing:
+            missing.append(m)
     if res.get("signal") and res["signal"]["side"] == dom:
         status = "سیگنال صادر شد"
     elif missing:
         status = "در انتظار: " + missing[0]
     else:
         status = "شرط‌ها کامل؛ منتظر تأیید نهایی"
+    if res.get("signal") and res["signal"]["side"] == dom:
+        decision = "ENTER"
+    elif t is None:
+        decision = "NO_ENTRY"
+    else:
+        decision = "CONDITIONAL"
     if t:
         when = "ورود %s به %s" % ("لیمیت" if t["order_type"] == "LIMIT" else "بازار", fmt_price(t["entry"]))
         retest = (short and t["entry"] > price) or ((not short) and t["entry"] < price)
@@ -1123,7 +1138,7 @@ def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
         activation = "—"
     return {"side": dom, "score_short": ss["score"], "score_long": ls["score"], "status": status,
             "trade": t, "missing": missing, "short": short, "activation": activation,
-            "price": price, "best_score": max(ls["score"], ss["score"])}
+            "price": price, "best_score": max(ls["score"], ss["score"]), "decision": decision}
 
 
 def format_card(res: Dict[str, Any]) -> List[str]:
@@ -1133,7 +1148,7 @@ def format_card(res: Dict[str, Any]) -> List[str]:
     lines = [
         "<b>%s</b> | قیمت %s" % (html.escape(res["symbol"]), f(c["price"])),
         "جهت غالب: %s | امتیاز شورت: %d | امتیاز لانگ: %d" % (c["side"], c["score_short"], c["score_long"]),
-        "وضعیت: " + html.escape(c["status"]),
+        "تصمیم: <b>%s</b> | وضعیت: %s" % (DECISION_FA[c["decision"]], html.escape(c["status"])),
     ]
     if t:
         lines.append("ورود: %s (%s)" % (f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار"))
