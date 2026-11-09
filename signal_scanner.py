@@ -1774,3 +1774,83 @@ def send_scan_report_to_telegram(token, chat_id, report_text):
 #     TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 #     
 #     send_scan_report_to_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, report)
+import ccxt
+import pandas as pd
+import numpy as np
+import os
+import requests
+
+# 1. تابع جدید محاسبه سطوح حمایت، مقاومت و تارگت‌ها (این را به فایل اضافه کنید)
+def calculate_levels_and_targets(df, direction='LONG', entry_price=0):
+    window = 20
+    df['recent_high'] = df['high'].rolling(window=window).max()
+    df['recent_low'] = df['low'].rolling(window=window).min()
+    
+    last_row = df.iloc[-1]
+    
+    if direction == 'LONG':
+        support = last_row['recent_low']
+        sl = support * 0.998  # کمی پایین‌تر از حمایت
+        tp1 = last_row['recent_high'] * 0.99
+        tp2 = last_row['recent_high'] * 1.015
+        
+        risk = entry_price - sl
+        reward1 = tp1 - entry_price
+        net_rr1 = (reward1 / risk) if risk > 0 else 0
+        
+        reward2 = tp2 - entry_price
+        net_rr2 = (reward2 / risk) if risk > 0 else 0
+        
+        return {
+            "SL": round(sl, 4), "TP1": round(tp1, 4), "TP2": round(tp2, 4),
+            "Net_RR1": round(net_rr1, 2), "Net_RR2": round(net_rr2, 2),
+            "Valid": net_rr2 >= 1.5
+        }
+    elif direction == 'SHORT':
+        resistance = last_row['recent_high']
+        sl = resistance * 1.002  # کمی بالاتر از مقاومت
+        tp1 = last_row['recent_low'] * 1.01
+        tp2 = last_row['recent_low'] * 0.985
+        
+        risk = sl - entry_price
+        reward1 = entry_price - tp1
+        net_rr1 = (reward1 / risk) if risk > 0 else 0
+        
+        reward2 = entry_price - tp2
+        net_rr2 = (reward2 / risk) if risk > 0 else 0
+        
+        return {
+            "SL": round(sl, 4), "TP1": round(tp1, 4), "TP2": round(tp2, 4),
+            "Net_RR1": round(net_rr1, 2), "Net_RR2": round(net_rr2, 2),
+            "Valid": net_rr2 >= 1.5
+        }
+
+# 2. حلقه اصلی اسکن شما (که از قبل داشتید)
+def main_scanner():
+    exchange = ccxt.lbank({'enableRateLimit': True})
+    exchange.load_markets()
+    
+    # لیست ارزهایی که بررسی می‌کنید (TON_USDT را هم بر اساس صحبت قبل می‌توانید بردارید)
+    symbols = ['BTC/USDT', 'XRP/USDT'] 
+    
+    for symbol in symbols:
+        try:
+            # دریافت دیتای کندل‌ها
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            current_price = df.iloc[-1]['close']
+            
+            # فرض کنید استراتژی شما جهت را تشخیص داده است
+            direction = 'LONG' 
+            
+            # استفاده از تابع جدید برای تعیین دقیق تارگت‌ها و SL
+            levels = calculate_levels_and_targets(df, direction=direction, entry_price=current_price)
+            
+            # چاپ یا ارسال به تلگرام
+            print(f"ارز {symbol} -> SL: {levels['SL']} | TP1: {levels['TP1']} | TP2: {levels['TP2']} | Net RR: {levels['Net_RR2']}")
+            
+        except Exception as e:
+            print(f"خطا در بررسی {symbol}: {e}")
+
+if __name__ == "__main__":
+    main_scanner()
