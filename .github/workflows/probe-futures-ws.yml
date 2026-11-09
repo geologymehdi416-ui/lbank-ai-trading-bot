@@ -1,3 +1,4 @@
+
 name: Probe LBank Futures WebSocket
 
 on:
@@ -9,41 +10,19 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install WebSocket client
-        run: pip install websocket-client
+        run: python -m pip install --upgrade websocket-client
 
-      - name: Test Futures WebSocket
+      - name: Test Futures WebSocket topics 11, 12 and 13
         run: |
-          python - <<'PY'
-          import websocket
-          import time
-
-          url = "wss://lbkperpws.lbank.com/ws"
-          print("Connecting to LBank Futures...")
-          ws = websocket.create_connection(url, timeout=8)
-          print("WEBSOCKET_HANDSHAKE=SUCCESS")
-
-          deadline = time.time() + 15
-          received = 0
-
-          try:
-              while time.time() < deadline:
-                  try:
-                      message = ws.recv()
-                      if message:
-                          received += 1
-                          print("SERVER_FRAME", received, str(message)[:1500])
-                  except websocket.WebSocketTimeoutException:
-                      break
-          finally:
-              ws.close()
-
-          print("SERVER_FRAMES_RECEIVED=", received)
-          PY
+          python -u ws_test.py
