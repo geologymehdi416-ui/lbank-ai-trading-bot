@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: lbank-futures-scanner
+  group: lbank-market-data-writer
   cancel-in-progress: false
 
 jobs:
@@ -34,15 +34,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
+      # ابتدا مخزن را به‌روز می‌کنیم
+      - name: Sync with remote
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "${GITHUB_REF_NAME}"
+          git rebase "origin/${GITHUB_REF_NAME}"
+
+      # جمع‌آوری قیمت‌ها
       - name: Collect LBank Futures prices
         run: |
           python collector.py
 
+      # تحلیل بازار
       - name: Run smart scanner
         run: |
           python signal_scanner.py
 
-      - name: Send Telegram report in multiple messages
+      # ارسال گزارش تلگرام
+      - name: Send Telegram report
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -57,43 +69,27 @@ jobs:
           chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
           if not token or not chat_id:
-              raise RuntimeError(
-                  "Telegram secrets are missing"
-              )
+              raise RuntimeError("Telegram secrets are missing")
 
           report_file = Path("report.txt")
 
           if not report_file.exists():
-              raise RuntimeError(
-                  "report.txt was not generated"
-              )
+              raise RuntimeError("report.txt was not generated")
 
-          report = report_file.read_text(
-              encoding="utf-8"
-          ).strip()
+          report = report_file.read_text(encoding="utf-8").strip()
 
           if not report:
-              raise RuntimeError(
-                  "Telegram report is empty"
-              )
+              raise RuntimeError("Telegram report is empty")
 
-          # تقسیم گزارش به پیام‌های زیر 3800 کاراکتر
           max_length = 3800
           chunks = []
           current = ""
 
           for line in report.splitlines():
-
               if len(line) > max_length:
-                  raise RuntimeError(
-                      "A report line exceeds Telegram message limit"
-                  )
+                  raise RuntimeError("A report line exceeds Telegram limit")
 
-              candidate = (
-                  current + "\n" + line
-                  if current
-                  else line
-              )
+              candidate = current + "\n" + line if current else line
 
               if len(candidate) > max_length:
                   chunks.append(current)
@@ -104,29 +100,17 @@ jobs:
           if current:
               chunks.append(current)
 
-          url = (
-              f"https://api.telegram.org/"
-              f"bot{token}/sendMessage"
-          )
-
-          total = len(chunks)
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
 
           for index, chunk in enumerate(chunks, start=1):
-
-              prefix = (
-                  f"📨 بخش {index}/{total}\n\n"
-                  if total > 1
-                  else ""
-              )
-
-              payload = {
-                  "chat_id": chat_id,
-                  "text": prefix + chunk
-              }
+              prefix = f"📨 بخش {index}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
 
               response = requests.post(
                   url,
-                  json=payload,
+                  json={
+                      "chat_id": chat_id,
+                      "text": prefix + chunk
+                  },
                   timeout=30
               )
 
@@ -135,35 +119,49 @@ jobs:
               result = response.json()
 
               if not result.get("ok"):
-                  raise RuntimeError(
-                      f"Telegram error: {result}"
-                  )
+                  raise RuntimeError(f"Telegram error: {result}")
 
-              print(
-                  f"Telegram message "
-                  f"{index}/{total} sent"
-              )
-
+              print(f"Telegram message {index}/{len(chunks)} sent")
               time.sleep(1)
 
-          print(
-              f"Successfully sent {total} Telegram messages"
-          )
+          print(f"Successfully sent {len(chunks)} messages")
           PY
 
-      - name: Save collected market data
+      # ذخیره امن داده‌های بازار
+      - name: Commit and push market data
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -e
 
           git add data/prices.jsonl
 
           if git diff --cached --quiet; then
             echo "No market data changes"
-          else
-            git commit -m "Update LBank futures market data"
-
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            exit 0
           fi
+
+          git commit -m "Update LBank futures market data"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt: ${attempt}"
+
+            git fetch origin "${GITHUB_REF_NAME}"
+
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              echo "Rebase conflict detected"
+
+              git rebase --abort || true
+
+              echo "Manual inspection required. No force push attempted."
+              exit 1
+            fi
+
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Market data successfully pushed"
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "Push failed after 5 attempts"
+          exit 1
