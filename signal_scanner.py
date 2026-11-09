@@ -29,6 +29,8 @@ Environment variables:
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
   FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
   TP_MIN_RR_NET      each structural target must have net RR >= this, default 0.5
+  EXPIRY_H           hours a conditional opportunity stays valid, default 4
+  TZ_OFFSET_HOURS    report time zone offset from UTC, default 3.5 (Tehran)
   REPORT_FILE        main Telegram output (plain text), default report.txt
   DETAILS_FILE       full analysis for local review (never sent), default details_report.txt
   SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
@@ -106,6 +108,7 @@ MIN_CANDLES = 100
 MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
+EXPIRY_H = _env_float("EXPIRY_H", 4.0)  # hours a conditional opportunity stays valid
 TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)  # each structural target must have net RR >= this
 WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
 CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)  # display only: hide cards whose TP1 net RR is below this (0 = show all)
@@ -1202,29 +1205,65 @@ def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
             "price": price, "best_score": max(ls["score"], ss["score"]), "decision": decision}
 
 
-def format_card(res: Dict[str, Any]) -> List[str]:
+def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Standard scenario fields for display: Activation Price, Confirmation, Entry Zone,
+    Invalidation, SL, TP1/TP2, Net RR, Leverage, Expiry. All numbers come from the trade."""
     c = build_card(res)
     t = c["trade"]
+    short = c["short"]
+    atr15 = res["D"]["15m"]["atr"]
+    off = _env_float("TZ_OFFSET_HOURS", 3.5)
+    exp_t = datetime.now(timezone.utc) + timedelta(hours=off + EXPIRY_H)
+    expiry = exp_t.strftime("%Y-%m-%d %H:%M") + " (محلی)"
+    f = {"side": c["side"], "decision": DECISION_FA[c["decision"]], "expiry": expiry,
+         "missing": c["missing"], "status": c["status"], "trade": t}
+    if t is None:
+        f.update({"activation": None, "confirmation": "—", "zone": None,
+                  "invalidation": "—", "sl": None, "tp1": None, "tp2": None,
+                  "rr1": None, "rr2": None, "leverage": None})
+        return f
+    zone = None
+    sc = res["scenarios"]["SHORT" if short else "LONG"]
+    if sc.get("zone"):
+        zone = (sc["zone"]["bottom"], sc["zone"]["top"])
+    if zone is None:
+        zone = (t["entry"] - 0.1 * atr15, t["entry"] + 0.1 * atr15)
+    side_word = "زیر" if short else "بالای"
+    f.update({
+        "activation": t["entry"],
+        "confirmation": "کندل 15m بسته‌شده %s %s با حجم ≥ %.1f× میانگین" % (
+            side_word, fmt_price(t["entry"]), BREAKOUT_MIN_VOL),
+        "zone": zone,
+        "invalidation": "کندل 15m بسته‌شده %s %s (حد ضرر)" % (
+            "بالای" if short else "زیر", fmt_price(t["sl"])),
+        "sl": t["sl"], "tp1": t["tp1"], "tp2": t["tp2"] if t.get("tp2_ok") else None,
+        "rr1": t["rr1n"], "rr2": t["rr2n"] if t.get("tp2_ok") else None,
+        "leverage": t["notional_x"],
+    })
+    return f
+
+
+def format_card(res: Dict[str, Any]) -> List[str]:
+    """Standard field card (details / per-symbol view)."""
+    p = plan_fields(res)
     f = fmt_price
     lines = [
-        "<b>%s</b> | قیمت %s" % (html.escape(res["symbol"]), f(c["price"])),
-        "جهت غالب: %s | امتیاز شورت: %d | امتیاز لانگ: %d" % (c["side"], c["score_short"], c["score_long"]),
-        "تصمیم: <b>%s</b> | وضعیت: %s" % (DECISION_FA[c["decision"]], html.escape(c["status"])),
+        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"], p["decision"],
+                                           html.escape(p["expiry"])),
     ]
-    if t:
-        lines.append("ورود: %s (%s)" % (f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار"))
-        lines.append("حد ضرر: %s (فاصله %.2f%%)" % (f(t["sl"]), t["stop_pct"]))
-        tp1 = "تارگت اول: %s (RR خالص %.2f)" % (f(t["tp1"]), t["rr1n"])
-        if t.get("tp2_ok", True):
-            tp1 += " | تارگت دوم: %s (RR خالص %.2f)" % (f(t["tp2"]), t["rr2n"])
-        else:
-            tp1 += " | تارگت دوم: — (معتبر پیدا نشد)"
-        lines.append(tp1)
-        lines.append("اهرم: تا %.2fx (ریسک %.2f%% ÷ فاصله‌ی حد ضرر + کارمزد)" % (t["notional_x"], RISK_PCT))
-    else:
+    if p["trade"] is None:
         lines.append("طرح معامله: — (تارگت یا حد ضرر معتبر پیدا نشد)")
-    lines.append("شرط فعال‌سازی: " + html.escape(c["activation"]))
-    rest = c["missing"][1:]
+    else:
+        lines.append("Activation Price: %s" % f(p["activation"]))
+        lines.append("Confirmation: %s" % html.escape(p["confirmation"]))
+        lines.append("Entry Zone: %s – %s" % (f(p["zone"][0]), f(p["zone"][1])))
+        lines.append("Invalidation: %s" % html.escape(p["invalidation"]))
+        lines.append("SL: %s (%.2f%%)" % (f(p["sl"]), p["trade"]["stop_pct"]))
+        tp2 = ("%s (Net RR %.2f)" % (f(p["tp2"]), p["rr2"])) if p["tp2"] is not None else "— (معتبر پیدا نشد)"
+        lines.append("TP1: %s (Net RR %.2f) | TP2: %s" % (f(p["tp1"]), p["rr1"], tp2))
+        lines.append("Leverage: ≤ %.2fx (ریسک %.2f%% ÷ فاصله‌ی حد ضرر + کارمزد)" % (p["leverage"], RISK_PCT))
+    lines.append("وضعیت: %s" % html.escape(p["status"]))
+    rest = p["missing"][1:]
     if rest:
         lines.append("نواقص دیگر: " + html.escape(" | ".join(rest)))
     return lines
@@ -1240,47 +1279,39 @@ def local_now() -> str:
 
 
 def format_brief(res: Dict[str, Any]) -> List[str]:
-    """Compact Telegram card: decision, entry, SL, targets and the coin's read."""
-    c = build_card(res)
-    t = c["trade"]
+    """Compact Telegram card with the standard fields."""
+    p = plan_fields(res)
     f = fmt_price
     D = res["D"]
-    side_key = "LONG" if c["side"] == "LONG" else "SHORT"
+    side_key = "LONG" if p["side"] == "LONG" else "SHORT"
     sc = res["scenarios"][side_key]
     read = [n for n in sc["notes"] if not n.startswith("حجم") and not n.startswith("مومنتوم")][:3]
     lines = [
-        "<b>%s</b> | قیمت %s | %s" % (html.escape(res["symbol"]), f(res["price"]),
-                                      DECISION_FA[c["decision"]]),
-        "جهت: %s | امتیاز شورت %d / لانگ %d" % (c["side"], c["score_short"], c["score_long"]),
+        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"],
+                                          p["decision"], html.escape(p["expiry"])),
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
                                      TREND_ARROW[D["15m"]["trend"]]),
     ]
     if read:
         lines.append("تحلیل: " + html.escape(" | ".join(read)))
-    if t:
-        lines.append("ورود: %s (%s) | حد ضرر: %s (%.2f%%)" % (
-            f(t["entry"]), "لیمیت" if t["order_type"] == "LIMIT" else "بازار", f(t["sl"]), t["stop_pct"]))
-        tp = "تارگت اول: %s (RR خالص %.2f)" % (f(t["tp1"]), t["rr1n"])
-        if t.get("tp2_ok"):
-            tp += " | تارگت دوم: %s (RR خالص %.2f)" % (f(t["tp2"]), t["rr2n"])
-        else:
-            tp += " | تارگت دوم: —"
-        lines.append(tp)
-        lines.append("اهرم: تا %.2fx" % t["notional_x"])
-    else:
+    if p["trade"] is None:
         lines.append("طرح معامله: — (تارگت معتبر نیست؛ ورود نکن)")
+    else:
+        lines.append("Activation: %s | Entry Zone: %s – %s" % (
+            f(p["activation"]), f(p["zone"][0]), f(p["zone"][1])))
+        lines.append("Confirmation: %s" % html.escape(p["confirmation"]))
+        lines.append("Invalidation: %s" % html.escape(p["invalidation"]))
+        lines.append("SL: %s (%.2f%%) | TP1: %s | TP2: %s" % (
+            f(p["sl"]), p["trade"]["stop_pct"], f(p["tp1"]),
+            f(p["tp2"]) if p["tp2"] is not None else "—"))
+        lines.append("Net RR: TP1 %.2f%s | Leverage ≤ %.2fx" % (
+            p["rr1"], (" / TP2 %.2f" % p["rr2"]) if p["rr2"] is not None else "", p["leverage"]))
     fp = fib_plan(D, side_key, res["price"])
     if fp:
-        tp1 = f(fp["tp1"]) if fp["tp1"] is not None else "—"
-        tp2 = f(fp["tp2"]) if fp["tp2"] is not None else "—"
         lines.append("پلن فیبو: %s" % html.escape(fp["status"]))
-        lines.append("ورود پلن: %s | حد ضرر: %s (%.2f%%) | T1: %s | T2: %s" % (
-            f(fp["entry"]), f(fp["sl"]), fp["stop_pct"], tp1, tp2))
-    if c["decision"] != "ENTER" and c["missing"]:
-        lines.append("نواقص: " + html.escape(" | ".join(c["missing"][:2])))
+    if p["decision"] != DECISION_FA["ENTER"] and p["missing"]:
+        lines.append("نواقص: " + html.escape(" | ".join(p["missing"][:2])))
     return lines
-
-
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
@@ -1400,6 +1431,8 @@ def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("")
     lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
+
+
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
