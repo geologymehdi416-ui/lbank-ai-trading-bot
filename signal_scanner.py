@@ -8,13 +8,13 @@ Analysis-only crypto futures signal scanner (NO order execution).
 Pipeline per symbol:
   1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
   2. Higher-timeframe STRUCTURE trend (HH/HL, LH/LL, CHoCH); ATR and volume
-     are used only as market filters. Price action is the primary method.
+     are used only as market filters. No EMA/RSI/MACD (pure price action).
   3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
   5. Build Entry / SL / TP1 / TP2 / RR; signal only if score >= MIN_SCORE and
-     all risk gates pass (5m structure and momentum included).
-  6. Send main report (signals or NO TRADE, with entry/SL/TP and coin read) to Telegram.
+     all risk gates pass.
+  6. Send scan report + signals to Telegram.
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
@@ -27,21 +27,10 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
-  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
-  TP_MIN_RR_NET      each structural target must have net RR >= this, default 0.5
-  REPORT_FILE        main Telegram output (plain text), default report.txt
-  DETAILS_FILE       full analysis for local review (never sent), default details_report.txt
-  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
-  DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
-  INDICATOR_FILTER   1 = indicator check can block signals; 0 (default) = diagnostics only
-  FIB_CONFIRM        1 = Fibonacci affects score/TP; 0 (default) = diagnostics only
-  SWING_MIN_AMP      0 (default, off) or a swing needs a move >= this x ATR
-  CARD_MIN_RR        display only: hide conditional cards whose TP1 net RR is below this (default 0 = all)
 
 Usage:
   python signal_scanner.py
   python signal_scanner.py --symbols BTC_USDT,ETH_USDT --dry-run
-  python signal_scanner.py --diag
 """
 from __future__ import annotations
 
@@ -58,7 +47,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("signal_scanner")
@@ -757,8 +746,63 @@ def fib_info(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Dict[str,
     if valid and in_zone:
         pts = FIB_PTS_OVERLAP if overlap else FIB_PTS_ZONE
     out.update({"valid": valid, "retr": retr, "zone": zone, "targets": targets,
-                "overlap": overlap, "in_zone": in_zone, "pts": pts})
+                "overlap": overlap, "in_zone": in_zone, "pts": pts,
+                "impulse": (ap, bp, cp, diff)})
     return out
+
+
+def fib_plan(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Optional[Dict[str, Any]]:
+    """Waiting plan from the 1H impulse (planning only, never creates a signal).
+    Entry at the 0.618 pullback; stop beyond the 0.786 level plus 0.25 ATR(15m);
+    TP1 = prior structural extreme of the impulse, TP2 = 1.272 extension of the impulse.
+    Each target must have positive net RR above TP_MIN_RR_NET."""
+    f = fib_info(D, side, price)
+    if not f.get("impulse") or not f["valid"]:
+        return None
+    long = side == "LONG"
+    a, b, c, diff = f["impulse"]
+    atr15 = D["15m"]["atr"]
+    zlo, zhi = f["zone"]
+    if long:
+        entry = b - 0.618 * diff
+        deep = b - 0.786 * diff
+        sl = deep - 0.25 * atr15
+        cand = [b, a + 1.272 * diff]
+    else:
+        entry = b + 0.618 * diff
+        deep = b + 0.786 * diff
+        sl = deep + 0.25 * atr15
+        cand = [b, a - 1.272 * diff]
+    if (long and not sl < entry) or ((not long) and not sl > entry):
+        return None
+    risk_pct = abs(sl - entry) / entry * 100.0
+    cost = 2.0 * FEE_PCT
+    tps: List[Tuple[float, float]] = []
+    for t in cand:
+        on_side = t > entry if long else t < entry
+        if not on_side:
+            tps.append((None, None))
+            continue
+        rr = (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+        tps.append((t, rr) if rr >= TP_MIN_RR_NET else (None, None))
+    margin = 0.25 * atr15
+    if long:
+        if price > zhi + margin:
+            status = "منتظر پولبک به ۰.۶۱۸ (فاصله %.2f%%)" % ((price - entry) / entry * 100.0)
+        elif price >= zlo - margin:
+            status = "در ناحیه‌ی ۰.۶۱۸ تا ۰.۷۸۶: منتظر تأیید 5m (MSS + کندل بدنه‌دار هم‌جهت)"
+        else:
+            status = "پولبک عمیق‌تر از ۰.۷۸۶: طرح باطل"
+    else:
+        if price < zlo - margin:
+            status = "منتظر پولبک به ۰.۶۱۸ (فاصله %.2f%%)" % ((entry - price) / entry * 100.0)
+        elif price <= zhi + margin:
+            status = "در ناحیه‌ی ۰.۶۱۸ تا ۰.۷۸۶: منتظر تأیید 5m (MSS + کندل بدنه‌دار هم‌جهت)"
+        else:
+            status = "پولبک عمیق‌تر از ۰.۷۸۶: طرح باطل"
+    return {"entry": entry, "sl": sl, "stop_pct": risk_pct,
+            "tp1": tps[0][0], "tp1_rr": tps[0][1], "tp2": tps[1][0], "tp2_rr": tps[1][1],
+            "zone": (zlo, zhi), "status": status}
 
 
 def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
@@ -1103,8 +1147,7 @@ def no_signal_reason(res: Dict[str, Any]) -> str:
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     """Complete trade plan for the dominant side, taken from the scanner's own trade object.
     Targets are structural and net-RR positive only; a second target is shown only if it is
-    valid. Market-level and setup blockers are listed; incomplete confirmations never remove
-    the plan."""
+    valid. Incomplete confirmations never remove the plan: they are listed as missing items."""
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
     short = dom == "SHORT"
@@ -1174,6 +1217,15 @@ def format_card(res: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def local_now() -> str:
+    """Report timestamp in the viewer's local time (TZ_OFFSET_HOURS, default +3.5 for Tehran)."""
+    off = _env_float("TZ_OFFSET_HOURS", 3.5)
+    t = datetime.now(timezone.utc) + timedelta(hours=off)
+    sign = "+" if off >= 0 else "-"
+    hh, mm = int(abs(off)), int(round((abs(off) - int(abs(off))) * 60))
+    return t.strftime("%Y-%m-%d %H:%M") + " (UTC%s%02d:%02d)" % (sign, hh, mm)
+
+
 def format_brief(res: Dict[str, Any]) -> List[str]:
     """Compact Telegram card: decision, entry, SL, targets and the coin's read."""
     c = build_card(res)
@@ -1204,6 +1256,13 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         lines.append("اهرم: تا %.2fx" % t["notional_x"])
     else:
         lines.append("طرح معامله: — (تارگت معتبر نیست؛ ورود نکن)")
+    fp = fib_plan(D, side_key, res["price"])
+    if fp:
+        tp1 = f(fp["tp1"]) if fp["tp1"] is not None else "—"
+        tp2 = f(fp["tp2"]) if fp["tp2"] is not None else "—"
+        lines.append("پلن فیبو: %s" % html.escape(fp["status"]))
+        lines.append("ورود پلن: %s | حد ضرر: %s (%.2f%%) | T1: %s | T2: %s" % (
+            f(fp["entry"]), f(fp["sl"]), fp["stop_pct"], tp1, tp2))
     if c["decision"] != "ENTER" and c["missing"]:
         lines.append("نواقص: " + html.escape(" | ".join(c["missing"][:2])))
     return lines
@@ -1213,7 +1272,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
     for the strongest symbols. Full analysis goes to details_report.txt."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = local_now()
     sigs = [r for r in results if r["signal"]]
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now]
     if sigs:
@@ -1238,7 +1297,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
 
 def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = local_now()
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now, ""]
     sigs = [r for r in results if r["signal"]]
     lines.append("🎯 سیگنال قطعی: %d" % len(sigs))
@@ -1525,7 +1584,7 @@ def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
     path = os.getenv("DIAG_FILE", DIAG_FILE)
     if not path:
         return
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = local_now()
     lines = ["DIAGNOSTIC REPORT — %s" % now, ""]
     for r in results:
         lines.extend(gate_table(r, min_score))
