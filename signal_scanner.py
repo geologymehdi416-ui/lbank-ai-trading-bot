@@ -1,37 +1,37 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-Smart Market Analyst V3 - Safe Rebuild
-
-Safety policy:
-- Never use Spot candles for Futures signals.
-- Never assume an undocumented Futures endpoint.
-- Fail closed until Futures OHLCV is verified.
-- Keep LONG and SHORT analysis independent.
-- Validate trade direction and risk/reward.
+signal_scanner.py
+Smart Market Analyst V3
+Corrected and safety-validated edition.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import html
 import json
 import logging
 import math
 import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+log = logging.getLogger("signal_scanner")
 
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-
-APP_NAME = "Smart Market Analyst V3"
+# --------------------------------------------------
+# GENERAL SETTINGS
+# --------------------------------------------------
 
 DEFAULT_SYMBOLS = (
     "BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
@@ -39,129 +39,347 @@ DEFAULT_SYMBOLS = (
     "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT"
 )
 
-MIN_SCORE = float(os.getenv("MIN_SCORE", "65"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.5"))
-MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "2"))
-MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "3"))
-MIN_RR = float(os.getenv("MIN_RR", "1.5"))
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
 
+
+MIN_SCORE = _env_float("MIN_SCORE", 65.0)
+RISK_PCT = _env_float("RISK_PCT", 0.5)
+MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
+REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
+FEE_PCT = _env_float("FEE_PCT", 0.06)
+
+MAX_STOP_PCT = 3.0
 MIN_CANDLES = 100
-ATR_PERIOD = 14
+MIN_RR = 1.5
+WATCH_MIN = 60
 
-TIMEFRAMES = {
-    "5m": 300,
-    "15m": 900,
-    "1h": 3600,
-    "4h": 14400,
+STRUCT_CAP = 70
+MSS_MAX_DELAY = 8
+MSS_MIN_BODY = 0.8
+
+# Safety: Futures OHLCV source must be verified.
+MARKET_TYPE = os.getenv("MARKET_TYPE", "FUTURES").upper()
+
+if MARKET_TYPE not in ("FUTURES", "SPOT"):
+    raise ValueError("MARKET_TYPE must be FUTURES or SPOT")
+
+
+TF_MAP: Dict[str, Tuple[str, int]] = {
+    "5m": ("minute5", 300),
+    "15m": ("minute15", 900),
+    "1h": ("hour1", 3600),
+    "4h": ("hour4", 14400),
 }
 
-REPORT_FILE = os.getenv("REPORT_FILE", "report.txt")
+TREND_FA = {
+    "UP": "صعودی",
+    "DOWN": "نزولی",
+    "RANGE": "رنج",
+}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+TREND_ARROW = {
+    "UP": "↑",
+    "DOWN": "↓",
+    "RANGE": "↔",
+}
 
-log = logging.getLogger("signal_scanner")
+DECISION_FA = {
+    "ENTER": "ورود",
+    "CONDITIONAL": "شرطی (نیازمند تأیید)",
+    "NO_ENTRY": "ورود نکن",
+}
 
 
-# ---------------------------------------------------------
+# --------------------------------------------------
 # EXCEPTIONS
-# ---------------------------------------------------------
+# --------------------------------------------------
 
 class ScanError(Exception):
-    """Recoverable scanner error."""
+    """Recoverable error for a single symbol or request."""
 
 
 class DataSourceError(ScanError):
-    """Unverified or invalid market data source."""
+    """Market data source is unavailable or not verified."""
 
 
-# ---------------------------------------------------------
-# SAFE NUMERIC HELPERS
-# ---------------------------------------------------------
+# --------------------------------------------------
+# CANDLE DATA STRUCTURE
+# --------------------------------------------------
 
-def to_float(value: Any) -> Optional[float]:
-    try:
-        number = float(value)
+class Candles:
 
-        if math.isfinite(number):
-            return number
+    def __init__(
+        self,
+        rows: List[
+            Tuple[float, float, float, float, float, float]
+        ],
+    ):
+        if not rows:
+            raise DataSourceError("No candle data received")
 
-    except (TypeError, ValueError, OverflowError):
-        pass
+        self.t = [float(r[0]) for r in rows]
+        self.o = [float(r[1]) for r in rows]
+        self.h = [float(r[2]) for r in rows]
+        self.l = [float(r[3]) for r in rows]
+        self.c = [float(r[4]) for r in rows]
+        self.v = [float(r[5]) for r in rows]
 
-    return None
+        self._validate()
+
+    def _validate(self) -> None:
+
+        n = len(self.c)
+
+        if not all(
+            len(x) == n
+            for x in (
+                self.t,
+                self.o,
+                self.h,
+                self.l,
+                self.v,
+            )
+        ):
+            raise DataSourceError("Candle arrays have different lengths")
+
+        for i in range(n):
+
+            values = (
+                self.o[i],
+                self.h[i],
+                self.l[i],
+                self.c[i],
+                self.v[i],
+            )
+
+            if not all(math.isfinite(x) for x in values):
+                raise DataSourceError("Non-finite candle value")
+
+            if min(
+                self.o[i],
+                self.h[i],
+                self.l[i],
+                self.c[i],
+            ) <= 0:
+                raise DataSourceError("Invalid candle price")
+
+            if self.h[i] < self.l[i]:
+                raise DataSourceError("Invalid candle high/low")
+
+            if self.v[i] < 0:
+                raise DataSourceError("Negative candle volume")
+
+            if self.h[i] < max(self.o[i], self.c[i]):
+                raise DataSourceError("Candle high is invalid")
+
+            if self.l[i] > min(self.o[i], self.c[i]):
+                raise DataSourceError("Candle low is invalid")
+
+            if i > 0 and self.t[i] <= self.t[i - 1]:
+                raise DataSourceError("Candle timestamps are not increasing")
+
+        if n < MIN_CANDLES:
+            raise DataSourceError(
+                "Insufficient candles: %d (required %d)"
+                % (n, MIN_CANDLES)
+            )
+
+    def __len__(self) -> int:
+        return len(self.c)
+
+# --------------------------------------------------------------------------
+# PART 2/5: NETWORK, DATA SOURCE & MARKET DATA
+# --------------------------------------------------------------------------
+
+_last_req = 0.0
+
+LBANK_BASE = os.getenv(
+    "LBANK_BASE_URL",
+    "https://api.lbkex.com"
+).rstrip("/")
 
 
-def safe_div(
-    numerator: float,
-    denominator: float,
-    default: float = 0.0
-) -> float:
+def _throttle() -> None:
+    global _last_req
 
-    if denominator == 0 or not math.isfinite(denominator):
-        return default
+    wait = REQUEST_INTERVAL - (time.monotonic() - _last_req)
 
-    result = numerator / denominator
+    if wait > 0:
+        time.sleep(wait)
 
-    return result if math.isfinite(result) else default
+    _last_req = time.monotonic()
 
 
-def clamp(
-    value: float,
-    low: float,
-    high: float
-) -> float:
+def http_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    retries: int = 4,
+    timeout: float = 15.0,
+) -> Any:
 
-    return max(low, min(high, value))
+    if params:
+        separator = "&" if "?" in url else "?"
+        url += separator + urllib.parse.urlencode(params)
 
+    data = None
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    headers = {
+        "User-Agent": "signal-scanner/3.1",
+        "Accept": "application/json",
+    }
+
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    last_err = "unknown"
+
+    for attempt in range(1, retries + 1):
+
+        _throttle()
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers=headers,
+            )
+
+            with urllib.request.urlopen(
+                req,
+                timeout=timeout,
+            ) as resp:
+
+                raw = resp.read().decode(
+                    "utf-8",
+                    "replace",
+                )
+
+            return json.loads(raw)
+
+        except urllib.error.HTTPError as e:
+
+            last_err = "HTTP %s" % e.code
+
+            if e.code == 429 or e.code >= 500:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+
+            raise ScanError(
+                "Network HTTP Error: %s" % last_err
+            )
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+        ) as e:
+
+            last_err = str(
+                getattr(e, "reason", None) or e
+            )
+
+            time.sleep(min(2 ** attempt, 20))
+
+        except (json.JSONDecodeError, ValueError):
+
+            last_err = "Invalid JSON response"
+
+            time.sleep(min(2 ** attempt, 20))
+
+    raise ScanError(
+        "Request failed after %d attempts: %s"
+        % (retries, last_err)
     )
 
 
-# ---------------------------------------------------------
-# CANDLE DATA MODEL
-# ---------------------------------------------------------
+# --------------------------------------------------------------------------
+# DATA SOURCE VALIDATION
+# --------------------------------------------------------------------------
 
-@dataclass
-class Candles:
+def futures_data_source_verified() -> bool:
+    """
+    Futures OHLCV must not be inferred from Spot data
+    or from periodic market snapshots.
 
-    timestamp: List[int]
-    open: List[float]
-    high: List[float]
-    low: List[float]
-    close: List[float]
-    volume: List[float]
+    Until an official Futures candle source is verified,
+    the scanner refuses to generate Futures signals.
+    """
 
-    def __len__(self) -> int:
-        return len(self.close)
+    return (
+        os.getenv("FUTURES_OHLCV_VERIFIED", "false").lower()
+        == "true"
+        and bool(os.getenv("FUTURES_KLINE_URL", "").strip())
+    )
 
-    @classmethod
-    def from_rows(cls, rows: List[Any]) -> "Candles":
 
-        parsed = {}
+def _validate_symbol(symbol: str) -> str:
 
-        for row in rows:
+    symbol = str(symbol).upper().strip()
 
-            if not isinstance(row, (list, tuple)) or len(row) < 6:
-                continue
+    if not re.fullmatch(r"[A-Z0-9]+_[A-Z0-9]+", symbol):
+        raise ScanError(
+            "Invalid symbol format: %s" % symbol
+        )
 
-            try:
-                ts = int(float(row[0]))
+    return symbol
 
-                if ts > 10**11:
-                    ts //= 1000
+
+# --------------------------------------------------------------------------
+# KLINE PARSING
+# --------------------------------------------------------------------------
+
+def _parse_kline_rows(
+    rows_raw: Any,
+    tf: str,
+) -> Candles:
+
+    if not isinstance(rows_raw, list):
+        raise ScanError("Invalid kline data array")
+
+    if tf not in TF_MAP:
+        raise ScanError("Unsupported timeframe: %s" % tf)
+
+    _, sec = TF_MAP[tf]
+
+    parsed: Dict[
+        int,
+        Tuple[float, float, float, float, float, float]
+    ] = {}
+
+    now = time.time()
+
+    for r in rows_raw:
+
+        try:
+            if isinstance(r, dict):
+                ts = int(float(
+                    r.get("timestamp", r.get("time"))
+                ))
+
+                o = float(r.get("open"))
+                h = float(r.get("high"))
+                l = float(r.get("low"))
+                c = float(r.get("close"))
+                v = float(r.get("volume"))
+
+            else:
+                ts = int(float(r[0]))
 
                 o, h, l, c, v = (
-                    float(x) for x in row[1:6]
+                    float(x) for x in r[1:6]
                 )
 
-            except (TypeError, ValueError, OverflowError):
-                continue
+            # Convert milliseconds to seconds.
+            if ts > 10 ** 11:
+                ts //= 1000
 
             values = (o, h, l, c, v)
 
@@ -171,111 +389,222 @@ class Candles:
             if min(o, h, l, c) <= 0:
                 continue
 
-            if h < max(o, c, l):
+            if h < max(o, c) or l > min(o, c):
                 continue
 
-            if l > min(o, c, h):
+            if h < l or v < 0:
                 continue
 
-            if v < 0:
+            # Ignore future candles.
+            if ts > now:
                 continue
 
-            parsed[ts] = (ts, o, h, l, c, v)
+            # Ignore candles that have not closed.
+            if ts + sec > now:
+                continue
 
-        clean = [
-            parsed[k]
-            for k in sorted(parsed)
-        ]
-
-        if len(clean) < MIN_CANDLES:
-            raise ScanError(
-                "Insufficient valid candles: %d; required: %d"
-                % (len(clean), MIN_CANDLES)
+            parsed[ts] = (
+                float(ts),
+                o,
+                h,
+                l,
+                c,
+                v,
             )
 
-        return cls(
-            timestamp=[x[0] for x in clean],
-            open=[x[1] for x in clean],
-            high=[x[2] for x in clean],
-            low=[x[3] for x in clean],
-            close=[x[4] for x in clean],
-            volume=[x[5] for x in clean],
+        except (
+            TypeError,
+            ValueError,
+            IndexError,
+            OverflowError,
+        ):
+            continue
+
+    rows = [
+        parsed[k]
+        for k in sorted(parsed)
+    ]
+
+    if len(rows) < MIN_CANDLES:
+        raise ScanError(
+            "Insufficient closed candles: %d (required %d)"
+            % (len(rows), MIN_CANDLES)
         )
 
-
-# ---------------------------------------------------------
-# DATA SOURCE SAFETY
-# ---------------------------------------------------------
-
-def futures_data_source_verified() -> bool:
-    """
-    Intentionally returns False.
-
-    Do not change this to True until:
-    1. An official Futures OHLCV endpoint is identified.
-    2. Its symbol format is verified.
-    3. All four timeframes return valid Futures candles.
-    4. Returned prices are cross-checked against Futures market data.
-    5. A repeatable automated test passes.
-    """
-
-    return False
+    return Candles(rows)
 
 
-def fetch_futures_klines(
+# --------------------------------------------------------------------------
+# FETCH KLINES
+# --------------------------------------------------------------------------
+
+def fetch_klines(
     symbol: str,
-    timeframe: str,
-    limit: int = 300
+    tf: str,
+    size: int = 300,
 ) -> Candles:
 
-    raise DataSourceError(
-        "Futures OHLCV source is not verified. "
-        "Spot API fallback is deliberately disabled."
-    )
+    symbol = _validate_symbol(symbol)
 
+    if tf not in TF_MAP:
+        raise ScanError(
+            "Unsupported timeframe: %s" % tf
+        )
 
-def fetch_futures_price(symbol: str) -> float:
+    if size < MIN_CANDLES or size > 1000:
+        raise ScanError("Invalid candle request size")
 
-    raise DataSourceError(
-        "Futures price source is not verified."
-    )
+    if MARKET_TYPE == "FUTURES":
 
+        if not futures_data_source_verified():
+            raise DataSourceError(
+                "Futures OHLCV source is not verified. "
+                "Spot candles are prohibited for Futures analysis."
+            )
 
-def validate_market_data(
-    candles: Candles,
-    timeframe: str
-) -> None:
+        url = os.getenv(
+            "FUTURES_KLINE_URL",
+            "",
+        ).strip()
 
-    if timeframe not in TIMEFRAMES:
-        raise ScanError("Unsupported timeframe: " + timeframe)
+        # No guessed endpoint or automatic Spot fallback.
+        if not url:
+            raise DataSourceError(
+                "Futures kline URL is missing"
+            )
 
-    if len(candles) < MIN_CANDLES:
-        raise ScanError("Not enough candles")
+        raise DataSourceError(
+            "Futures adapter requires a verified LBank "
+            "request format and response mapping. "
+            "No unverified endpoint will be called."
+        )
+
+    # Explicit SPOT mode only.
+    typ, sec = TF_MAP[tf]
 
     now = int(time.time())
-    interval = TIMEFRAMES[timeframe]
+    start = now - size * sec
 
-    last_closed = candles.timestamp[-1]
+    data = http_json(
+        LBANK_BASE + "/v2/kline.do",
+        {
+            "symbol": symbol.lower(),
+            "size": size,
+            "type": typ,
+            "time": start,
+        },
+    )
 
-    if last_closed + interval > now:
-        raise ScanError("Latest candle is incomplete")
-
-    age = now - (last_closed + interval)
-
-    if age > interval * 3:
+    if (
+        not isinstance(data, dict)
+        or str(data.get("result", "")).lower() != "true"
+    ):
         raise ScanError(
-            "Candle data is stale: %d seconds" % age
+            "Invalid Spot kline response for %s [%s]"
+            % (symbol, tf)
         )
-# =========================================================
-# PART 2 - INDICATORS AND MARKET STRUCTURE
-# =========================================================
+
+    return _parse_kline_rows(
+        data.get("data"),
+        tf,
+    )
+
+
+# --------------------------------------------------------------------------
+# FETCH PRICE
+# --------------------------------------------------------------------------
+
+def fetch_price(symbol: str) -> Optional[float]:
+
+    symbol = _validate_symbol(symbol)
+
+    if MARKET_TYPE == "FUTURES":
+        raise DataSourceError(
+            "Futures price adapter is not verified"
+        )
+
+    try:
+
+        data = http_json(
+            LBANK_BASE + "/v2/ticker/24hr.do",
+            {"symbol": symbol.lower()},
+        )
+
+        items = (
+            data.get("data")
+            if isinstance(data, dict)
+            else None
+        )
+
+        if not isinstance(items, list) or not items:
+            return None
+
+        ticker = items[0].get("ticker", {})
+
+        price = float(ticker.get("latest"))
+
+        if math.isfinite(price) and price > 0:
+            return price
+
+    except (
+        ScanError,
+        TypeError,
+        ValueError,
+        KeyError,
+    ):
+        log.warning(
+            "Unable to fetch Spot price for %s",
+            symbol,
+        )
+
+    return None
+
+
+# --------------------------------------------------------------------------
+# FETCH SPOT PAIRS
+# --------------------------------------------------------------------------
+
+def fetch_pairs() -> Optional[set]:
+
+    if MARKET_TYPE != "SPOT":
+        return None
+
+    try:
+
+        data = http_json(
+            LBANK_BASE + "/v2/currencyPairs.do"
+        )
+
+    except ScanError:
+        return None
+
+    items = (
+        data.get("data")
+        if isinstance(data, dict)
+        else None
+    )
+
+    if not isinstance(items, list):
+        return None
+
+    pairs = {
+        str(x).lower()
+        for x in items
+        if isinstance(x, str)
+    }
+
+    return pairs if pairs else None
+
+# --------------------------------------------------------------------------
+# PART 3/5: INDICATORS, MARKET STRUCTURE & TRADE VALIDATOR
+# --------------------------------------------------------------------------
 
 def ema(values: List[float], period: int) -> List[float]:
-    if not values:
+    if not values or period <= 0:
         return []
 
-    alpha = 2.0 / (period + 1)
-    result = [values[0]]
+    alpha = 2.0 / (period + 1.0)
+    result = [float(values[0])]
 
     for value in values[1:]:
         result.append(
@@ -285,9 +614,9 @@ def ema(values: List[float], period: int) -> List[float]:
     return result
 
 
-def rsi(values: List[float], period: int = 14) -> List[float]:
-    if len(values) < period + 1:
-        return [50.0] * len(values)
+def rsi(values: List[float], period: int = 14) -> float:
+    if len(values) <= period:
+        return 50.0
 
     gains = []
     losses = []
@@ -300,16 +629,6 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    result = [50.0] * period
-
-    def calculate(gain, loss):
-        if loss == 0:
-            return 100.0 if gain > 0 else 50.0
-        rs = gain / loss
-        return 100.0 - (100.0 / (1.0 + rs))
-
-    result.append(calculate(avg_gain, avg_loss))
-
     for i in range(period, len(gains)):
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
@@ -319,392 +638,549 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
             avg_loss * (period - 1) + losses[i]
         ) / period
 
-        result.append(calculate(avg_gain, avg_loss))
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
 
-    return result
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def macd(
-    values: List[float]
-) -> Tuple[List[float], List[float], List[float]]:
+    values: List[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> Dict[str, float]:
 
-    fast = ema(values, 12)
-    slow = ema(values, 26)
+    if len(values) < slow + signal:
+        return {
+            "macd": 0.0,
+            "signal": 0.0,
+            "histogram": 0.0,
+        }
+
+    fast_line = ema(values, fast)
+    slow_line = ema(values, slow)
 
     line = [
-        fast[i] - slow[i]
-        for i in range(len(values))
+        a - b
+        for a, b in zip(fast_line, slow_line)
     ]
 
-    signal = ema(line, 9)
+    signal_line = ema(line, signal)
 
-    histogram = [
-        line[i] - signal[i]
-        for i in range(len(line))
-    ]
-
-    return line, signal, histogram
+    return {
+        "macd": line[-1],
+        "signal": signal_line[-1],
+        "histogram": line[-1] - signal_line[-1],
+    }
 
 
 def atr(
-    high: List[float],
-    low: List[float],
-    close: List[float],
-    period: int = 14
+    h: List[float],
+    l: List[float],
+    c: List[float],
+    n: int = 14,
 ) -> List[float]:
 
-    if not close:
-        return []
+    if len(c) < n or len(h) != len(c) or len(l) != len(c):
+        raise ScanError("Insufficient data for ATR")
 
-    tr = [high[0] - low[0]]
+    trs = [h[0] - l[0]]
 
-    for i in range(1, len(close)):
-        tr.append(max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1])
-        ))
+    for i in range(1, len(c)):
+        trs.append(
+            max(
+                h[i] - l[i],
+                abs(h[i] - c[i - 1]),
+                abs(l[i] - c[i - 1]),
+            )
+        )
 
-    result = []
-    current = sum(tr[:period]) / min(period, len(tr))
+    out = []
+    current = sum(trs[:n]) / n
 
-    for i, value in enumerate(tr):
-        if i < period:
-            current = sum(tr[:i + 1]) / (i + 1)
-        elif i == period:
-            current = sum(tr[:period + 1]) / (period + 1)
+    for i, tr in enumerate(trs):
+        if i < n - 1:
+            out.append(sum(trs[:i + 1]) / (i + 1))
+        elif i == n - 1:
+            out.append(current)
         else:
             current = (
-                current * (period - 1) + value
-            ) / period
+                current * (n - 1) + tr
+            ) / n
 
-        result.append(current)
+            out.append(current)
 
-    return result
+    return out
 
 
-def volume_ratio(
-    volume: List[float],
-    recent_period: int = 3,
-    baseline_period: int = 20
-) -> float:
-
-    required = recent_period + baseline_period
-
-    if len(volume) < required:
+def volume_ratio(v: List[float]) -> float:
+    if len(v) < 24:
         return 1.0
 
-    recent = sum(volume[-recent_period:]) / recent_period
+    recent = sum(v[-3:]) / 3.0
+    base = sum(v[-23:-3]) / 20.0
 
-    baseline_values = volume[
-        -(required):-recent_period
-    ]
-
-    baseline = sum(baseline_values) / len(baseline_values)
-
-    if baseline <= 0:
+    if base <= 0:
         return 1.0
 
-    return recent / baseline
+    return recent / base
 
+
+# --------------------------------------------------------------------------
+# MARKET STRUCTURE
+# --------------------------------------------------------------------------
 
 def find_swings(
-    high: List[float],
-    low: List[float],
-    strength: int = 3
-) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    h: List[float],
+    l: List[float],
+    n: int = 3,
+) -> Tuple[
+    List[Tuple[int, float]],
+    List[Tuple[int, float]],
+]:
 
-    swing_highs = []
-    swing_lows = []
+    highs = []
+    lows = []
 
-    for i in range(strength, len(high) - strength):
+    for i in range(n, len(h) - n):
 
-        if all(
-            high[i] > high[i - k]
-            for k in range(1, strength + 1)
-        ) and all(
-            high[i] >= high[i + k]
-            for k in range(1, strength + 1)
+        if (
+            all(h[i] > h[i - k] for k in range(1, n + 1))
+            and
+            all(h[i] >= h[i + k] for k in range(1, n + 1))
         ):
-            swing_highs.append((i, high[i]))
+            highs.append((i, h[i]))
 
-        if all(
-            low[i] < low[i - k]
-            for k in range(1, strength + 1)
-        ) and all(
-            low[i] <= low[i + k]
-            for k in range(1, strength + 1)
+        if (
+            all(l[i] < l[i - k] for k in range(1, n + 1))
+            and
+            all(l[i] <= l[i + k] for k in range(1, n + 1))
         ):
-            swing_lows.append((i, low[i]))
+            lows.append((i, l[i]))
 
-    return swing_highs, swing_lows
+    return highs, lows
 
 
-def structure_direction(
+def structure_dir(
     highs: List[Tuple[int, float]],
-    lows: List[Tuple[int, float]]
+    lows: List[Tuple[int, float]],
 ) -> int:
 
     if len(highs) < 2 or len(lows) < 2:
         return 0
 
-    higher_high = highs[-1][1] > highs[-2][1]
-    higher_low = lows[-1][1] > lows[-2][1]
+    hh = highs[-1][1] > highs[-2][1]
+    hl = lows[-1][1] > lows[-2][1]
 
-    lower_high = highs[-1][1] < highs[-2][1]
-    lower_low = lows[-1][1] < lows[-2][1]
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1] < lows[-2][1]
 
-    if higher_high and higher_low:
+    if hh and hl:
         return 1
 
-    if lower_high and lower_low:
+    if lh and ll:
         return -1
 
     return 0
 
 
-def detect_trend(
-    candles: Candles,
+def structure_trend(
+    c: List[float],
     highs: List[Tuple[int, float]],
-    lows: List[Tuple[int, float]]
+    lows: List[Tuple[int, float]],
 ) -> str:
 
-    if len(candles) < 50:
+    if not c or not highs or not lows:
         return "RANGE"
 
-    closes = candles.close
-    e20 = ema(closes, 20)[-1]
-    e50 = ema(closes, 50)[-1]
+    st = structure_dir(highs, lows)
+    last = c[-1]
 
-    direction = structure_direction(highs, lows)
-    price = closes[-1]
+    if st == 1:
+        return "RANGE" if last < lows[-1][1] else "UP"
 
-    if (
-        direction == 1
-        and price > e20
-        and e20 > e50
-    ):
+    if st == -1:
+        return "RANGE" if last > highs[-1][1] else "DOWN"
+
+    if last > highs[-1][1]:
         return "UP"
 
-    if (
-        direction == -1
-        and price < e20
-        and e20 < e50
-    ):
+    if last < lows[-1][1]:
         return "DOWN"
 
     return "RANGE"
 
 
-def build_timeframe_analysis(
-    candles: Candles,
-    timeframe: str
+def build_tf(
+    cs: Candles,
+    name: str,
 ) -> Dict[str, Any]:
 
-    closes = candles.close
+    c, h, l = cs.c, cs.h, cs.l
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    ema200 = ema(closes, 200)
+    at = atr(h, l, c)
 
-    rsi_values = rsi(closes)
-    macd_line, macd_signal, macd_hist = macd(closes)
-
-    atr_values = atr(
-        candles.high,
-        candles.low,
-        closes
+    highs, lows = find_swings(
+        h,
+        l,
+        2 if name == "4h" else 3,
     )
 
-    swing_highs, swing_lows = find_swings(
-        candles.high,
-        candles.low,
-        strength=2 if timeframe == "4h" else 3
+    st = structure_dir(highs, lows)
+
+    recent_atr = at[-100:]
+
+    atr_rank = (
+        sum(1 for x in recent_atr if x <= at[-1])
+        / float(len(recent_atr))
     )
 
-    trend = detect_trend(
-        candles,
-        swing_highs,
-        swing_lows
-    )
+    trend = structure_trend(c, highs, lows)
+
+    ema20 = ema(c, 20)
+    ema50 = ema(c, 50)
+    ema200 = ema(c, 200)
+
+    m = macd(c)
 
     return {
-        "timeframe": timeframe,
-        "candles": candles,
-        "price": closes[-1],
+        "name": name,
+        "cs": cs,
+        "close": c[-1],
+        "atr": max(at[-1], c[-1] * 1e-6),
+        "vol_ratio": volume_ratio(cs.v),
+        "highs": highs,
+        "lows": lows,
+        "struct": st,
         "trend": trend,
+        "atr_rank": atr_rank,
+        "atr_list": at,
         "ema20": ema20[-1],
         "ema50": ema50[-1],
         "ema200": ema200[-1],
-        "rsi": rsi_values[-1],
-        "macd": macd_line[-1],
-        "macd_signal": macd_signal[-1],
-        "macd_hist": macd_hist[-1],
-        "atr": atr_values[-1],
-        "volume_ratio": volume_ratio(candles.volume),
-        "swing_highs": swing_highs,
-        "swing_lows": swing_lows,
-        "structure": structure_direction(
-            swing_highs,
-            swing_lows
-        )
+        "rsi": rsi(c),
+        "macd": m,
     }
 
 
-def liquidity_levels(
-    analysis: Dict[str, Any],
-    price: float
-) -> Dict[str, Optional[float]]:
+# --------------------------------------------------------------------------
+# SUPPORT & RESISTANCE
+# --------------------------------------------------------------------------
+
+def liquidity_map(
+    d: Dict[str, Any],
+    price: float,
+) -> Dict[str, Any]:
 
     highs = [
-        value for _, value in analysis["swing_highs"]
-        if value > price
+        p[1] for p in d["highs"]
+        if p[1] > price
     ]
 
     lows = [
-        value for _, value in analysis["swing_lows"]
-        if value < price
+        p[1] for p in d["lows"]
+        if p[1] < price
     ]
 
-    return {
-        "buy_side_liquidity": min(highs) if highs else None,
-        "sell_side_liquidity": max(lows) if lows else None
-    }
-
-
-def detect_market_regime(
-    analysis: Dict[str, Any]
-) -> str:
-
-    trends = [
-        analysis[tf]["trend"]
-        for tf in ("4h", "1h", "15m")
-    ]
-
-    if trends.count("UP") >= 2:
-        return "UPTREND"
-
-    if trends.count("DOWN") >= 2:
-        return "DOWNTREND"
-
-    return "RANGE_OR_TRANSITION"
-    if stop_pct > max_stop_pct:
-        errors.append("STOP_TOO_WIDE")
-
-    if rr_1 < min_rr:
-        errors.append("TARGET_1_RR_TOO_LOW")
+    resistance = min(highs) if highs else None
+    support = max(lows) if lows else None
 
     return {
-        "valid": len(errors) == 0,
-        "errors": errors,
-        "rr_1": round(rr_1, 3),
-        "rr_2": round(rr_2, 3),
-        "stop_percent": round(stop_pct, 3),
-        "risk_distance": round(risk, 10),
-    }
-
-
-def calculate_position_size(
-    account_balance: float,
-    entry: float,
-    stop_loss: float,
-    risk_pct: float = RISK_PCT,
-    max_leverage: float = MAX_LEVERAGE,
-) -> dict:
-    """
-    محاسبه اندازه پوزیشن بر اساس درصد ریسک حساب.
-    خروجی صرفاً محاسباتی است و سفارش ثبت نمی‌کند.
-    """
-
-    balance = to_float(account_balance)
-    entry = to_float(entry)
-    stop = to_float(stop_loss)
-    risk_pct = to_float(risk_pct)
-    max_leverage = to_float(max_leverage)
-
-    if balance <= 0 or entry <= 0 or stop <= 0:
-        raise ValueError("Invalid balance or prices")
-
-    if not 0 < risk_pct <= 2:
-        raise ValueError("Risk percentage must be between 0 and 2")
-
-    if not 0 < max_leverage <= 5:
-        raise ValueError("Leverage must be between 0 and 5")
-
-    distance = abs(entry - stop)
-
-    if distance <= 0:
-        raise ValueError("Entry and stop cannot be equal")
-
-    risk_amount = balance * (risk_pct / 100)
-
-    quantity = risk_amount / distance
-    notional = quantity * entry
-
-    max_notional = balance * max_leverage
-
-    if notional > max_notional:
-        quantity = max_notional / entry
-        notional = max_notional
-
-        actual_risk = quantity * distance
-    else:
-        actual_risk = risk_amount
-
-    return {
-        "quantity": quantity,
-        "notional": notional,
-        "risk_amount": actual_risk,
-        "risk_percent": (actual_risk / balance) * 100,
-        "max_leverage": max_leverage,
-    }
-
-
-def market_structure_summary(
-    candles: Candles,
-    analysis: dict,
-) -> dict:
-    """خلاصه ساختار قیمت برای گزارش و بررسی سناریوها."""
-
-    if len(candles) < MIN_CANDLES:
-        raise ValueError("Insufficient candles")
-
-    price = to_float(candles.close[-1])
-    trend = str(analysis.get("trend", "UNKNOWN")).upper()
-
-    levels = support_resistance(candles)
-
-    support = nearest_level(
-        levels["support"],
-        price,
-    )
-
-    resistance = nearest_level(
-        levels["resistance"],
-        price,
-    )
-
-    return {
-        "price": price,
-        "trend": trend,
         "support": support,
         "resistance": resistance,
-        "all_supports": levels["support"],
-        "all_resistances": levels["resistance"],
     }
 
 
-# ============================================================
-# END OF PART 3/5
-# ============================================================
-# ============================================================
-# PART 4/5 — LONG/SHORT SCENARIO ENGINE & SCORING
-# ============================================================
+# --------------------------------------------------------------------------
+# STRICT TRADE PLAN VALIDATOR
+# --------------------------------------------------------------------------
 
-def calculate_rsi_value(values: list, period: int = 14) -> float:
-    """محاسبه RSI بدون وابستگی به کتابخانه خارجی."""
+def validate_and_correct_trade_plan(
+    direction: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    recovery_lvl: Optional[float],
+    swings_h: List[Tuple[int, float]],
+    swings_l: List[Tuple[int, float]],
+) -> Dict[str, Any]:
 
-    if len(values) < period + 1:
+    errors = []
+
+    values = (entry, sl, tp1, tp2)
+
+    if not all(
+        math.isfinite(x) and x > 0
+        for x in values
+    ):
+        return {
+            "Entry": entry,
+            "SL": sl,
+            "TP1": tp1,
+            "TP2": tp2,
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": [
+                "قیمت‌های طرح معامله نامعتبر هستند"
+            ],
+        }
+
+    if direction not in ("LONG", "SHORT"):
+        errors.append("جهت معامله نامعتبر است")
+
+    if recovery_lvl is not None:
+        if not math.isfinite(recovery_lvl) or recovery_lvl <= 0:
+            errors.append("سطح بازیابی نامعتبر است")
+        elif direction == "LONG" and entry < recovery_lvl:
+            entry = recovery_lvl
+        elif direction == "SHORT" and entry > recovery_lvl:
+            entry = recovery_lvl
+
+    if direction == "LONG":
+
+        if sl >= entry:
+            errors.append("حد ضرر LONG باید پایین‌تر از ورود باشد")
+
+        if tp1 <= entry or tp2 <= entry:
+            errors.append("تارگت LONG باید بالاتر از ورود باشد")
+
+        if tp2 < tp1:
+            errors.append("ترتیب TP1 و TP2 در LONG اشتباه است")
+
+    elif direction == "SHORT":
+
+        if sl <= entry:
+            errors.append("حد ضرر SHORT باید بالاتر از ورود باشد")
+
+        if tp1 >= entry or tp2 >= entry:
+            errors.append("تارگت SHORT باید پایین‌تر از ورود باشد")
+
+        if tp2 > tp1:
+            errors.append("ترتیب TP1 و TP2 در SHORT اشتباه است")
+
+    if errors:
+        return {
+            "Entry": round(entry, 8),
+            "SL": round(sl, 8),
+            "TP1": round(tp1, 8),
+            "TP2": round(tp2, 8),
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": errors,
+        }
+
+    risk = abs(entry - sl)
+
+    if risk <= 0:
+        errors.append("ریسک معامله صفر است")
+
+    if errors:
+        return {
+            "Entry": round(entry, 8),
+            "SL": round(sl, 8),
+            "TP1": round(tp1, 8),
+            "TP2": round(tp2, 8),
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": errors,
+        }
+
+    risk_pct = risk / entry * 100.0
+
+    if risk_pct > MAX_STOP_PCT:
+        errors.append(
+            "حد ضرر بیش از %.2f%% است (%.2f%%)"
+            % (MAX_STOP_PCT, risk_pct)
+        )
+
+    reward1 = abs(tp1 - entry)
+    reward2 = abs(tp2 - entry)
+
+    rr1 = round(reward1 / risk, 2)
+    rr2 = round(reward2 / risk, 2)
+
+    if rr1 <= 0:
+        errors.append("نسبت ریسک به بازده TP1 نامعتبر است")
+
+    if rr2 < MIN_RR:
+        errors.append(
+            "نسبت ریسک به بازده TP2 کمتر از %.2f است"
+            % MIN_RR
+        )
+
+    valid = not errors
+
+    return {
+        "Entry": round(entry, 8),
+        "SL": round(sl, 8),
+        "TP1": round(tp1, 8),
+        "TP2": round(tp2, 8),
+        "Net_RR1": rr1,
+        "Net_RR2": rr2,
+        "Risk_Pct": round(risk_pct, 4),
+        "Valid": valid,
+        "Validator_Errors": errors,
+    }
+
+
+# --------------------------------------------------------------------------
+# STRUCTURAL ENTRY, SL & TARGETS
+# --------------------------------------------------------------------------
+
+def calculate_levels_and_targets(
+    cs: Candles,
+    direction: str = "LONG",
+    entry_price: float = 0,
+    swings_h=None,
+    swings_l=None,
+) -> Dict[str, Any]:
+
+    if entry_price <= 0:
+        raise ScanError("Invalid entry price")
+
+    if swings_h is None or swings_l is None:
+        swings_h, swings_l = find_swings(
+            cs.h,
+            cs.l,
+            n=3,
+        )
+
+    lookback = 60
+
+    highs_raw = cs.h[-lookback:]
+    lows_raw = cs.l[-lookback:]
+
+    structural_highs = [
+        p[1] for p in swings_h
+        if p[1] > entry_price
+    ]
+
+    structural_lows = [
+        p[1] for p in swings_l
+        if p[1] < entry_price
+    ]
+
+    structural_low = (
+        min(lows_raw) if lows_raw
+        else entry_price * 0.99
+    )
+
+    structural_high = (
+        max(highs_raw) if highs_raw
+        else entry_price * 1.01
+    )
+
+    if direction == "LONG":
+
+        valid_lows = [
+            p[1] for p in swings_l
+            if p[1] < entry_price
+        ]
+
+        sl_base = (
+            max(valid_lows)
+            if valid_lows
+            else structural_low
+        )
+
+        sl = sl_base * 0.995
+
+        risk = entry_price - sl
+
+        if risk <= 0:
+            raise ScanError("Invalid LONG structural stop")
+
+        tp1 = (
+            min(structural_highs)
+            if structural_highs
+            else entry_price + risk * 1.5
+        )
+
+        tp2 = (
+            max(structural_highs)
+            if structural_highs
+            else entry_price + risk * 2.5
+        )
+
+        if tp2 <= tp1:
+            tp2 = entry_price + risk * 2.5
+
+    elif direction == "SHORT":
+
+        valid_highs = [
+            p[1] for p in swings_h
+            if p[1] > entry_price
+        ]
+
+        sl_base = (
+            min(valid_highs)
+            if valid_highs
+            else structural_high
+        )
+
+        sl = sl_base * 1.005
+
+        risk = sl - entry_price
+
+        if risk <= 0:
+            raise ScanError("Invalid SHORT structural stop")
+
+        tp1 = (
+            max(structural_lows)
+            if structural_lows
+            else entry_price - risk * 1.5
+        )
+
+        tp2 = (
+            min(structural_lows)
+            if structural_lows
+            else entry_price - risk * 2.5
+        )
+
+        if tp2 >= tp1:
+            tp2 = entry_price - risk * 2.5
+
+    else:
+        raise ScanError("Unknown trade direction")
+
+    return validate_and_correct_trade_plan(
+        direction,
+        entry_price,
+        sl,
+        tp1,
+        tp2,
+        None,
+        swings_h,
+        swings_l,
+    )
+
+# --------------------------------------------------------------------------
+# PART 3/5: INDICATORS, MARKET STRUCTURE & TRADE VALIDATOR
+# --------------------------------------------------------------------------
+
+def ema(values: List[float], period: int) -> List[float]:
+    if not values or period <= 0:
+        return []
+
+    alpha = 2.0 / (period + 1.0)
+    result = [float(values[0])]
+
+    for value in values[1:]:
+        result.append(
+            alpha * value + (1.0 - alpha) * result[-1]
+        )
+
+    return result
+
+
+def rsi(values: List[float], period: int = 14) -> float:
+    if len(values) <= period:
         return 50.0
 
     gains = []
@@ -715,8 +1191,17 @@ def calculate_rsi_value(values: list, period: int = 14) -> float:
         gains.append(max(change, 0.0))
         losses.append(max(-change, 0.0))
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
+        ) / period
 
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
@@ -725,736 +1210,937 @@ def calculate_rsi_value(values: list, period: int = 14) -> float:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-def calculate_ema_value(values: list, period: int) -> float:
-    """محاسبه مقدار آخر EMA."""
+def macd(
+    values: List[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> Dict[str, float]:
 
-    if not values or period <= 0:
-        return 0.0
-
-    multiplier = 2.0 / (period + 1.0)
-    result = float(values[0])
-
-    for value in values[1:]:
-        result = (
-            float(value) * multiplier
-            + result * (1.0 - multiplier)
-        )
-
-    return result
-
-
-def calculate_macd_values(values: list) -> dict:
-    """محاسبه MACD و خط سیگنال."""
-
-    if len(values) < 35:
+    if len(values) < slow + signal:
         return {
             "macd": 0.0,
             "signal": 0.0,
             "histogram": 0.0,
         }
 
-    fast_values = []
-    slow_values = []
+    fast_line = ema(values, fast)
+    slow_line = ema(values, slow)
 
-    fast = float(values[0])
-    slow = float(values[0])
-
-    fast_multiplier = 2.0 / 13.0
-    slow_multiplier = 2.0 / 27.0
-
-    for value in values:
-        value = float(value)
-
-        fast = (
-            value * fast_multiplier
-            + fast * (1.0 - fast_multiplier)
-        )
-
-        slow = (
-            value * slow_multiplier
-            + slow * (1.0 - slow_multiplier)
-        )
-
-        fast_values.append(fast)
-        slow_values.append(slow)
-
-    macd_line = [
-        f - s
-        for f, s in zip(fast_values, slow_values)
+    line = [
+        a - b
+        for a, b in zip(fast_line, slow_line)
     ]
 
-    signal_line = calculate_ema_series(
-        macd_line,
-        9,
-    )
-
-    macd_now = macd_line[-1]
-    signal_now = signal_line[-1]
+    signal_line = ema(line, signal)
 
     return {
-        "macd": macd_now,
-        "signal": signal_now,
-        "histogram": macd_now - signal_now,
+        "macd": line[-1],
+        "signal": signal_line[-1],
+        "histogram": line[-1] - signal_line[-1],
     }
 
 
-def calculate_ema_series(values: list, period: int) -> list:
-    """محاسبه سری کامل EMA."""
+def atr(
+    h: List[float],
+    l: List[float],
+    c: List[float],
+    n: int = 14,
+) -> List[float]:
 
-    if not values:
-        return []
+    if len(c) < n or len(h) != len(c) or len(l) != len(c):
+        raise ScanError("Insufficient data for ATR")
 
-    multiplier = 2.0 / (period + 1.0)
-    result = [float(values[0])]
+    trs = [h[0] - l[0]]
 
-    for value in values[1:]:
-        result.append(
-            float(value) * multiplier
-            + result[-1] * (1.0 - multiplier)
+    for i in range(1, len(c)):
+        trs.append(
+            max(
+                h[i] - l[i],
+                abs(h[i] - c[i - 1]),
+                abs(l[i] - c[i - 1]),
+            )
         )
 
-    return result
+    out = []
+    current = sum(trs[:n]) / n
+
+    for i, tr in enumerate(trs):
+        if i < n - 1:
+            out.append(sum(trs[:i + 1]) / (i + 1))
+        elif i == n - 1:
+            out.append(current)
+        else:
+            current = (
+                current * (n - 1) + tr
+            ) / n
+
+            out.append(current)
+
+    return out
 
 
-def candle_volume_confirmation(candles: Candles) -> dict:
-    """بررسی حجم آخرین کندل نسبت به میانگین حجم."""
+def volume_ratio(v: List[float]) -> float:
+    if len(v) < 24:
+        return 1.0
 
-    if len(candles) < 21:
-        return {
-            "ratio": 0.0,
-            "confirmed": False,
-        }
+    recent = sum(v[-3:]) / 3.0
+    base = sum(v[-23:-3]) / 20.0
 
-    previous_volumes = candles.volume[-21:-1]
+    if base <= 0:
+        return 1.0
 
-    average_volume = (
-        sum(previous_volumes) / len(previous_volumes)
-        if previous_volumes
-        else 0.0
+    return recent / base
+
+
+# --------------------------------------------------------------------------
+# MARKET STRUCTURE
+# --------------------------------------------------------------------------
+
+def find_swings(
+    h: List[float],
+    l: List[float],
+    n: int = 3,
+) -> Tuple[
+    List[Tuple[int, float]],
+    List[Tuple[int, float]],
+]:
+
+    highs = []
+    lows = []
+
+    for i in range(n, len(h) - n):
+
+        if (
+            all(h[i] > h[i - k] for k in range(1, n + 1))
+            and
+            all(h[i] >= h[i + k] for k in range(1, n + 1))
+        ):
+            highs.append((i, h[i]))
+
+        if (
+            all(l[i] < l[i - k] for k in range(1, n + 1))
+            and
+            all(l[i] <= l[i + k] for k in range(1, n + 1))
+        ):
+            lows.append((i, l[i]))
+
+    return highs, lows
+
+
+def structure_dir(
+    highs: List[Tuple[int, float]],
+    lows: List[Tuple[int, float]],
+) -> int:
+
+    if len(highs) < 2 or len(lows) < 2:
+        return 0
+
+    hh = highs[-1][1] > highs[-2][1]
+    hl = lows[-1][1] > lows[-2][1]
+
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1] < lows[-2][1]
+
+    if hh and hl:
+        return 1
+
+    if lh and ll:
+        return -1
+
+    return 0
+
+
+def structure_trend(
+    c: List[float],
+    highs: List[Tuple[int, float]],
+    lows: List[Tuple[int, float]],
+) -> str:
+
+    if not c or not highs or not lows:
+        return "RANGE"
+
+    st = structure_dir(highs, lows)
+    last = c[-1]
+
+    if st == 1:
+        return "RANGE" if last < lows[-1][1] else "UP"
+
+    if st == -1:
+        return "RANGE" if last > highs[-1][1] else "DOWN"
+
+    if last > highs[-1][1]:
+        return "UP"
+
+    if last < lows[-1][1]:
+        return "DOWN"
+
+    return "RANGE"
+
+
+def build_tf(
+    cs: Candles,
+    name: str,
+) -> Dict[str, Any]:
+
+    c, h, l = cs.c, cs.h, cs.l
+
+    at = atr(h, l, c)
+
+    highs, lows = find_swings(
+        h,
+        l,
+        2 if name == "4h" else 3,
     )
 
-    current_volume = to_float(candles.volume[-1])
+    st = structure_dir(highs, lows)
 
-    ratio = (
-        current_volume / average_volume
-        if average_volume > 0
-        else 0.0
+    recent_atr = at[-100:]
+
+    atr_rank = (
+        sum(1 for x in recent_atr if x <= at[-1])
+        / float(len(recent_atr))
     )
+
+    trend = structure_trend(c, highs, lows)
+
+    ema20 = ema(c, 20)
+    ema50 = ema(c, 50)
+    ema200 = ema(c, 200)
+
+    m = macd(c)
 
     return {
-        "ratio": ratio,
-        "confirmed": ratio >= 1.2,
+        "name": name,
+        "cs": cs,
+        "close": c[-1],
+        "atr": max(at[-1], c[-1] * 1e-6),
+        "vol_ratio": volume_ratio(cs.v),
+        "highs": highs,
+        "lows": lows,
+        "struct": st,
+        "trend": trend,
+        "atr_rank": atr_rank,
+        "atr_list": at,
+        "ema20": ema20[-1],
+        "ema50": ema50[-1],
+        "ema200": ema200[-1],
+        "rsi": rsi(c),
+        "macd": m,
     }
 
 
-def evaluate_scenario(
-    side: str,
-    candles: Candles,
-    analysis: dict,
-    higher_tf_analysis: dict = None,
-) -> dict:
-    """
-    ارزیابی مستقل سناریوی LONG یا SHORT.
-    امتیاز بالا به‌تنهایی مجوز ورود نیست.
-    """
+# --------------------------------------------------------------------------
+# SUPPORT & RESISTANCE
+# --------------------------------------------------------------------------
 
-    side = str(side).upper()
+def liquidity_map(
+    d: Dict[str, Any],
+    price: float,
+) -> Dict[str, Any]:
 
-    if side not in ("LONG", "SHORT"):
-        raise ValueError("Side must be LONG or SHORT")
+    highs = [
+        p[1] for p in d["highs"]
+        if p[1] > price
+    ]
 
-    if len(candles) < MIN_CANDLES:
+    lows = [
+        p[1] for p in d["lows"]
+        if p[1] < price
+    ]
+
+    resistance = min(highs) if highs else None
+    support = max(lows) if lows else None
+
+    return {
+        "support": support,
+        "resistance": resistance,
+    }
+
+
+# --------------------------------------------------------------------------
+# STRICT TRADE PLAN VALIDATOR
+# --------------------------------------------------------------------------
+
+def validate_and_correct_trade_plan(
+    direction: str,
+    entry: float,
+    sl: float,
+    tp1: float,
+    tp2: float,
+    recovery_lvl: Optional[float],
+    swings_h: List[Tuple[int, float]],
+    swings_l: List[Tuple[int, float]],
+) -> Dict[str, Any]:
+
+    errors = []
+
+    values = (entry, sl, tp1, tp2)
+
+    if not all(
+        math.isfinite(x) and x > 0
+        for x in values
+    ):
         return {
-            "side": side,
-            "score": 0,
-            "eligible": False,
-            "reasons": ["INSUFFICIENT_CANDLES"],
+            "Entry": entry,
+            "SL": sl,
+            "TP1": tp1,
+            "TP2": tp2,
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": [
+                "قیمت‌های طرح معامله نامعتبر هستند"
+            ],
         }
 
-    closes = candles.close
-    highs = candles.high
-    lows = candles.low
+    if direction not in ("LONG", "SHORT"):
+        errors.append("جهت معامله نامعتبر است")
 
-    price = to_float(closes[-1])
+    if recovery_lvl is not None:
+        if not math.isfinite(recovery_lvl) or recovery_lvl <= 0:
+            errors.append("سطح بازیابی نامعتبر است")
+        elif direction == "LONG" and entry < recovery_lvl:
+            entry = recovery_lvl
+        elif direction == "SHORT" and entry > recovery_lvl:
+            entry = recovery_lvl
 
-    ema20 = calculate_ema_value(closes, 20)
-    ema50 = calculate_ema_value(closes, 50)
-    ema200 = calculate_ema_value(closes, 200)
+    if direction == "LONG":
 
-    rsi_value = calculate_rsi_value(closes, 14)
-    macd_data = calculate_macd_values(closes)
-    volume_data = candle_volume_confirmation(candles)
+        if sl >= entry:
+            errors.append("حد ضرر LONG باید پایین‌تر از ورود باشد")
 
-    atr_value = to_float(analysis.get("atr"))
+        if tp1 <= entry or tp2 <= entry:
+            errors.append("تارگت LONG باید بالاتر از ورود باشد")
 
-    if atr_value <= 0:
+        if tp2 < tp1:
+            errors.append("ترتیب TP1 و TP2 در LONG اشتباه است")
+
+    elif direction == "SHORT":
+
+        if sl <= entry:
+            errors.append("حد ضرر SHORT باید بالاتر از ورود باشد")
+
+        if tp1 >= entry or tp2 >= entry:
+            errors.append("تارگت SHORT باید پایین‌تر از ورود باشد")
+
+        if tp2 > tp1:
+            errors.append("ترتیب TP1 و TP2 در SHORT اشتباه است")
+
+    if errors:
         return {
-            "side": side,
-            "score": 0,
-            "eligible": False,
-            "reasons": ["ATR_UNAVAILABLE"],
+            "Entry": round(entry, 8),
+            "SL": round(sl, 8),
+            "TP1": round(tp1, 8),
+            "TP2": round(tp2, 8),
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": errors,
         }
 
-    swings = find_swings(
-        highs,
-        lows,
-        strength=3,
+    risk = abs(entry - sl)
+
+    if risk <= 0:
+        errors.append("ریسک معامله صفر است")
+
+    if errors:
+        return {
+            "Entry": round(entry, 8),
+            "SL": round(sl, 8),
+            "TP1": round(tp1, 8),
+            "TP2": round(tp2, 8),
+            "Net_RR1": 0.0,
+            "Net_RR2": 0.0,
+            "Valid": False,
+            "Validator_Errors": errors,
+        }
+
+    risk_pct = risk / entry * 100.0
+
+    if risk_pct > MAX_STOP_PCT:
+        errors.append(
+            "حد ضرر بیش از %.2f%% است (%.2f%%)"
+            % (MAX_STOP_PCT, risk_pct)
+        )
+
+    reward1 = abs(tp1 - entry)
+    reward2 = abs(tp2 - entry)
+
+    rr1 = round(reward1 / risk, 2)
+    rr2 = round(reward2 / risk, 2)
+
+    if rr1 <= 0:
+        errors.append("نسبت ریسک به بازده TP1 نامعتبر است")
+
+    if rr2 < MIN_RR:
+        errors.append(
+            "نسبت ریسک به بازده TP2 کمتر از %.2f است"
+            % MIN_RR
+        )
+
+    valid = not errors
+
+    return {
+        "Entry": round(entry, 8),
+        "SL": round(sl, 8),
+        "TP1": round(tp1, 8),
+        "TP2": round(tp2, 8),
+        "Net_RR1": rr1,
+        "Net_RR2": rr2,
+        "Risk_Pct": round(risk_pct, 4),
+        "Valid": valid,
+        "Validator_Errors": errors,
+    }
+
+
+# --------------------------------------------------------------------------
+# STRUCTURAL ENTRY, SL & TARGETS
+# --------------------------------------------------------------------------
+
+def calculate_levels_and_targets(
+    cs: Candles,
+    direction: str = "LONG",
+    entry_price: float = 0,
+    swings_h=None,
+    swings_l=None,
+) -> Dict[str, Any]:
+
+    if entry_price <= 0:
+        raise ScanError("Invalid entry price")
+
+    if swings_h is None or swings_l is None:
+        swings_h, swings_l = find_swings(
+            cs.h,
+            cs.l,
+            n=3,
+        )
+
+    lookback = 60
+
+    highs_raw = cs.h[-lookback:]
+    lows_raw = cs.l[-lookback:]
+
+    structural_highs = [
+        p[1] for p in swings_h
+        if p[1] > entry_price
+    ]
+
+    structural_lows = [
+        p[1] for p in swings_l
+        if p[1] < entry_price
+    ]
+
+    structural_low = (
+        min(lows_raw) if lows_raw
+        else entry_price * 0.99
     )
 
-    swing_highs = swings.get("highs", [])
-    swing_lows = swings.get("lows", [])
+    structural_high = (
+        max(highs_raw) if highs_raw
+        else entry_price * 1.01
+    )
 
-    recent_highs = [
-        highs[i]
-        for i in swing_highs
-        if i < len(highs) - 3
-    ][-2:]
+    if direction == "LONG":
 
-    recent_lows = [
-        lows[i]
-        for i in swing_lows
-        if i < len(lows) - 3
-    ][-2:]
+        valid_lows = [
+            p[1] for p in swings_l
+            if p[1] < entry_price
+        ]
 
-    score = 0
-    reasons = []
-    blockers = []
+        sl_base = (
+            max(valid_lows)
+            if valid_lows
+            else structural_low
+        )
 
-    # --------------------------------------------------------
-    # 1. EMA trend
-    # --------------------------------------------------------
+        sl = sl_base * 0.995
 
-    if side == "LONG":
-        if price > ema20 > ema50:
-            score += 15
-            reasons.append("PRICE_ABOVE_EMA20_EMA50")
+        risk = entry_price - sl
 
-        if ema50 > ema200:
-            score += 10
-            reasons.append("EMA50_ABOVE_EMA200")
+        if risk <= 0:
+            raise ScanError("Invalid LONG structural stop")
 
-        if price < ema20:
-            blockers.append("PRICE_BELOW_EMA20")
+        tp1 = (
+            min(structural_highs)
+            if structural_highs
+            else entry_price + risk * 1.5
+        )
 
-    else:
-        if price < ema20 < ema50:
-            score += 15
-            reasons.append("PRICE_BELOW_EMA20_EMA50")
+        tp2 = (
+            max(structural_highs)
+            if structural_highs
+            else entry_price + risk * 2.5
+        )
 
-        if ema50 < ema200:
-            score += 10
-            reasons.append("EMA50_BELOW_EMA200")
+        if tp2 <= tp1:
+            tp2 = entry_price + risk * 2.5
 
-        if price > ema20:
-            blockers.append("PRICE_ABOVE_EMA20")
+    elif direction == "SHORT":
 
-    # --------------------------------------------------------
-    # 2. RSI momentum
-    # --------------------------------------------------------
+        valid_highs = [
+            p[1] for p in swings_h
+            if p[1] > entry_price
+        ]
 
-    if side == "LONG":
-        if 50 <= rsi_value <= 68:
-            score += 10
-            reasons.append("RSI_BULLISH_RANGE")
-        elif rsi_value > 75:
-            blockers.append("RSI_OVERBOUGHT")
-        elif rsi_value < 40:
-            blockers.append("RSI_WEAK_FOR_LONG")
+        sl_base = (
+            min(valid_highs)
+            if valid_highs
+            else structural_high
+        )
 
-    else:
-        if 32 <= rsi_value <= 50:
-            score += 10
-            reasons.append("RSI_BEARISH_RANGE")
-        elif rsi_value < 25:
-            blockers.append("RSI_OVERSOLD")
-        elif rsi_value > 60:
-            blockers.append("RSI_STRONG_AGAINST_SHORT")
+        sl = sl_base * 1.005
 
-    # --------------------------------------------------------
-    # 3. MACD momentum
-    # --------------------------------------------------------
+        risk = sl - entry_price
 
-    histogram = macd_data["histogram"]
+        if risk <= 0:
+            raise ScanError("Invalid SHORT structural stop")
 
-    if side == "LONG":
-        if histogram > 0:
-            score += 10
-            reasons.append("MACD_BULLISH")
-        else:
-            blockers.append("MACD_NOT_BULLISH")
+        tp1 = (
+            max(structural_lows)
+            if structural_lows
+            else entry_price - risk * 1.5
+        )
+
+        tp2 = (
+            min(structural_lows)
+            if structural_lows
+            else entry_price - risk * 2.5
+        )
+
+        if tp2 >= tp1:
+            tp2 = entry_price - risk * 2.5
 
     else:
-        if histogram < 0:
-            score += 10
-            reasons.append("MACD_BEARISH")
-        else:
-            blockers.append("MACD_NOT_BEARISH")
+        raise ScanError("Unknown trade direction")
 
-    # --------------------------------------------------------
-    # 4. Market structure
-    # --------------------------------------------------------
+    return validate_and_correct_trade_plan(
+        direction,
+        entry_price,
+        sl,
+        tp1,
+        tp2,
+        None,
+        swings_h,
+        swings_l,
+    )
 
-    structure_confirmed = False
-
-    if side == "LONG" and len(recent_highs) >= 2 and len(recent_lows) >= 2:
-        higher_high = recent_highs[-1] > recent_highs[-2]
-        higher_low = recent_lows[-1] > recent_lows[-2]
-
-        if higher_high and higher_low:
-            score += 15
-            structure_confirmed = True
-            reasons.append("HIGHER_HIGH_HIGHER_LOW")
-
-    elif side == "SHORT" and len(recent_highs) >= 2 and len(recent_lows) >= 2:
-        lower_high = recent_highs[-1] < recent_highs[-2]
-        lower_low = recent_lows[-1] < recent_lows[-2]
-
-        if lower_high and lower_low:
-            score += 15
-            structure_confirmed = True
-            reasons.append("LOWER_HIGH_LOWER_LOW")
-
-    if not structure_confirmed:
-        blockers.append("MARKET_STRUCTURE_NOT_CONFIRMED")
-
-    # --------------------------------------------------------
-    # 5. Volume confirmation
-    # --------------------------------------------------------
-
-    if volume_data["confirmed"]:
-        score += 10
-        reasons.append("VOLUME_CONFIRMED")
-    else:
-        blockers.append("VOLUME_NOT_CONFIRMED")
-
-    # --------------------------------------------------------
-    # 6. Higher timeframe alignment
-    # --------------------------------------------------------
-
-    higher_trend = None
-
-    if higher_tf_analysis:
-        higher_trend = str(
-            higher_tf_analysis.get("trend", "UNKNOWN")
-        ).upper()
-
-        if side == "LONG":
-            if higher_trend in ("UP", "BULLISH", "UPTREND"):
-                score += 15
-                reasons.append("HIGHER_TF_BULLISH")
-            else:
-                blockers.append("HIGHER_TF_NOT_BULLISH")
-
-        else:
-            if higher_trend in ("DOWN", "BEARISH", "DOWNTREND"):
-                score += 15
-                reasons.append("HIGHER_TF_BEARISH")
-            else:
-                blockers.append("HIGHER_TF_NOT_BEARISH")
-
-    else:
-        blockers.append("HIGHER_TF_DATA_MISSING")
-
-    # --------------------------------------------------------
-    # 7. Price volatility sanity check
-    # --------------------------------------------------------
-
-    atr_percent = (atr_value / price) * 100 if price > 0 else 999
-
-    if atr_percent <= 5:
-        score += 5
-        reasons.append("VOLATILITY_ACCEPTABLE")
-    else:
-        blockers.append("VOLATILITY_TOO_HIGH")
-
-    score = min(score, 100)
-
-    eligible = (
-        score >= MIN_SCORE
-        and len(blockers) == 0
+def make_watch(symbol: str, price: float, long_result: dict, short_result: dict):
+    """
+    Build a watch-only result when neither direction qualifies for a trade.
+    """
+    best = max(
+        (long_result, short_result),
+        key=lambda x: float(x.get("score", 0) or 0),
     )
 
     return {
-        "side": side,
-        "score": score,
-        "eligible": eligible,
+        "symbol": symbol,
         "price": price,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi_value,
-        "macd": macd_data,
-        "volume_ratio": volume_data["ratio"],
-        "atr": atr_value,
-        "atr_percent": atr_percent,
-        "higher_timeframe_trend": higher_trend,
-        "structure_confirmed": structure_confirmed,
-        "reasons": reasons,
-        "blockers": blockers,
+        "signal": None,
+        "watch": {
+            "side": best.get("side"),
+            "score": best.get("score", 0),
+            "reasons": best.get("reasons", []),
+            "blockers": best.get("blockers", []),
+        },
+        "long": long_result,
+        "short": short_result,
+        "decision": "NO TRADE",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def evaluate_both_sides(
-    candles: Candles,
-    analysis: dict,
-    higher_tf_analysis: dict = None,
-) -> dict:
-    """ارزیابی جداگانه LONG و SHORT."""
+def _extract_price(raw):
+    """
+    Extract a usable price from common ticker response formats.
+    """
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        return value if math.isfinite(value) and value > 0 else None
 
-    long_result = evaluate_scenario(
-        "LONG",
-        candles,
-        analysis,
-        higher_tf_analysis,
-    )
+    if isinstance(raw, dict):
+        for key in ("last", "lastPrice", "price", "close", "ticker"):
+            value = raw.get(key)
+            if isinstance(value, (int, float, str)):
+                try:
+                    number = float(value)
+                    if math.isfinite(number) and number > 0:
+                        return number
+                except (TypeError, ValueError):
+                    pass
 
-    short_result = evaluate_scenario(
-        "SHORT",
-        candles,
-        analysis,
-        higher_tf_analysis,
-    )
+        data = raw.get("data")
+        if isinstance(data, dict):
+            return _extract_price(data)
+        if isinstance(data, list) and data:
+            return _extract_price(data[0])
+
+    if isinstance(raw, list) and raw:
+        return _extract_price(raw[0])
+
+    return None
+
+
+def analyze_symbol(symbol: str):
+    """
+    Analyze one symbol across 4h, 1h, 15m and 5m.
+    """
+    symbol = _validate_symbol(symbol)
+
+    raw_price = fetch_price(symbol)
+    price = _extract_price(raw_price)
+
+    if price is None:
+        raise DataSourceError(f"قیمت معتبر برای {symbol} دریافت نشد")
+
+    data = {}
+
+    # Fetch all required timeframes.
+    for tf, interval in TF_MAP.items():
+        candles = fetch_klines(symbol, interval, limit=300)
+        if not isinstance(candles, Candles):
+            raise DataSourceError(
+                f"داده کندل {tf} برای {symbol} معتبر نیست"
+            )
+
+        data[tf] = build_tf(candles)
+
+    # Evaluate both directions independently.
+    long_result = evaluate_side(data, "LONG", price)
+    short_result = evaluate_side(data, "SHORT", price)
+
+    qualified = []
+
+    if long_result.get("decision") == "LONG" and long_result.get("plan"):
+        qualified.append(long_result)
+
+    if short_result.get("decision") == "SHORT" and short_result.get("plan"):
+        qualified.append(short_result)
+
+    # Never issue a signal if both directions qualify simultaneously.
+    if len(qualified) != 1:
+        return make_watch(symbol, price, long_result, short_result)
+
+    signal = qualified[0]
 
     return {
-        "LONG": long_result,
-        "SHORT": short_result,
+        "symbol": symbol,
+        "price": price,
+        "signal": signal,
+        "watch": None,
+        "long": long_result,
+        "short": short_result,
+        "decision": signal["decision"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-# ============================================================
-# END OF PART 4/5
-# ============================================================
+def fmt_price(value):
+    """
+    Format prices without unnecessary trailing zeros.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "-"
 
-# ============================================================
-# PART 5/5 — REPORTING, SCANNER & SAFE MAIN
-# ============================================================
-
-def format_price(value: float) -> str:
-    """نمایش خوانای قیمت."""
-    value = to_float(value)
-
-    if value <= 0:
-        return "N/A"
+    if not math.isfinite(value):
+        return "-"
 
     if value >= 1000:
-        return f"{value:,.2f}"
-
+        return f"{value:,.2f}".rstrip("0").rstrip(".")
     if value >= 1:
-        return f"{value:.4f}"
+        return f"{value:.5f}".rstrip("0").rstrip(".")
+    if value >= 0.001:
+        return f"{value:.7f}".rstrip("0").rstrip(".")
 
-    return f"{value:.8f}"
+    return f"{value:.10f}".rstrip("0").rstrip(".")
 
 
-def build_report(
-    status: str,
-    message: str,
-    results: dict = None,
-) -> str:
-    """ساخت گزارش متنی ربات."""
+def plan_fields(plan: dict):
+    """
+    Return normalized trade-plan fields for reporting.
+    """
+    if not isinstance(plan, dict):
+        return {}
+
+    return {
+        "entry": plan.get("Entry"),
+        "sl": plan.get("SL"),
+        "tp1": plan.get("TP1"),
+        "tp2": plan.get("TP2"),
+        "rr": plan.get("Net_RR"),
+        "risk_pct": plan.get("Risk_Pct"),
+        "position_multiple": plan.get("Position_Risk_Multiple"),
+        "leverage_cap": plan.get("Leverage_Cap"),
+    }
+
+
+def build_card(result: dict):
+    """
+    Build a readable report section for one symbol.
+    """
+    symbol = html.escape(str(result.get("symbol", "UNKNOWN")))
+    price = fmt_price(result.get("price"))
+
+    signal = result.get("signal")
 
     lines = [
-        "=" * 60,
-        APP_NAME,
-        "=" * 60,
-        f"Time: {utc_now()}",
-        f"Status: {status}",
-        f"Message: {message}",
-        "",
+        f"<b>{symbol}</b>",
+        f"قیمت: <code>{price}</code>",
     ]
 
-    if results:
-        for symbol, data in results.items():
-            lines.extend([
-                "-" * 50,
-                f"Symbol: {symbol}",
-            ])
+    if not signal:
+        watch = result.get("watch") or {}
+        side = watch.get("side", "-")
+        score = watch.get("score", 0)
 
-            for side in ("LONG", "SHORT"):
-                scenario = data.get(side)
+        lines.extend([
+            "تصمیم: <b>NO TRADE</b>",
+            f"جهت تحت نظر: {side}",
+            f"امتیاز: {score}",
+        ])
 
-                if not scenario:
-                    continue
+        blockers = watch.get("blockers") or []
+        if blockers:
+            lines.append("<b>دلایل عدم ورود:</b>")
+            for item in blockers[:5]:
+                lines.append(f"• {html.escape(str(item))}")
 
-                lines.append(
-                    f"{side}: Score={scenario.get('score', 0)}"
-                )
+        return "\n".join(lines)
 
-                lines.append(
-                    f"Eligible: {scenario.get('eligible', False)}"
-                )
-
-                lines.append(
-                    f"Reasons: {', '.join(scenario.get('reasons', []))}"
-                )
-
-                lines.append(
-                    f"Blockers: {', '.join(scenario.get('blockers', []))}"
-                )
-
-                lines.append("")
+    plan = plan_fields(signal.get("plan") or {})
 
     lines.extend([
-        "=" * 60,
-        "Risk notice: High leverage can cause rapid liquidation.",
-        "This program does not place orders.",
-        "=" * 60,
+        f"سیگنال: <b>{signal.get('decision')}</b>",
+        f"امتیاز: <b>{signal.get('score')}</b>",
+        f"ورود: <code>{fmt_price(plan.get('entry'))}</code>",
+        f"حد ضرر: <code>{fmt_price(plan.get('sl'))}</code>",
+        f"تارگت ۱: <code>{fmt_price(plan.get('tp1'))}</code>",
+        f"تارگت ۲: <code>{fmt_price(plan.get('tp2'))}</code>",
+        f"RR خالص تقریبی: <b>{plan.get('rr', '-')}</b>",
+        f"ریسک تخمینی موقعیت: {plan.get('risk_pct', '-')}%",
+        f"ضریب اسمی موقعیت: {plan.get('position_multiple', '-')}",
     ])
+
+    reasons = signal.get("reasons") or []
+    if reasons:
+        lines.append("<b>دلایل سیگنال:</b>")
+        for item in reasons[:6]:
+            lines.append(f"• {html.escape(str(item))}")
 
     return "\n".join(lines)
 
 
-def save_report(report: str) -> bool:
-    """ذخیره گزارش در فایل."""
-
-    try:
-        with open(
-            REPORT_FILE,
-            "w",
-            encoding="utf-8",
-        ) as file:
-            file.write(report)
-
-        return True
-
-    except OSError as exc:
-        logging.error("Could not save report: %s", exc)
-        return False
-
-
-def print_report(report: str) -> None:
-    """نمایش گزارش در ترمینال."""
-    print(report)
-
-
-def safe_shutdown(message: str, exit_code: int = 1) -> int:
+def format_brief(results: list):
     """
-    توقف ایمن:
-    در صورت نبود منبع تأییدشده Futures هیچ سیگنالی تولید نمی‌شود.
+    Compact summary of scan results.
     """
+    total = len(results)
+    signals = [
+        item for item in results
+        if item.get("signal") and item["signal"].get("plan")
+    ]
 
-    logging.warning(message)
-
-    report = build_report(
-        status="NO TRADE",
-        message=message,
+    long_count = sum(
+        1 for item in signals
+        if item["signal"].get("decision") == "LONG"
+    )
+    short_count = sum(
+        1 for item in signals
+        if item["signal"].get("decision") == "SHORT"
     )
 
-    print_report(report)
-    save_report(report)
+    return (
+        "گزارش خلاصه اسکن بازار\n"
+        f"تعداد نمادها: {total}\n"
+        f"سیگنال LONG: {long_count}\n"
+        f"سیگنال SHORT: {short_count}\n"
+        f"بدون ورود: {total - len(signals)}"
+    )
 
-    return exit_code
 
-
-def scan_symbol(
-    symbol: str,
-    account_balance: float = 0.0,
-) -> dict:
+def format_report(results: list):
     """
-    تحلیل یک نماد.
-    این تابع فقط پس از تأیید منبع واقعی Futures قابل اجراست.
+    Build the full Telegram-compatible HTML report.
     """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    if not futures_data_source_verified():
-        raise DataSourceError(
-            "Futures OHLCV source is not verified"
-        )
+    header = [
+        "<b>SMART MARKET ANALYST V3</b>",
+        f"Market: {MARKET_TYPE}",
+        f"زمان گزارش: {now}",
+        "",
+        html.escape(format_brief(results)),
+        "",
+        "------------------------------",
+    ]
 
-    # دریافت کندل‌ها باید از Adapter رسمی Futures انجام شود.
-    candles_15m = fetch_futures_klines(
-        symbol,
-        "15m",
-    )
+    cards = []
+    for result in results:
+        cards.append(build_card(result))
+        cards.append("------------------------------")
 
-    candles_1h = fetch_futures_klines(
-        symbol,
-        "1h",
-    )
+    footer = [
+        "",
+        "<b>مدیریت ریسک:</b>",
+        f"ریسک پایه: {RISK_PCT}%",
+        f"حداکثر اهرم مجاز در تنظیمات: {MAX_LEVERAGE}x",
+        "اهرم بالا می‌تواند باعث لیکوییدشدن سریع سرمایه شود.",
+        "این گزارش توصیه مالی قطعی نیست.",
+    ]
 
-    validate_market_data(candles_15m, "15m")
-    validate_market_data(candles_1h, "1h")
-
-    analysis_15m = build_timeframe_analysis(
-        candles_15m,
-    )
-
-    analysis_1h = build_timeframe_analysis(
-        candles_1h,
-    )
-
-    scenarios = evaluate_both_sides(
-        candles_15m,
-        analysis_15m,
-        analysis_1h,
-    )
-
-    output = {
-        "LONG": scenarios["LONG"],
-        "SHORT": scenarios["SHORT"],
-    }
-
-    for side in ("LONG", "SHORT"):
-        scenario = output[side]
-
-        if not scenario["eligible"]:
-            continue
-
-        plan = calculate_trade_levels(
-            side,
-            candles_15m.close[-1],
-            candles_15m,
-            analysis_15m,
-        )
-
-        validation = validate_trade_plan(plan)
-
-        scenario["trade_plan"] = plan
-        scenario["validation"] = validation
-
-        if not validation["valid"]:
-            scenario["eligible"] = False
-            scenario["blockers"].extend(
-                validation["errors"]
-            )
-
-        elif account_balance > 0:
-            scenario["position"] = calculate_position_size(
-                account_balance,
-                plan["entry"],
-                plan["stop_loss"],
-            )
-
-    return output
+    return "\n".join(header + cards + footer)
 
 
-def run_scanner(symbols: list) -> dict:
-    """اجرای اسکن نمادها."""
+def _parse_symbols(raw_symbols):
+    """
+    Normalize comma-separated symbols.
+    """
+    if not raw_symbols:
+        return list(DEFAULT_SYMBOLS)
 
-    if not futures_data_source_verified():
-        raise DataSourceError(
-            "NO TRADE — FUTURES DATA NOT VERIFIED"
-        )
+    symbols = []
+    for item in raw_symbols.split(","):
+        item = item.strip().upper()
+        if item and item not in symbols:
+            symbols.append(item)
 
-    results = {}
-
-    for symbol in symbols:
-        try:
-            logging.info("Scanning %s", symbol)
-
-            results[symbol] = scan_symbol(symbol)
-
-        except Exception as exc:
-            logging.exception(
-                "Scan failed for %s",
-                symbol,
-            )
-
-            results[symbol] = {
-                "error": str(exc),
-                "LONG": None,
-                "SHORT": None,
-            }
-
-    return results
+    return symbols
 
 
-def main() -> int:
-    """نقطه شروع برنامه."""
-
+def main():
     parser = argparse.ArgumentParser(
-        description=APP_NAME
+        description="Smart Market Analyst V3"
     )
-
     parser.add_argument(
         "--symbols",
-        default=DEFAULT_SYMBOLS,
-        help="Comma-separated Futures symbols",
+        type=str,
+        default="",
+        help="نمادها با کاما جدا شوند؛ مثال BTC_USDT,ETH_USDT",
     )
-
     parser.add_argument(
-        "--balance",
-        type=float,
-        default=0.0,
-        help="Account balance for position sizing",
+        "--output",
+        type=str,
+        default="report.txt",
+        help="مسیر فایل گزارش",
     )
-
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
+        level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    symbols = [
-        item.strip().upper()
-        for item in args.symbols.split(",")
-        if item.strip()
-    ]
+    symbols = _parse_symbols(args.symbols)
 
     if not symbols:
-        return safe_shutdown(
-            "No symbols configured",
-            2,
+        logging.error("هیچ نمادی برای اسکن مشخص نشده است")
+        return 1
+
+    # Do not silently substitute Spot data for Futures.
+    if MARKET_TYPE == "FUTURES":
+        if not futures_data_source_verified():
+            logging.error(
+                "اسکن Futures متوقف شد: منبع OHLCV فیوچرز هنوز "
+                "با endpoint و قالب پاسخ تأییدشده تنظیم نشده است."
+            )
+            return 1
+
+        logging.error(
+            "آداپتور واقعی Futures هنوز در fetch_klines و fetch_price "
+            "پیاده‌سازی نشده است؛ برای جلوگیری از سیگنال جعلی، اسکن متوقف شد."
         )
+        return 1
 
-    if args.balance < 0:
-        return safe_shutdown(
-            "Invalid account balance",
-            2,
-        )
+    # Spot mode only.
+    try:
+        available_pairs = fetch_pairs()
+    except Exception as exc:
+        logging.error("دریافت فهرست نمادها ناموفق بود: %s", exc)
+        return 1
 
-    # --------------------------------------------------------
-    # SAFETY GATE
-    # --------------------------------------------------------
+    if isinstance(available_pairs, dict):
+        available_pairs = available_pairs.get("data", [])
 
-    if not futures_data_source_verified():
-        return safe_shutdown(
-            "NO TRADE — FUTURES DATA NOT VERIFIED. "
-            "Official Futures OHLCV endpoint and candle "
-            "integrity have not been verified. "
-            "Spot data fallback is disabled.",
-            0,
-        )
+    if not isinstance(available_pairs, (list, tuple, set)):
+        logging.error("قالب فهرست نمادهای صرافی معتبر نیست")
+        return 1
 
-    # --------------------------------------------------------
-    # SCAN
-    # --------------------------------------------------------
+    normalized_pairs = set()
+    for pair in available_pairs:
+        if isinstance(pair, dict):
+            pair = (
+                pair.get("symbol")
+                or pair.get("pair")
+                or pair.get("currency_pair")
+            )
+
+        if pair:
+            normalized_pairs.add(str(pair).upper())
+
+    if not normalized_pairs:
+        logging.error("فهرست نمادهای قابل معامله خالی است")
+        return 1
+
+    results = []
+
+    for symbol in symbols:
+        try:
+            symbol = _validate_symbol(symbol)
+
+            if symbol.upper() not in normalized_pairs:
+                logging.warning(
+                    "%s در فهرست نمادهای Spot صرافی پیدا نشد",
+                    symbol,
+                )
+                continue
+
+            logging.info("شروع تحلیل %s", symbol)
+            result = analyze_symbol(symbol)
+            results.append(result)
+
+            logging.info(
+                "%s | decision=%s",
+                symbol,
+                result.get("decision"),
+            )
+
+        except Exception as exc:
+            logging.exception(
+                "تحلیل %s با خطا مواجه شد: %s",
+                symbol,
+                exc,
+            )
+
+        time.sleep(max(0.0, REQUEST_INTERVAL))
+
+    if not results:
+        logging.error("هیچ نمادی با موفقیت تحلیل نشد")
+        return 1
+
+    report = format_report(results)
 
     try:
-        results = run_scanner(symbols)
+        output_path = os.path.abspath(args.output)
+        output_dir = os.path.dirname(output_path)
 
-        report = build_report(
-            status="SCAN COMPLETED",
-            message="Analysis completed. No orders were placed.",
-            results=results,
-        )
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
-        print_report(report)
-        save_report(report)
+        with open(output_path, "w", encoding="utf-8") as file:
+            file.write(report)
 
-        return 0
+        logging.info("گزارش ذخیره شد: %s", output_path)
 
-    except DataSourceError as exc:
-        return safe_shutdown(str(exc), 1)
+    except OSError as exc:
+        logging.exception("ذخیره گزارش ناموفق بود: %s", exc)
+        return 1
 
-    except Exception as exc:
-        logging.exception("Fatal scanner error")
-
-        return safe_shutdown(
-            f"Scanner stopped due to error: {exc}",
-            1,
-        )
+    print(report)
+    return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-# ============================================================
-# END OF PART 5/5
-# ============================================================
