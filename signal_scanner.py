@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-signal_scanner.py
+signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Final Production Grade with Strict Validator.
-- Fully integrated with Trade Plan Validator (Risk cap 3%, Net RR >= 1.5, Leverage <= 2x).
-- Automated LBank futures scanning & Telegram reporting.
+Smart Market Analyst V3 - Corrected Net RR & Strict Validator Logic.
 """
 from __future__ import annotations
 
@@ -63,9 +61,8 @@ DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (ممیزی شده)
 
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
-
 # --------------------------------------------------------------------------
-# Network & Data Sanitization
+# Part 2/5: Robust Network Requests & Data Sanitization
 # --------------------------------------------------------------------------
 _last_req = 0.0
 
@@ -173,9 +170,8 @@ def fetch_pairs() -> Optional[set]:
         return None
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
-
 # --------------------------------------------------------------------------
-# Structure, Liquidity & Strict Trade Plan Validator
+# Part 3/5: Structure Calculations, Liquidity Map & Corrected Validator
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -287,39 +283,48 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
 def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
     errors = []
     
+    # 1. تطبیق قیمت ورود با سطح بازیابی
     if recovery_lvl:
         if direction == 'LONG' and entry < recovery_lvl:
             entry = recovery_lvl
         elif direction == 'SHORT' and entry > recovery_lvl:
             entry = recovery_lvl
 
+    # 2. تنظیم متقارن تارگت‌ها بر اساس جهت معامله (LONG / SHORT)
     if direction == 'LONG':
         intermediate_highs = [h for _, h in swings_h if tp1 < h < tp2]
         if intermediate_highs:
             tp2 = min(intermediate_highs)
             if tp2 <= tp1:
-                tp2 = tp1 * 1.02
+                tp2 = tp1 * 1.015
     elif direction == 'SHORT':
         intermediate_lows = [l for _, l in swings_l if tp1 > l > tp2]
         if intermediate_lows:
             tp2 = max(intermediate_lows)
             if tp2 >= tp1:
-                tp2 = tp1 * 0.98
+                tp2 = tp1 * 0.985
 
+    # 3. محاسبه دقیق ریسک (فاصله ورود تا استاپ)
     risk = abs(entry - sl)
     if risk <= 0:
-        risk = entry * 0.01
+        risk = entry * 0.005
         
     risk_pct = (risk / entry) * 100.0
     if risk_pct > MAX_STOP_PCT:
         errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
 
+    # 4. محاسبه صحیح Net RR با احتساب کارمزد دوطرفه ورود و خروج
+    total_fee_rate = 2.0 * FEE_PCT / 100.0
     reward1 = abs(tp1 - entry)
     reward2 = abs(tp2 - entry)
-    net_rr1 = round(reward1 / risk, 2)
-    net_rr2 = round(reward2 / risk, 2)
     
-    valid = net_rr2 >= 1.5 and not errors
+    net_reward1 = reward1 - (entry * total_fee_rate)
+    net_reward2 = reward2 - (entry * total_fee_rate)
+    
+    net_rr1 = round(net_reward1 / risk, 2) if risk > 0 else 0.0
+    net_rr2 = round(net_reward2 / risk, 2) if risk > 0 else 0.0
+    
+    valid = net_rr2 >= 1.45 and not errors
 
     return {
         "SL": round(sl, 4), "TP1": round(tp1, 4), "TP2": round(tp2, 4),
@@ -361,9 +366,8 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
         tp2 = min(external_lows) if external_lows else entry_price - (risk * 2.5)
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
-
 # --------------------------------------------------------------------------
-# Structural Analysis & Setup Recovery Engine
+# Part 4/5: Structural Analysis & Setup Recovery Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -595,9 +599,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok}
-
 # --------------------------------------------------------------------------
-# Reporting & Main Execution
+# Part 5/5: Fully Audited Reporting & Main Execution
 # --------------------------------------------------------------------------
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
