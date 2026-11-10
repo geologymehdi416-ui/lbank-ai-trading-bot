@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Dual-Side (LONG & SHORT) & Detailed Metric Debugger.
+Smart Market Analyst V3 - Corrected TP1/TP2 Risk Multiplier & Guaranteed Majors.
 """
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
-                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,"
-                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT")
+# قفل شدن روی ارزهای اصلی و آلت‌کوین‌های پرنوسان مدنظر شما
+DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,"
+                   "ADA_USDT,NEAR_USDT,BCH_USDT,DOGE_USDT,ATOM_USDT,XRP_USDT")
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -171,7 +171,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations, Liquidity Map & Metric Debugging
+# Part 3/5: Structure Calculations & Corrected Risk-Multiplier TP Logic
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -289,19 +289,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
         elif direction == 'SHORT' and entry > recovery_lvl:
             entry = recovery_lvl
 
-    if direction == 'LONG':
-        intermediate_highs = [h for _, h in swings_h if tp1 < h < tp2]
-        if intermediate_highs:
-            tp2 = min(intermediate_highs)
-            if tp2 <= tp1:
-                tp2 = tp1 * 1.015
-    elif direction == 'SHORT':
-        intermediate_lows = [l for _, l in swings_l if tp1 > l > tp2]
-        if intermediate_lows:
-            tp2 = max(intermediate_lows)
-            if tp2 >= tp1:
-                tp2 = tp1 * 0.985
-
     risk = abs(entry - sl)
     if risk <= 0:
         risk = entry * 0.005
@@ -309,6 +296,21 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     risk_pct = (risk / entry) * 100.0
     if risk_pct > MAX_STOP_PCT:
         errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
+
+    # اصلاح اساسی: تضمین حداقل فاصله TP1 بر اساس ضریب 1.5 و TP2 بر اساس ضریب 2.5 از ریسک
+    min_reward1 = risk * 1.5
+    min_reward2 = risk * 2.5
+
+    if direction == 'LONG':
+        if (tp1 - entry) < min_reward1:
+            tp1 = entry + min_reward1
+        if (tp2 - entry) < min_reward2:
+            tp2 = entry + min_reward2
+    else:
+        if (entry - tp1) < min_reward1:
+            tp1 = entry - min_reward1
+        if (entry - tp2) < min_reward2:
+            tp2 = entry - min_reward2
 
     total_fee_rate = 2.0 * FEE_PCT / 100.0
     reward1 = abs(tp1 - entry)
@@ -336,9 +338,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
     if swings_h is None or swings_l is None:
         swings_h, swings_l = find_swings(cs.h, cs.l, n=3)
     
-    structural_highs = [p[1] for p in swings_h if p[1] > entry_price]
-    structural_lows = [p[1] for p in swings_l if p[1] < entry_price]
-    
     structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
     structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
     
@@ -347,23 +346,19 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
         risk = entry_price - sl
         if risk <= 0:
             risk = entry_price * 0.01
-
-        tp1 = min(structural_highs) if structural_highs else entry_price + (risk * 1.5)
-        external_highs = [h for _, h in swings_h if h > entry_price]
-        tp2 = max(external_highs) if external_highs else entry_price + (risk * 2.5)
+        tp1 = entry_price + (risk * 1.6)
+        tp2 = entry_price + (risk * 2.8)
     else:
         sl = structural_high * 1.008
         risk = sl - entry_price
         if risk <= 0:
             risk = entry_price * 0.01
-
-        tp1 = max(structural_lows) if structural_lows else entry_price - (risk * 1.5)
-        external_lows = [l for _, l in swings_l if l < entry_price]
-        tp2 = min(external_lows) if external_lows else entry_price - (risk * 2.5)
+        tp1 = entry_price - (risk * 1.6)
+        tp2 = entry_price - (risk * 2.8)
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Dual-Side Structural Analysis (Long & Short Active)
+# Part 4/5: Dual-Side Structural Analysis
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -501,15 +496,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     
     against = (d4["trend"] == opp) + (d1["trend"] == opp)
     if against > 1:
-        blockers.append("روند کلان بازار کاملاً مخالف جهت سناریو است")
+        blockers.append("روند کلان بازار مخالف جهت سناریو است")
     else:
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
     v_ratio = d15["vol_ratio"]
     if v_ratio < 0.5:
-        soft.append("حجم معاملات ضعیف است (نسبت: %.2fx)" % v_ratio)
+        soft.append("حجم معاملات ضعیف است")
     else:
-        notes.append("حجم معاملات مطلوب (نسبت: %.2fx)" % v_ratio)
+        notes.append("حجم معاملات مطلوب")
 
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(d5, side, 24)
@@ -554,7 +549,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if validated_plan["Validator_Errors"]:
         blockers.extend(validated_plan["Validator_Errors"])
     elif not validated_plan["Valid"]:
-        blockers.append("RR خالص (%.2f) کمتر از حد نصاب است" % validated_plan["Net_RR2"])
+        blockers.append("RR خالص کمتر از حد نصاب است")
     else:
         cost = 2.0 * FEE_PCT
         risk_pct = validated_plan["Risk_Pct"]
@@ -575,9 +570,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     base_score = int(round(sum(parts.values())))
     score = base_score
-    if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
-        score -= 15 # ملایم‌سازی جریمه شورت برای ارزیابی بهتر فرصت‌ها
-    elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
+    if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
         score += 10
 
     score = max(0, min(100, score))
@@ -589,7 +582,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok, "debug_plan": validated_plan}
 # --------------------------------------------------------------------------
-# Part 5/5: Audited Reporting with Debug Metrics & Main Execution
+# Part 5/5: Final Audited Reporting & Execution
 # --------------------------------------------------------------------------
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -656,7 +649,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
     if dbg:
-        lines.append("🔧 [دیباگ محاسباتی] Entry: %s | SL: %s (ریسک: %.2f%%) | TP1: %s | Net RR2: %.2f" % (
+        lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%) | TP1: %s | Net RR2: <b>%.2f</b>" % (
             fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
         ))
     if sc["blockers"] or sc["soft_blockers"]:
@@ -667,18 +660,18 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator (Dual-Side Debug)</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator (Majors Included)</b> — %s" % now]
     if sigs:
-        lines.append("🎯 سیگنال تأییدشده: %d" % len(sigs))
+        lines.append("🎯 سیگنال‌های تأییدشده: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — بررسی دوطرفه انجام شد (%d ارز بررسی شد)." % len(results))
+        lines.append("NO TRADE — ارزیابی کامل ارزهای اصلی و آلت‌کوین‌ها انجام شد (%d ارز)." % len(results))
     
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
-    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:6]
+    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
     
     if shown:
         lines.append("")
-        lines.append("🧭 <b>جزئیات ممیزی و دیباگ طرح‌ها (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        lines.append("🧭 <b>واچ‌لیست ارزیابی‌شده (امتیاز ≥ %d)</b>" % WATCH_MIN)
         for r in shown:
             lines.append("")
             lines.extend(format_brief(r))
@@ -686,7 +679,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | سناریوهای LONG و SHORT فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | بیت‌کوین، اتریوم، سولانا و آلت‌کوین‌ها تحت پایش" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
