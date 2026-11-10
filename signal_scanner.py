@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Corrected Net RR & Strict Validator Logic.
+Smart Market Analyst V3 - Dual-Side (LONG & SHORT) & Detailed Metric Debugger.
 """
 from __future__ import annotations
 
@@ -171,7 +171,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations, Liquidity Map & Corrected Validator
+# Part 3/5: Structure Calculations, Liquidity Map & Metric Debugging
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -283,14 +283,12 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
 def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
     errors = []
     
-    # 1. تطبیق قیمت ورود با سطح بازیابی
     if recovery_lvl:
         if direction == 'LONG' and entry < recovery_lvl:
             entry = recovery_lvl
         elif direction == 'SHORT' and entry > recovery_lvl:
             entry = recovery_lvl
 
-    # 2. تنظیم متقارن تارگت‌ها بر اساس جهت معامله (LONG / SHORT)
     if direction == 'LONG':
         intermediate_highs = [h for _, h in swings_h if tp1 < h < tp2]
         if intermediate_highs:
@@ -304,7 +302,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
             if tp2 >= tp1:
                 tp2 = tp1 * 0.985
 
-    # 3. محاسبه دقیق ریسک (فاصله ورود تا استاپ)
     risk = abs(entry - sl)
     if risk <= 0:
         risk = entry * 0.005
@@ -313,7 +310,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     if risk_pct > MAX_STOP_PCT:
         errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
 
-    # 4. محاسبه صحیح Net RR با احتساب کارمزد دوطرفه ورود و خروج
     total_fee_rate = 2.0 * FEE_PCT / 100.0
     reward1 = abs(tp1 - entry)
     reward2 = abs(tp2 - entry)
@@ -329,7 +325,7 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     return {
         "SL": round(sl, 4), "TP1": round(tp1, 4), "TP2": round(tp2, 4),
         "Net_RR1": net_rr1, "Net_RR2": net_rr2, "Valid": valid, "Entry": round(entry, 4),
-        "Validator_Errors": errors
+        "Validator_Errors": errors, "Risk_Pct": round(risk_pct, 2)
     }
 
 def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, swings_h=None, swings_l=None):
@@ -367,7 +363,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Structural Analysis & Setup Recovery Engine
+# Part 4/5: Dual-Side Structural Analysis (Long & Short Active)
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -539,7 +535,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if not structure_ok:
         if sweep:
             recovery_level = d15["highs"][-1][1] if not long else d15["lows"][-1][1]
-            soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی (%s)" % datetime.now(timezone.utc).strftime("%H:%M"))
+            soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی")
         else:
             soft.append("ستاپ ساختاری در حال شکل‌گیری")
 
@@ -552,28 +548,22 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         parts["zone"] = 3.0
 
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
-    raw_levels = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry, swings_h=swings_h, swings_l=swings_l)
-    
-    validated_plan = validate_and_correct_trade_plan(
-        direction=side, entry=entry, sl=raw_levels["SL"], tp1=raw_levels["TP1"], tp2=raw_levels["TP2"],
-        recovery_lvl=recovery_level, swings_h=swings_h, swings_l=swings_l
-    )
+    validated_plan = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry, swings_h=swings_h, swings_l=swings_l)
 
     trade = None
     if validated_plan["Validator_Errors"]:
         blockers.extend(validated_plan["Validator_Errors"])
     elif not validated_plan["Valid"]:
-        blockers.append("RR خالص کمتر از حد نصاب یا نامعتبر است")
+        blockers.append("RR خالص (%.2f) کمتر از حد نصاب است" % validated_plan["Net_RR2"])
     else:
         cost = 2.0 * FEE_PCT
-        risk_pct = abs(validated_plan["Entry"] - validated_plan["SL"]) / validated_plan["Entry"] * 100.0
+        risk_pct = validated_plan["Risk_Pct"]
         notional_mult = (RISK_PCT / 100.0) / ((risk_pct + cost) / 100.0)
         lev = min(MAX_LEVERAGE, notional_mult)
         trade = {
             "entry": validated_plan["Entry"], "sl": validated_plan["SL"],
             "tp1": validated_plan["TP1"], "tp2": validated_plan["TP2"],
             "rr1": validated_plan["Net_RR1"], "rr2": validated_plan["Net_RR2"],
-            "rr1n": validated_plan["Net_RR1"], "rr2n": validated_plan["Net_RR2"],
             "cost_pct": cost, "stop_pct": risk_pct, "order_type": "LIMIT",
             "notional_x": lev, "eff_risk_pct": lev * ((risk_pct + cost) / 100.0) * 100.0,
             "capped": notional_mult > MAX_LEVERAGE, "tp2_ok": True,
@@ -586,8 +576,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     base_score = int(round(sum(parts.values())))
     score = base_score
     if side == "SHORT" and (d4["trend"] == "UP" or d1["trend"] == "UP"):
-        score -= 25
-        blockers.append("شورت خلاف روند صعودی اصلی بازار")
+        score -= 15 # ملایم‌سازی جریمه شورت برای ارزیابی بهتر فرصت‌ها
     elif side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
         score += 10
 
@@ -598,9 +587,9 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
-            "structure_ok": structure_ok}
+            "structure_ok": structure_ok, "debug_plan": validated_plan}
 # --------------------------------------------------------------------------
-# Part 5/5: Fully Audited Reporting & Main Execution
+# Part 5/5: Audited Reporting with Debug Metrics & Main Execution
 # --------------------------------------------------------------------------
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -611,7 +600,7 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "RR" in b]
+        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b]
         if s["score"] >= min_score and not critical_blockers and not gb and s["trade"] and s["structure_ok"]:
             signal = s
             break
@@ -624,8 +613,9 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
         "liq": liquidity_map(D["15m"], price),
     }
     if not signal and not gb:
-        cands = [s for s in scenarios.values() if s["trade"] and s["score"] >= WATCH_MIN]
+        cands = [s for s in scenarios.values() if s["score"] >= WATCH_MIN]
         if cands:
+            cands.sort(key=lambda x: -x["score"])
             res["watch"] = {"side": cands[0]["side"], "score": cands[0]["score"], "trade": cands[0]["trade"], "condition": "بازیابی ستاپ"}
     return res
 
@@ -646,88 +636,57 @@ def fmt_price(p: float) -> str:
 def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
     ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
     dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
-    short = dom == "SHORT"
-    sc = ss if short else ls
+    sc = ss if dom == "SHORT" else ls
     t = sc["trade"]
     missing = list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"])
     if sc["score"] < MIN_SCORE:
         missing.append("امتیاز %d از %d" % (sc["score"], MIN_SCORE))
     decision = "ENTER" if (res.get("signal") and res["signal"]["side"] == dom) else ("CONDITIONAL" if t else "NO_ENTRY")
-    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("ممیزی طرح: " + (missing[0] if missing else "شرایط")),
-            "trade": t, "missing": missing, "short": short, "decision": decision}
-
-def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
-    c = build_card(res)
-    t = c["trade"]
-    exp_t = datetime.now(timezone.utc) + timedelta(hours=4.0)
-    expiry = exp_t.strftime("%Y-%m-%d %H:%M") + " (محلی)"
-    f = {"side": c["side"], "decision": DECISION_FA[c["decision"]], "expiry": expiry,
-         "missing": c["missing"], "status": c["status"], "trade": t}
-    if t is None:
-        f.update({"activation": None, "confirmation": "—", "zone": None,
-                  "invalidation": "—", "sl": None, "tp1": None, "tp2": None,
-                  "rr1": None, "rr2": None, "leverage": None})
-        return f
-    f.update({
-        "activation": t["entry"],
-        "confirmation": "تأیید ممیزی و تست مقاومت میانی",
-        "zone": (t["entry"] * 0.999, t["entry"] * 1.001),
-        "invalidation": "حد ضرر ساختاری (تایید شده)",
-        "sl": t["sl"], "tp1": t["tp1"], "tp2": t["tp2"],
-        "rr1": t["rr1"], "rr2": t["rr2"], "leverage": t["notional_x"],
-    })
-    return f
+    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("ممیزی: " + (missing[0] if missing else "شرایط")),
+            "trade": t, "missing": missing, "decision": decision}
 
 def format_brief(res: Dict[str, Any]) -> List[str]:
-    p = plan_fields(res)
-    f = fmt_price
+    c = build_card(res)
+    p = c["trade"]
     D = res["D"]
-    side_key = "LONG" if p["side"] == "LONG" else "SHORT"
-    sc = res["scenarios"][side_key]
-    read = [n for n in sc["notes"] if not n.startswith("حجم")][:3]
+    sc = res["scenarios"][c["side"]]
+    dbg = sc.get("debug_plan", {})
     lines = [
-        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"],
-                                          p["decision"], html.escape(p["expiry"])),
-        "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
-                                     TREND_ARROW[D["15m"]["trend"]]),
+        "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: %s" % (html.escape(res["symbol"]), c["side"], sc["score"], c["decision"]),
+        "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
-    if read:
-        lines.append("تحلیل: " + html.escape(" | ".join(read)))
-    if sc.get("recovery_level"):
-        lines.append("🔄 سطح بازیابی (Recovery): <b>%s</b>" % f(sc["recovery_level"]))
-    if p["trade"] is None:
-        lines.append("طرح معامله: — (توسط اعتبارسنج مسدود شد)")
-    else:
-        lines.append("Activation: %s | Entry Zone: %s – %s" % (
-            f(p["activation"]), f(p["zone"][0]), f(p["zone"][1])))
-        lines.append("SL: %s (%.2f%%) | TP1: %s | TP2: %s" % (
-            f(p["sl"]), p["trade"]["stop_pct"], f(p["tp1"]), f(p["tp2"])))
-        lines.append("Net RR: TP1 %.2f / TP2 %.2f | Leverage ≤ %.2fx" % (p["rr1"], p["rr2"], p["leverage"]))
-    if p["decision"] != DECISION_FA["ENTER"] and p["missing"]:
-        lines.append("علت ممیزی: " + html.escape(" | ".join(p["missing"][:2])))
+    if dbg:
+        lines.append("🔧 [دیباگ محاسباتی] Entry: %s | SL: %s (ریسک: %.2f%%) | TP1: %s | Net RR2: %.2f" % (
+            fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
+        ))
+    if sc["blockers"] or sc["soft_blockers"]:
+        all_errs = list(sc["blockers"]) + list(sc["soft_blockers"])
+        lines.append("❌ علت مسدودسازی: " + html.escape(" | ".join(all_errs[:2])))
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator (Dual-Side Debug)</b> — %s" % now]
     if sigs:
         lines.append("🎯 سیگنال تأییدشده: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — هیچ طرح معامله‌ای از فیلتر سخت‌گیرانه اعتبارسنج عبور نکرد (%d ارز بررسی شد)." % len(results))
+        lines.append("NO TRADE — بررسی دوطرفه انجام شد (%d ارز بررسی شد)." % len(results))
+    
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
-    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
-             and not r["signal"]][:5]
+    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:6]
+    
     if shown:
         lines.append("")
-        lines.append("🧭 <b>واچ‌لیست و ممیزی طرح‌ها (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        lines.append("🧭 <b>جزئیات ممیزی و دیباگ طرح‌ها (امتیاز ≥ %d)</b>" % WATCH_MIN)
         for r in shown:
             lines.append("")
             lines.extend(format_brief(r))
+            
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | Trade Plan Validator فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | سناریوهای LONG و SHORT فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -743,7 +702,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     pairs = fetch_pairs()
     if pairs:
         for sym in [x for x in symbols if x.lower() not in pairs]:
-            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد؛ نادیده گرفته شد"))
+            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد"))
         symbols = [x for x in symbols if x.lower() in pairs]
         
     for sym in symbols:
@@ -752,7 +711,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ScanError as e:
             errors.append((sym, str(e)))
         except Exception as e:
-            errors.append((sym, "خطای سیستمی غیرمنتظره: %s" % str(e)))
+            errors.append((sym, "خطای سیستمی: %s" % str(e)))
 
     report_text = format_report(results, errors)
     
