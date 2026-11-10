@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-signal_scanner.py (Part 1/5)
+signal_scanner.py
 -----------------
 Smart Market Analyst V3 - Final Production Grade with Strict Validator.
+- Fully integrated with Trade Plan Validator (Risk cap 3%, Net RR >= 1.5, Leverage <= 2x).
+- Automated LBank futures scanning & Telegram reporting.
 """
 from __future__ import annotations
 
@@ -61,8 +63,9 @@ DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (ممیزی شده)
 
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
+
 # --------------------------------------------------------------------------
-# Part 2/5: Robust Network Requests & Data Sanitization
+# Network & Data Sanitization
 # --------------------------------------------------------------------------
 _last_req = 0.0
 
@@ -170,8 +173,9 @@ def fetch_pairs() -> Optional[set]:
         return None
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
+
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations, Liquidity Map & Strict Trade Plan Validator
+# Structure, Liquidity & Strict Trade Plan Validator
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -357,8 +361,9 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
         tp2 = min(external_lows) if external_lows else entry_price - (risk * 2.5)
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
+
 # --------------------------------------------------------------------------
-# Part 4/5: Structural Analysis & Setup Recovery Engine
+# Structural Analysis & Setup Recovery Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -590,8 +595,9 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok}
+
 # --------------------------------------------------------------------------
-# Part 5/5: Fully Audited Reporting & Main Execution
+# Reporting & Main Execution
 # --------------------------------------------------------------------------
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
