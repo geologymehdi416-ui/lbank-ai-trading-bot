@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Dynamic Trend Reversal & Smart Long Detector.
+Smart Market Analyst V3 - Advanced SMC + Fibonacci Golden Pocket Confluence.
 """
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations & Risk-Multiplier TP Logic
+# Part 3/5: Structure Calculations, Risk-Multiplier & Fibonacci Confluence
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -210,6 +210,46 @@ def find_swings(h: List[float], l: List[float], n: int = 3
            all(l[i] <= l[i + k] for k in range(1, n + 1)):
             lows.append((i, l[i]))
     return highs, lows
+
+def calculate_fib_levels(swing_high: float, swing_low: float, direction: str) -> Dict[str, float]:
+    diff = abs(swing_high - swing_low)
+    if diff <= 0:
+        return {}
+    if direction == 'LONG':
+        return {
+            "fib_500": swing_high - (diff * 0.5),
+            "fib_618": swing_high - (diff * 0.618),
+            "fib_786": swing_high - (diff * 0.786),
+        }
+    else:
+        return {
+            "fib_500": swing_low + (diff * 0.5),
+            "fib_618": swing_low + (diff * 0.618),
+            "fib_786": swing_low + (diff * 0.786),
+        }
+
+def check_fib_confluence(entry: float, swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]], side: str, atr_val: float) -> Tuple[bool, str]:
+    if not swings_h or not swings_l:
+        return False, "بدون سویگ معتبر"
+    recent_high = max([p[1] for p in swings_h[-5:]]) if swings_h else entry * 1.02
+    recent_low = min([p[1] for p in swings_l[-5:]]) if swings_l else entry * 0.98
+    
+    fibs = calculate_fib_levels(recent_high, recent_low, side)
+    if not fibs:
+        return False, "محاسبه فیبو مقدور نیست"
+        
+    tolerance = 0.6 * atr_val
+    f618 = fibs["fib_618"]
+    f786 = fibs["fib_786"]
+    
+    lower_bound = min(f618, f786) - tolerance
+    upper_bound = max(f618, f786) + tolerance
+    
+    if lower_bound <= entry <= upper_bound:
+        return True, "انطباق عالی با محدوده طلایی فیبو (0.618 - 0.786)"
+    elif abs(entry - fibs["fib_500"]) <= tolerance:
+        return True, "انطباق با سطح اصلاحی 0.5 فیبو"
+    return False, "خارج از محدوده طلایی فیبو"
 
 def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> int:
     if len(highs) < 2 or len(lows) < 2:
@@ -281,7 +321,6 @@ def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
 
 def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
     errors = []
-    
     if recovery_lvl:
         if direction == 'LONG' and entry < recovery_lvl:
             entry = recovery_lvl
@@ -291,7 +330,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     risk = abs(entry - sl)
     if risk <= 0:
         risk = entry * 0.005
-        
     risk_pct = (risk / entry) * 100.0
     if risk_pct > MAX_STOP_PCT:
         errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
@@ -313,13 +351,10 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     total_fee_rate = 2.0 * FEE_PCT / 100.0
     reward1 = abs(tp1 - entry)
     reward2 = abs(tp2 - entry)
-    
     net_reward1 = reward1 - (entry * total_fee_rate)
     net_reward2 = reward2 - (entry * total_fee_rate)
-    
     net_rr1 = round(net_reward1 / risk, 2) if risk > 0 else 0.0
     net_rr2 = round(net_reward2 / risk, 2) if risk > 0 else 0.0
-    
     valid = net_rr2 >= 1.45 and not errors
 
     return {
@@ -332,10 +367,8 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
     lookback = 60
     highs_raw = cs.h[-lookback:]
     lows_raw = cs.l[-lookback:]
-    
     if swings_h is None or swings_l is None:
         swings_h, swings_l = find_swings(cs.h, cs.l, n=3)
-    
     structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
     structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
     
@@ -353,10 +386,9 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
             risk = entry_price * 0.01
         tp1 = entry_price - (risk * 1.6)
         tp2 = entry_price - (risk * 2.8)
-
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Dual-Side Structural Analysis & Smart Reversal Detector
+# Part 4/5: Structural Analysis, Reversal Detector & Fibonacci Confluence
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -505,14 +537,12 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     sweep = chosen[1] if chosen else (sw15 or sw5)
     parts["sweep"] = float(chosen[2]) if chosen else 0.0
     parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
-    
     structure_ok = bool(chosen and chosen_mss)
 
-    # تشخیص هوشمند بازگشت روند: اگر روند ۴ ساعته نزولی است، اما در ۱۵ دقیقه اسویپ تمیز + تغییر ساختار (MSS) رخ داده یعنی کف‌سازی و بازگشت روند رخ داده است.
     reversal_detected = (d4["trend"] == "DOWN" and long and structure_ok) or (d4["trend"] == "UP" and not long and structure_ok)
 
     if side == "LONG" and d4["trend"] == "DOWN" and not reversal_detected:
-        blockers.append("روند 4H نزولی است؛ منتظر تاییدیه بازگشت روند (MSS) بمانید")
+        blockers.append("روند 4H نزولی است؛ منتظر تاییدیه بازگشت روند بمانید")
     elif side == "SHORT" and d4["trend"] == "UP" and not reversal_detected:
         blockers.append("روند 4H صعودی است؛ منتظر تغییر ساختار شورت بمانید")
 
@@ -521,8 +551,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     parts["htf"] = s4 + s1
     
     notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
-    if reversal_detected:
-        notes.append("⚡ تشخیص بازگشت روند در کف (Reversal Confirmed)")
 
     v_ratio = d15["vol_ratio"]
     if v_ratio < 0.5:
@@ -547,6 +575,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         parts["zone"] = 3.0
 
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
+    
+    # بررسی انطباق با سطوح فیبوناچی (Fibonacci Confluence)
+    fib_matched, fib_note = check_fib_confluence(entry, swings_h, swings_l, side, atr15)
+    if fib_matched:
+        parts["fibonacci"] = 8.0
+        notes.append("📐 " + fib_note)
+    else:
+        parts["fibonacci"] = 0.0
+
     validated_plan = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry, swings_h=swings_h, swings_l=swings_l)
 
     trade = None
@@ -575,7 +612,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     base_score = int(round(sum(parts.values())))
     score = base_score
     if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE" or reversal_detected):
-        score += 15
+        score += 10
 
     score = max(0, min(100, score))
     if not structure_ok:
@@ -648,10 +685,13 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     D = res["D"]
     sc = res["scenarios"][c["side"]]
     dbg = sc.get("debug_plan", {})
+    notes = [n for n in sc["notes"] if n.startswith("📐")]
     lines = [
         "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: %s" % (html.escape(res["symbol"]), c["side"], sc["score"], c["decision"]),
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
+    if notes:
+        lines.append("تحلیل فیبو: " + html.escape(" | ".join(notes)))
     if dbg and p:
         lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%) | TP1: %s | Net RR2: <b>%.2f</b>" % (
             fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
@@ -664,11 +704,11 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Reversal Detector</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Fibonacci Confluence</b> — %s" % now]
     if sigs:
-        lines.append("🎯 سیگنال‌های تأییدشده: %d" % len(sigs))
+        lines.append("🎯 سیگنال‌های تأییدشده با فیبو: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — اسکن بازگشت روند در بازار انجام شد (%d ارز)." % len(results))
+        lines.append("NO TRADE — اسکن فیبوناچی و ساختار انجام شد (%d ارز)." % len(results))
     
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
@@ -683,7 +723,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | قابلیت تشخیص بازگشت روند فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | تاییدیه فیبوناچی Golden Pocket فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
