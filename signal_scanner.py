@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Fully Calibrated 3-Tier Decision Engine, Fee-Adjusted RR & Clean Gatekeeper.
+Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Clean Uncorrelated Assets.
 """
 from __future__ import annotations
 
@@ -26,8 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,"
-                   "ADA_USDT,NEAR_USDT,BCH_USDT,DOGE_USDT,ATOM_USDT,XRP_USDT")
+# واچ‌لیست اصلاح‌شده (بدون TON و شامل ارزهای معتبر و مستقل در LBank)
+DEFAULT_SYMBOLS = ("TRX_USDT,XMR_USDT,NEAR_USDT,ATOM_USDT,"
+                   "BCH_USDT,DOGE_USDT,LINK_USDT,FIL_USDT")
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -449,7 +450,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], min_score: float) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["decision"] == "ENTER"]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 (حرفه‌ای و اصلاح‌شده)</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 (ارزهای مستقل)</b> — %s" % now]
     lines.append("🎯 سیگنال‌های قطعی ورود (ENTER): %d" % len(sigs))
     
     top = sorted(results, key=lambda r: -r["best_sc"]["score"])
@@ -465,7 +466,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز استاندارد: %.0f | ثبت عملکرد و کنترل تازگی فعال" % min_score)
+    lines.append("حداقل امتیاز استاندارد: %.0f | اسکن ارزهای غیرهمبسته فعال" % min_score)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
