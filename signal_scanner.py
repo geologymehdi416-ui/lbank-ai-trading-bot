@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Volume Trend Continuation.
+Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Volume Trend Continuation + Final Gatekeeper.
 """
 from __future__ import annotations
 
@@ -541,7 +541,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     reversal_detected = (d4["trend"] == "DOWN" and long and structure_ok) or (d4["trend"] == "UP" and not long and structure_ok)
 
-    # شرط اختصاصی ادامه‌روند (پیشنهاد شما): اگر 1H نزولی باشد و پولبک صعودی 15m به مقاومت بخورد و حجم بالا برود
     continuation_override = False
     if side == "SHORT" and d1["trend"] == "DOWN":
         if d15["vol_ratio"] >= 1.2 and structure_ok:
@@ -631,9 +630,37 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok or continuation_override, "debug_plan": validated_plan}
 # --------------------------------------------------------------------------
-# Part 5/5: Final Audited Reporting (Iran Local Time) & Execution
+# Part 5/5: Final Gatekeeper, Detailed RR Reporting & Execution
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+def final_audit_check(scenario: Dict[str, Any], global_blockers: List[str]) -> Tuple[bool, List[str]]:
+    """
+    کنترل نهایی (Final Gatekeeper) پیش از صدور وضعیت ENTER:
+    ۱. بررسی تایید تمامی شروط اجباری و ساختار
+    ۲. بررسی عدم وجود هرگونه علت مسدودسازی (Blockers)
+    ۳. بررسی حجم کندل/تاییدیه حجم
+    ۴. تطابق نسبت ریسک به بازده با تارگت واقعی (Net RR2 >= 1.45)
+    """
+    audit_failures = []
+    
+    if not scenario.get("structure_ok", False):
+        audit_failures.append("شروط ساختاری و تاییدیه اسویپ/MSS کامل نیستند")
+        
+    blockers = scenario.get("blockers", []) + global_blockers
+    critical_blockers = [b for b in blockers if "حد ضرر" in b or "روند 4H نزولی" in b or "کمتر از حد نصاب" in b]
+    if critical_blockers:
+        audit_failures.append("علت مسدودسازی بحرانی فعال است")
+        
+    trade = scenario.get("trade")
+    if not trade:
+        audit_failures.append("طرح معاملاتی معتبری وجود ندارد")
+    else:
+        net_rr2 = trade.get("rr2", 0.0)
+        if net_rr2 < 1.45:
+            audit_failures.append(f"نسبت ریسک به بازده واقعی نامعتبر است (Net RR2: {net_rr2})")
+            
+    return len(audit_failures) == 0, audit_failures
 
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -644,10 +671,14 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
+        is_approved, audit_errors = final_audit_check(s, gb)
         critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "روند 4H نزولی" in b]
-        if s["score"] >= min_score and not critical_blockers and not gb and s["trade"] and s["structure_ok"]:
+        
+        if s["score"] >= min_score and not critical_blockers and not gb and is_approved and s["trade"]:
             signal = s
             break
+        elif s["score"] >= min_score and not is_approved:
+            s["blockers"].extend([f"ممیزی نهایی: {err}" for err in audit_errors])
             
     age_min = (time.time() - (D["5m"].get("cs", C["5m"]).t[-1] + TF_MAP["5m"][1])) / 60.0
     res: Dict[str, Any] = {
@@ -702,10 +733,16 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     ]
     if notes:
         lines.append("تحلیل ساختار: " + html.escape(" | ".join(notes)))
+        
     if dbg and p:
-        lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%) | TP1: %s | Net RR2: <b>%.2f</b>" % (
-            fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
+        lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%)" % (
+            fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)
         ))
+        lines.append("▫️ TP1: %s (Net RR1: <b>%.2f</b>) | TP2: %s (Net RR2: <b>%.2f</b>)" % (
+            fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0),
+            fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)
+        ))
+
     if sc["blockers"] or sc["soft_blockers"]:
         all_errs = list(sc["blockers"]) + list(sc["soft_blockers"])
         lines.append("❌ علت مسدودسازی: " + html.escape(" | ".join(all_errs[:2])))
@@ -714,9 +751,9 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Volume Continuation</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Final Gatekeeper</b> — %s" % now]
     if sigs:
-        lines.append("🎯 سیگنال‌های تأییدشده با حجم و ادامه‌روند: %d" % len(sigs))
+        lines.append("🎯 سیگنال‌های تأییدشده با ممیزی نهایی: %d" % len(sigs))
     else:
         lines.append("NO TRADE — اسکن ساختار و حجم انجام شد (%d ارز)." % len(results))
     
@@ -733,7 +770,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | فیلتر حجم ادامه‌روند (1H نزولی) + ساعت ایران فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | کنترل نهایی (Gatekeeper) + ساعت ایران فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
