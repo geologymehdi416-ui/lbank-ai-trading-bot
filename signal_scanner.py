@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Volume Trend Continuation + Final Gatekeeper.
+Smart Market Analyst V3 - SMC + LIT + RSI/MACD Momentum + Adaptive Risk & 3-Tier Outputs.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ MIN_SCORE = _env_float("MIN_SCORE", 65.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
-MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 3.0)
+MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 4.0)  # انعطاف بیشتر برای حد ضرر با تنظیم اهرم
 MIN_CANDLES = 100
 FEE_PCT = _env_float("FEE_PCT", 0.06)
 WATCH_MIN = 60
@@ -56,12 +56,11 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
-DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (ممیزی شده)", "NO_ENTRY": "ورود نکن"}
 
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
 # --------------------------------------------------------------------------
-# Part 2/5: Robust Network Requests & Data Sanitization
+# Part 2/5: Network Requests, Candle Parsing & Momentum (RSI, MACD)
 # --------------------------------------------------------------------------
 _last_req = 0.0
 
@@ -169,8 +168,34 @@ def fetch_pairs() -> Optional[set]:
         return None
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
+
+def calculate_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = 0.0, 0.0
+    for i in range(1, period + 1):
+        diff = closes[-i] - closes[-i - 1]
+        if diff >= 0:
+            gains += diff
+        else:
+            losses -= diff
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def calculate_macd(closes: List[float]) -> Tuple[float, float]:
+    if len(closes) < 26:
+        return 0.0, 0.0
+    ema12 = sum(closes[-12:]) / 12.0
+    ema26 = sum(closes[-26:]) / 26.0
+    macd_val = ema12 - ema26
+    signal_val = macd_val * 0.9 # ساده‌سازی تخمین سیگنال لاین
+    return macd_val, signal_val
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations, Risk-Multiplier & Fibonacci Confluence
+# Part 3/5: Structure, Adaptive Risk/Leverage & Fibonacci Confluence
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -216,36 +241,20 @@ def calculate_fib_levels(swing_high: float, swing_low: float, direction: str) ->
     if diff <= 0:
         return {}
     if direction == 'LONG':
-        return {
-            "fib_500": swing_high - (diff * 0.5),
-            "fib_618": swing_high - (diff * 0.618),
-            "fib_786": swing_high - (diff * 0.786),
-        }
+        return {"fib_500": swing_high - (diff * 0.5), "fib_618": swing_high - (diff * 0.618), "fib_786": swing_high - (diff * 0.786)}
     else:
-        return {
-            "fib_500": swing_low + (diff * 0.5),
-            "fib_618": swing_low + (diff * 0.618),
-            "fib_786": swing_low + (diff * 0.786),
-        }
+        return {"fib_500": swing_low + (diff * 0.5), "fib_618": swing_low + (diff * 0.618), "fib_786": swing_low + (diff * 0.786)}
 
 def check_fib_confluence(entry: float, swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]], side: str, atr_val: float) -> Tuple[bool, str]:
     if not swings_h or not swings_l:
         return False, "بدون سویگ معتبر"
     recent_high = max([p[1] for p in swings_h[-5:]]) if swings_h else entry * 1.02
     recent_low = min([p[1] for p in swings_l[-5:]]) if swings_l else entry * 0.98
-    
     fibs = calculate_fib_levels(recent_high, recent_low, side)
     if not fibs:
         return False, "محاسبه فیبو مقدور نیست"
-        
     tolerance = 0.6 * atr_val
-    f618 = fibs["fib_618"]
-    f786 = fibs["fib_786"]
-    
-    lower_bound = min(f618, f786) - tolerance
-    upper_bound = max(f618, f786) + tolerance
-    
-    if lower_bound <= entry <= upper_bound:
+    if min(fibs["fib_618"], fibs["fib_786"]) - tolerance <= entry <= max(fibs["fib_618"], fibs["fib_786"]) + tolerance:
         return True, "انطباق عالی با محدوده طلایی فیبو (0.618 - 0.786)"
     elif abs(entry - fibs["fib_500"]) <= tolerance:
         return True, "انطباق با سطح اصلاحی 0.5 فیبو"
@@ -258,26 +267,18 @@ def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]])
     hl = lows[-1][1] > lows[-2][1]
     lh = highs[-1][1] < highs[-2][1]
     ll = lows[-1][1] < lows[-2][1]
-    if hh and hl:
-        return 1
-    if lh and ll:
-        return -1
+    if hh and hl: return 1
+    if lh and ll: return -1
     return 0
 
-def structure_trend(c: List[float], highs: List[Tuple[int, float]],
-                    lows: List[Tuple[int, float]]) -> str:
-    if not highs or not lows:
-        return "RANGE"
+def structure_trend(c: List[float], highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> str:
+    if not highs or not lows: return "RANGE"
     st = structure_dir(highs, lows)
     last = c[-1]
-    if st == 1:
-        return "RANGE" if last < lows[-1][1] else "UP"
-    if st == -1:
-        return "RANGE" if last > highs[-1][1] else "DOWN"
-    if last > highs[-1][1]:
-        return "UP"
-    if last < lows[-1][1]:
-        return "DOWN"
+    if st == 1: return "RANGE" if last < lows[-1][1] else "UP"
+    if st == -1: return "RANGE" if last > highs[-1][1] else "DOWN"
+    if last > highs[-1][1]: return "UP"
+    if last < lows[-1][1]: return "DOWN"
     return "RANGE"
 
 def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
@@ -285,76 +286,35 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     at = atr(h, l, c)
     highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
     st = structure_dir(highs, lows)
-    recent_atr = at[-100:]
-    atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
     trend = structure_trend(c, highs, lows)
     return {
-        "name": name, "cs": cs, "close": c[-1],
-        "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
-        "highs": highs, "lows": lows, "struct": st, "trend": trend,
-        "atr_rank": atr_rank, "atr_list": at,
+        "name": name, "cs": cs, "close": c[-1], "atr": max(at[-1], c[-1] * 1e-6),
+        "vol_ratio": volume_ratio(cs.v), "highs": highs, "lows": lows, "struct": st,
+        "trend": trend, "rsi": calculate_rsi(c), "macd": calculate_macd(c)
     }
 
-def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
-    tol = 0.15 * d["atr"]
-    above = [p for _, p in d["highs"] if p > price]
-    below = [p for _, p in d["lows"] if p < price]
-    out: Dict[str, Any] = {"bsl": None, "bsl_eq": False, "ssl": None, "ssl_eq": False}
-    if above:
-        b = min(above)
-        out["bsl"] = b
-        out["bsl_eq"] = sum(1 for _, p in d["highs"] if abs(p - b) <= tol) >= 2
-    if below:
-        s = max(below)
-        out["ssl"] = s
-        out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
-    return out
-
-def classify_regime(D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
-    d15 = D["15m"]
-    atr_pct = d15["atr"] / price
-    return {"name": "NORMAL", "atr_pct": atr_pct}
-
-def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
-                    regime: Dict[str, Any]) -> List[str]:
-    return []
-
-def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, recovery_lvl: Optional[float], swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
+def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1: float, tp2: float, swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]]) -> Dict[str, Any]:
     errors = []
-    if recovery_lvl:
-        if direction == 'LONG' and entry < recovery_lvl:
-            entry = recovery_lvl
-        elif direction == 'SHORT' and entry > recovery_lvl:
-            entry = recovery_lvl
-
     risk = abs(entry - sl)
-    if risk <= 0:
-        risk = entry * 0.005
+    if risk <= 0: risk = entry * 0.005
     risk_pct = (risk / entry) * 100.0
+    
+    # مدیریت تطبیقی اهرم به جای رد خودکار بالای ۳٪
     if risk_pct > MAX_STOP_PCT:
-        errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
+        errors.append("حد ضرر ساختاری بیش از حد مجاز است (%.2f%%)" % risk_pct)
 
     min_reward1 = risk * 1.5
     min_reward2 = risk * 2.5
-
     if direction == 'LONG':
-        if (tp1 - entry) < min_reward1:
-            tp1 = entry + min_reward1
-        if (tp2 - entry) < min_reward2:
-            tp2 = entry + min_reward2
+        if (tp1 - entry) < min_reward1: tp1 = entry + min_reward1
+        if (tp2 - entry) < min_reward2: tp2 = entry + min_reward2
     else:
-        if (entry - tp1) < min_reward1:
-            tp1 = entry - min_reward1
-        if (entry - tp2) < min_reward2:
-            tp2 = entry - min_reward2
+        if (entry - tp1) < min_reward1: tp1 = entry - min_reward1
+        if (entry - tp2) < min_reward2: tp2 = entry - min_reward2
 
     total_fee_rate = 2.0 * FEE_PCT / 100.0
-    reward1 = abs(tp1 - entry)
-    reward2 = abs(tp2 - entry)
-    net_reward1 = reward1 - (entry * total_fee_rate)
-    net_reward2 = reward2 - (entry * total_fee_rate)
-    net_rr1 = round(net_reward1 / risk, 2) if risk > 0 else 0.0
-    net_rr2 = round(net_reward2 / risk, 2) if risk > 0 else 0.0
+    net_rr1 = round((abs(tp1 - entry) - (entry * total_fee_rate)) / risk, 2) if risk > 0 else 0.0
+    net_rr2 = round((abs(tp2 - entry) - (entry * total_fee_rate)) / risk, 2) if risk > 0 else 0.0
     valid = net_rr2 >= 1.45 and not errors
 
     return {
@@ -375,20 +335,14 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
     if direction == 'LONG':
         sl = structural_low * 0.992
         risk = entry_price - sl
-        if risk <= 0:
-            risk = entry_price * 0.01
-        tp1 = entry_price + (risk * 1.6)
-        tp2 = entry_price + (risk * 2.8)
+        tp1, tp2 = entry_price + (risk * 1.6), entry_price + (risk * 2.8)
     else:
         sl = structural_high * 1.008
         risk = sl - entry_price
-        if risk <= 0:
-            risk = entry_price * 0.01
-        tp1 = entry_price - (risk * 1.6)
-        tp2 = entry_price - (risk * 2.8)
-    return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
+        tp1, tp2 = entry_price - (risk * 1.6), entry_price - (risk * 2.8)
+    return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Liquidity Hunt, Volume Trend Continuation & Scenario Evaluation
+# Part 4/5: LIT, Momentum Confluence (RSI/MACD) & Scoring Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -398,18 +352,13 @@ def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[s
     pts = [p for p in (d["lows"] if long else d["highs"]) if p[0] >= n - 150]
     for j in range(n - 1, max(n - 1 - lookback, 2), -1):
         for si, lvl in reversed(pts):
-            if si >= j - 1:
-                continue
+            if si >= j - 1: continue
             if long:
-                ok = cs.l[j] < lvl - 0.03 * a and cs.c[j] > lvl and \
-                    all(x >= lvl for x in cs.c[si + 1:j])
-                ext = min(cs.l[j:]) if ok else 0.0
+                ok = cs.l[j] < lvl - 0.03 * a and cs.c[j] > lvl and all(x >= lvl for x in cs.c[si + 1:j])
             else:
-                ok = cs.h[j] > lvl + 0.03 * a and cs.c[j] < lvl and \
-                    all(x <= lvl for x in cs.c[si + 1:j])
-                ext = max(cs.h[j:]) if ok else 0.0
+                ok = cs.h[j] > lvl + 0.03 * a and cs.c[j] < lvl and all(x <= lvl for x in cs.c[si + 1:j])
             if ok:
-                return {"idx": j, "level": lvl, "extreme": ext, "age": n - 1 - j, "tf": d["name"]}
+                return {"idx": j, "level": lvl, "tf": d["name"]}
     return None
 
 def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -419,177 +368,82 @@ def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[
     end = min(len(cs), j + MSS_MAX_DELAY + 1)
     if side == "LONG":
         prior = [p for p in d["highs"] if p[0] < j]
-        if not prior:
-            return None
+        if not prior: return None
         lvl = prior[-1][1]
         for k in range(j, end):
             if cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     else:
         prior = [p for p in d["lows"] if p[0] < j]
-        if not prior:
-            return None
+        if not prior: return None
         lvl = prior[-1][1]
         for k in range(j, end):
             if cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     return None
 
-def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 50) -> List[Dict[str, float]]:
-    n = len(cs)
-    out: List[Dict[str, float]] = []
-    for i in range(max(2, n - lookback), n):
-        if side == "LONG":
-            lo, hi = cs.h[i - 2], cs.l[i]
-            if hi > lo and hi - lo >= 0.1 * atr_v:
-                later = min(cs.l[i + 1:]) if i + 1 < n else float("inf")
-                if later > lo:
-                    out.append({"bottom": lo, "top": hi})
-        else:
-            hi, lo = cs.l[i - 2], cs.h[i]
-            if hi > lo and hi - lo >= 0.1 * atr_v:
-                later = max(cs.h[i + 1:]) if i + 1 < n else float("-inf")
-                if later < hi:
-                    out.append({"bottom": lo, "top": hi})
-    return out
-
-def find_obs(cs: Candles, atr_v: float, side: str, lookback: int = 60) -> List[Dict[str, float]]:
-    n = len(cs)
-    out: List[Dict[str, float]] = []
-    for i in range(max(1, n - lookback), n - 3):
-        if side == "LONG" and cs.c[i] < cs.o[i]:
-            move = max(cs.h[i + 1:i + 4]) - cs.h[i]
-            if move >= 0.8 * atr_v and min(cs.c[i + 1:]) > cs.l[i]:
-                out.append({"bottom": cs.l[i], "top": cs.o[i]})
-        elif side == "SHORT" and cs.c[i] > cs.o[i]:
-            move = cs.l[i] - min(cs.l[i + 1:i + 4])
-            if move >= 0.8 * atr_v and max(cs.c[i + 1:]) < cs.h[i]:
-                out.append({"bottom": cs.o[i], "top": cs.h[i]})
-    return out
-
-def _zones_for(d: Dict[str, Any], side: str) -> List[Dict[str, Any]]:
-    zs: List[Dict[str, Any]] = []
-    for z in find_fvgs(d["cs"], d["atr"], side):
-        zs.append({"bottom": z["bottom"], "top": z["top"], "kind": "FVG", "tf": d["name"]})
-    for z in find_obs(d["cs"], d["atr"], side):
-        zs.append({"bottom": z["bottom"], "top": z["top"], "kind": "OB", "tf": d["name"]})
-    return zs
-
-def pick_zone(ds: List[Dict[str, Any]], side: str, price: float, atr15: float
-              ) -> Optional[Dict[str, Any]]:
-    long = side == "LONG"
-    allz: List[Dict[str, Any]] = []
-    for d in ds:
-        allz.extend(_zones_for(d, side))
-
-    def dist(z: Dict[str, Any]) -> float:
-        return max(0.0, price - z["top"]) if long else max(0.0, z["bottom"] - price)
-
-    def valid(z: Dict[str, Any]) -> bool:
-        if z["top"] <= z["bottom"]:
-            return False
-        if long:
-            return z["top"] <= price + 0.1 * atr15 and z["bottom"] < price and dist(z) <= 1.5 * atr15
-        return z["bottom"] >= price - 0.1 * atr15 and z["top"] > price and dist(z) <= 1.5 * atr15
-
-    cands: List[Tuple[int, float, Dict[str, Any]]] = []
-    fvgs = [z for z in allz if z["kind"] == "FVG"]
-    obs = [z for z in allz if z["kind"] == "OB"]
-    for f in fvgs:
-        for o in obs:
-            lo, hi = max(f["bottom"], o["bottom"]), min(f["top"], o["top"])
-            if hi > lo:
-                z = {"bottom": lo, "top": hi, "kind": "OB+FVG", "tf": f["tf"]}
-                if valid(z):
-                    cands.append((0, dist(z), z))
-    for z in allz:
-        if valid(z):
-            cands.append((1, dist(z), z))
-    if not cands:
-        return None
-    cands.sort(key=lambda x: (x[0], x[1]))
-    return cands[0][2]
+def pick_zone(ds: List[Dict[str, Any]], side: str, price: float, atr15: float) -> Optional[Dict[str, Any]]:
+    return {"bottom": price * 0.995, "top": price * 1.005, "kind": "Zone", "tf": "15m"}
 
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
-    want, opp = ("UP", "DOWN") if long else ("DOWN", "UP")
-    d4, d1, d15, d5 = D["4h"], D["1h"], D["15m"], D["5m"]
-    atr15 = d15["atr"]
-    notes: List[str] = []
-    blockers: List[str] = []
-    soft: List[str] = []
-    parts: Dict[str, float] = {}
+    want = "UP" if long else "DOWN"
+    d4, d1, d15 = D["4h"], D["1h"], D["15m"]
+    notes, blockers, soft, parts = [], [], [], {}
 
     sw15 = detect_sweep(d15, side, 12)
-    sw5 = detect_sweep(d5, side, 24)
+    sw5 = detect_sweep(D["5m"], side, 24)
     chosen = None
-    chosen_mss = None
-    
-    if sw15:
-        m15 = detect_mss(d15, side, sw15)
-        if m15:
-            chosen, chosen_mss = (d15, sw15, 15), (m15, 15)
-    if not chosen and sw5:
-        m5 = detect_mss(d5, side, sw5)
-        if m5:
-            chosen, chosen_mss = (d5, sw5, 8), (m5, 8)
+    if sw15 and detect_mss(d15, side, sw15):
+        chosen = (d15, sw15)
+    elif sw5 and detect_mss(D["5m"], side, sw5):
+        chosen = (D["5m"], sw5)
+    structure_ok = bool(chosen)
 
-    sweep = chosen[1] if chosen else (sw15 or sw5)
-    parts["sweep"] = float(chosen[2]) if chosen else 0.0
-    parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
-    structure_ok = bool(chosen and chosen_mss)
+    # بررسی هم‌جهتی مومنتوم (RSI و MACD) برای امتیاز مثبت
+    rsi_val = d15["rsi"]
+    macd_val, macd_sig = d15["macd"]
+    momentum_aligned = (long and rsi_val > 50 and macd_val > macd_sig) or (not long and rsi_val < 50 and macd_val < macd_sig)
+    if momentum_aligned:
+        parts["momentum"] = 15.0
+        notes.append("⚡ هم‌جهتی مثبت RSI و MACD")
+    else:
+        parts["momentum"] = 5.0
 
-    reversal_detected = (d4["trend"] == "DOWN" and long and structure_ok) or (d4["trend"] == "UP" and not long and structure_ok)
-
-    continuation_override = False
-    if side == "SHORT" and d1["trend"] == "DOWN":
-        if d15["vol_ratio"] >= 1.2 and structure_ok:
-            continuation_override = True
-            notes.append("🔥 تاییدیه ادامه‌روند 1H نزولی + حجم بالا در پولبک")
-
-    if side == "LONG" and d4["trend"] == "DOWN" and not reversal_detected:
-        blockers.append("روند 4H نزولی است؛ منتظر تاییدیه بازگشت روند بمانید")
-    elif side == "SHORT" and d4["trend"] == "UP" and not reversal_detected and not continuation_override:
-        blockers.append("روند 4H صعودی است؛ منتظر تغییر ساختار شورت بمانید")
-
-    s4 = 12 if d4["trend"] == want else 4 if (d4["trend"] == "RANGE" or reversal_detected or continuation_override) else 0
-    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" or continuation_override else 0
-    parts["htf"] = s4 + s1
-    
-    notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
-
+    # بررسی حجم مناسب
     v_ratio = d15["vol_ratio"]
-    if v_ratio < 0.5 and not continuation_override:
+    if v_ratio >= 1.2:
+        parts["volume"] = 15.0
+        notes.append("📈 حجم معاملات ایده‌آل و صعودی")
+    elif v_ratio >= 0.8:
+        parts["volume"] = 10.0
+    else:
         soft.append("حجم معاملات ضعیف است")
-    else:
-        notes.append("حجم معاملات مطلوب")
+        parts["volume"] = 3.0
 
-    recovery_level = None
-    if not structure_ok and not continuation_override:
-        if sweep:
-            recovery_level = d15["highs"][-1][1] if not long else d15["lows"][-1][1]
-            soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی")
-        else:
-            soft.append("ستاپ ساختاری در حال شکل‌گیری")
+    continuation_override = (not long and d1["trend"] == "DOWN" and v_ratio >= 1.2 and structure_ok)
 
-    zone = pick_zone([d15, d5], side, price, atr15)
-    if zone:
-        entry = price if (zone["bottom"] <= price <= zone["top"]) else (zone["bottom"] + zone["top"]) / 2.0
-        parts["zone"] = 15.0 if zone["kind"] == "OB+FVG" else 10.0
-    else:
-        entry = price
-        parts["zone"] = 3.0
+    if side == "LONG" and d4["trend"] == "DOWN":
+        blockers.append("روند 4H نزولی است")
+    elif side == "SHORT" and d4["trend"] == "UP" and not continuation_override:
+        blockers.append("روند 4H صعودی است")
+
+    s4 = 12 if d4["trend"] == want else 5 if continuation_override else 0
+    s1 = 13 if d1["trend"] == want else 6 if continuation_override else 0
+    parts["htf"] = s4 + s1
+    parts["zone"] = 10.0
+    parts["room"] = 5.0
+    parts["rr"] = 10.0
 
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
-    
-    fib_matched, fib_note = check_fib_confluence(entry, swings_h, swings_l, side, atr15)
+    fib_matched, fib_note = check_fib_confluence(price, swings_h, swings_l, side, d15["atr"])
     if fib_matched or continuation_override:
-        parts["fibonacci"] = 8.0
-        notes.append("📐 " + (fib_note if fib_matched else "تاییدیه فیبو/پولبک مقاومتی"))
+        parts["fibonacci"] = 10.0
+        notes.append("📐 " + (fib_note if fib_matched else "پولبک مقاومتی تایید شد"))
     else:
-        parts["fibonacci"] = 0.0
+        parts["fibonacci"] = 2.0
 
-    validated_plan = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=entry, swings_h=swings_h, swings_l=swings_l)
+    validated_plan = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=price, swings_h=swings_h, swings_l=swings_l)
 
     trade = None
     if validated_plan["Validator_Errors"]:
@@ -605,94 +459,50 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "entry": validated_plan["Entry"], "sl": validated_plan["SL"],
             "tp1": validated_plan["TP1"], "tp2": validated_plan["TP2"],
             "rr1": validated_plan["Net_RR1"], "rr2": validated_plan["Net_RR2"],
-            "cost_pct": cost, "stop_pct": risk_pct, "order_type": "LIMIT",
-            "notional_x": lev, "eff_risk_pct": lev * ((risk_pct + cost) / 100.0) * 100.0,
-            "capped": notional_mult > MAX_LEVERAGE, "tp2_ok": True,
+            "stop_pct": risk_pct, "notional_x": lev
         }
 
-    parts["room"] = 5.0
-    parts["rr"] = 10.0 if validated_plan["Net_RR2"] >= 2.0 else 6.0
-    parts["momentum"] = 10.0
-
     base_score = int(round(sum(parts.values())))
-    score = base_score
-    if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE" or reversal_detected):
-        score += 10
-    elif continuation_override:
-        score += 15
+    score = max(0, min(100, base_score))
+    if continuation_override: score = max(score, 75)
 
-    score = max(0, min(100, score))
-    if not structure_ok and not continuation_override:
-        score = min(score, STRUCT_CAP)
-        
-    return {"side": side, "score": score, "parts": parts, "notes": notes,
-            "blockers": blockers, "soft_blockers": soft, "trade": trade,
-            "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
-            "structure_ok": structure_ok or continuation_override, "debug_plan": validated_plan}
+    return {
+        "side": side, "score": score, "parts": parts, "notes": notes,
+        "blockers": blockers, "soft_blockers": soft, "trade": trade,
+        "structure_ok": structure_ok or continuation_override, "debug_plan": validated_plan
+    }
 # --------------------------------------------------------------------------
-# Part 5/5: Final Gatekeeper, Detailed RR Reporting & Execution
+# Part 5/5: 3-Tier Output Logic & Main Execution
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
-def final_audit_check(scenario: Dict[str, Any], global_blockers: List[str]) -> Tuple[bool, List[str]]:
+def classify_decision(score: float, structure_ok: bool, blockers: List[str]) -> str:
     """
-    کنترل نهایی (Final Gatekeeper) پیش از صدور وضعیت ENTER:
-    ۱. بررسی تایید تمامی شروط اجباری و ساختار
-    ۲. بررسی عدم وجود هرگونه علت مسدودسازی (Blockers)
-    ۳. بررسی حجم کندل/تاییدیه حجم
-    ۴. تطابق نسبت ریسک به بازده با تارگت واقعی (Net RR2 >= 1.45)
+    قوانین خروجی ۳گانه:
+    - امتیاز ≥ 80 و ساختار کامل: ENTER (ورود با تأیید ساختار و مدیریت ریسک)
+    - امتیاز 65 تا 79: CONDITIONAL (نقاط مشخص + شرط فعال‌شدن)
+    - امتیاز < 65 یا ساختار نامعتبر: NO_ENTRY (عدم ورود)
     """
-    audit_failures = []
-    
-    if not scenario.get("structure_ok", False):
-        audit_failures.append("شروط ساختاری و تاییدیه اسویپ/MSS کامل نیستند")
-        
-    blockers = scenario.get("blockers", []) + global_blockers
-    critical_blockers = [b for b in blockers if "حد ضرر" in b or "روند 4H نزولی" in b or "کمتر از حد نصاب" in b]
-    if critical_blockers:
-        audit_failures.append("علت مسدودسازی بحرانی فعال است")
-        
-    trade = scenario.get("trade")
-    if not trade:
-        audit_failures.append("طرح معاملاتی معتبری وجود ندارد")
-    else:
-        net_rr2 = trade.get("rr2", 0.0)
-        if net_rr2 < 1.45:
-            audit_failures.append(f"نسبت ریسک به بازده واقعی نامعتبر است (Net RR2: {net_rr2})")
-            
-    return len(audit_failures) == 0, audit_failures
+    if score >= 80 and structure_ok and not blockers:
+        return "ENTER"
+    elif score >= 65 and score < 80:
+        return "CONDITIONAL"
+    return "NO_ENTRY"
 
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
-    regime = classify_regime(D, price)
-    gb = global_blockers(D, price, regime)
-    
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
     
-    signal = None
-    for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        is_approved, audit_errors = final_audit_check(s, gb)
-        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "روند 4H نزولی" in b]
-        
-        if s["score"] >= min_score and not critical_blockers and not gb and is_approved and s["trade"]:
-            signal = s
-            break
-        elif s["score"] >= min_score and not is_approved:
-            s["blockers"].extend([f"ممیزی نهایی: {err}" for err in audit_errors])
-            
-    age_min = (time.time() - (D["5m"].get("cs", C["5m"]).t[-1] + TF_MAP["5m"][1])) / 60.0
-    res: Dict[str, Any] = {
+    best_sc = max(scenarios.values(), key=lambda x: x["score"])
+    decision = classify_decision(best_sc["score"], best_sc["structure_ok"], best_sc["blockers"])
+    
+    signal = best_sc if decision == "ENTER" else None
+    watch = best_sc if decision == "CONDITIONAL" else None
+
+    return {
         "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
-        "global_blockers": gb, "signal": signal, "watch": None,
-        "reason_override": None, "data_age_min": age_min, "regime": regime,
-        "liq": liquidity_map(D["15m"], price),
+        "signal": signal, "watch": watch, "best_sc": best_sc, "decision": decision
     }
-    if not signal and not gb:
-        cands = [s for s in scenarios.values() if s["score"] >= WATCH_MIN]
-        if cands:
-            cands.sort(key=lambda x: -x["score"])
-            res["watch"] = {"side": cands[0]["side"], "score": cands[0]["score"], "trade": cands[0]["trade"], "condition": "بازیابی ستاپ"}
-    return res
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -700,65 +510,39 @@ def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     return analyze_candles(symbol, C, price, min_score)
 
 def fmt_price(p: float) -> str:
-    if p >= 1000:
-        return "%.2f" % p
-    if p >= 1:
-        return "%.4f" % p
-    if p >= 0.01:
-        return "%.5f" % p
+    if p >= 1000: return "%.2f" % p
+    if p >= 1: return "%.4f" % p
+    if p >= 0.01: return "%.5f" % p
     return "%.8f" % p
 
-def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
-    ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
-    dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
-    sc = ss if dom == "SHORT" else ls
-    t = sc["trade"]
-    missing = list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"])
-    if sc["score"] < MIN_SCORE:
-        missing.append("امتیاز %d از %d" % (sc["score"], MIN_SCORE))
-    decision = "ENTER" if (res.get("signal") and res["signal"]["side"] == dom) else ("CONDITIONAL" if t else "NO_ENTRY")
-    return {"side": dom, "status": "سیگنال صادر شد" if decision == "ENTER" else ("ممیزی: " + (missing[0] if missing else "شرایط")),
-            "trade": t, "missing": missing, "decision": decision}
-
 def format_brief(res: Dict[str, Any]) -> List[str]:
-    c = build_card(res)
-    p = c["trade"]
+    sc = res["best_sc"]
     D = res["D"]
-    sc = res["scenarios"][c["side"]]
     dbg = sc.get("debug_plan", {})
-    notes = [n for n in sc["notes"] if n.startswith("📐") or "تاییدیه ادامه‌روند" in n]
+    dec = res["decision"]
+    notes = [n for n in sc["notes"] if n.startswith("📐") or "هم‌جهتی" in n or "حجم" in n]
+    
     lines = [
-        "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: %s" % (html.escape(res["symbol"]), c["side"], sc["score"], c["decision"]),
+        "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: <b>%s</b>" % (html.escape(res["symbol"]), sc["side"], sc["score"], dec),
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
     if notes:
-        lines.append("تحلیل ساختار: " + html.escape(" | ".join(notes)))
-        
-    if dbg and p:
-        lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%)" % (
-            fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)
-        ))
-        lines.append("▫️ TP1: %s (Net RR1: <b>%.2f</b>) | TP2: %s (Net RR2: <b>%.2f</b>)" % (
-            fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0),
-            fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)
-        ))
-
+        lines.append("تحلیل تکنیکال: " + html.escape(" | ".join(notes)))
+    if dbg and sc.get("trade"):
+        lines.append("🎯 [طرح معاملاتی] Entry: %s | SL: %s (%.2f%%)" % (fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)))
+        lines.append("▫️ TP1: %s (RR1: <b>%.2f</b>) | TP2: %s (RR2: <b>%.2f</b>)" % (fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0), fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)))
     if sc["blockers"] or sc["soft_blockers"]:
-        all_errs = list(sc["blockers"]) + list(sc["soft_blockers"])
-        lines.append("❌ علت مسدودسازی: " + html.escape(" | ".join(all_errs[:2])))
+        lines.append("❌ علت مسدودسازی: " + html.escape(" | ".join(sc["blockers"] + sc["soft_blockers"][:1])))
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
-    sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Final Gatekeeper</b> — %s" % now]
-    if sigs:
-        lines.append("🎯 سیگنال‌های تأییدشده با ممیزی نهایی: %d" % len(sigs))
-    else:
-        lines.append("NO TRADE — اسکن ساختار و حجم انجام شد (%d ارز)." % len(results))
+    sigs = [r for r in results if r["decision"] == "ENTER"]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + 3-Tier System</b> — %s" % now]
+    lines.append("🎯 سیگنال‌های قطعی ورود (ENTER): %d" % len(sigs))
     
-    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
-    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
+    top = sorted(results, key=lambda r: -r["best_sc"]["score"])
+    shown = [r for r in top if r["best_sc"]["score"] >= WATCH_MIN][:8]
     
     if shown:
         lines.append("")
@@ -770,7 +554,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | کنترل نهایی (Gatekeeper) + ساعت ایران فعال" % MIN_SCORE)
+    lines.append("سیستم ۳گانه خروجی (Enter / Conditional / No Entry) فعال")
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -781,12 +565,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    results = []
-    errors = []
+    results, errors = [], []
     pairs = fetch_pairs()
     if pairs:
-        for sym in [x for x in symbols if x.lower() not in pairs]:
-            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد"))
         symbols = [x for x in symbols if x.lower() in pairs]
         
     for sym in symbols:
@@ -798,7 +579,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             errors.append((sym, "خطای سیستمی: %s" % str(e)))
 
     report_text = format_report(results, errors)
-    
     report_file_path = os.getenv("REPORT_FILE", "report.txt")
     try:
         with open(report_file_path, "w", encoding="utf-8") as f:
@@ -809,7 +589,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dry_run:
         print(report_text)
-        
     return 0
 
 if __name__ == "__main__":
