@@ -576,7 +576,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
     
-    # بررسی انطباق با سطوح فیبوناچی (Fibonacci Confluence)
     fib_matched, fib_note = check_fib_confluence(entry, swings_h, swings_l, side, atr15)
     if fib_matched:
         parts["fibonacci"] = 8.0
@@ -623,8 +622,10 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
             "structure_ok": structure_ok, "debug_plan": validated_plan}
 # --------------------------------------------------------------------------
-# Part 5/5: Final Audited Reporting & Execution
+# Part 5/5: Final Audited Reporting (Iran Local Time) & Execution
 # --------------------------------------------------------------------------
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
     regime = classify_regime(D, price)
@@ -702,7 +703,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
+    now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["signal"]]
     lines = ["📊 <b>گزارش Smart Market Analyst V3 + Fibonacci Confluence</b> — %s" % now]
     if sigs:
@@ -723,7 +724,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | تاییدیه فیبوناچی Golden Pocket فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | تاییدیه فیبوناچی Golden Pocket + ساعت محلی ایران فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
