@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Fibonacci Confluence.
+Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Volume Trend Continuation.
 """
 from __future__ import annotations
 
@@ -388,7 +388,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
         tp2 = entry_price - (risk * 2.8)
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Liquidity Hunt (Sweep), MSS & Scenario Evaluation Engine
+# Part 4/5: Liquidity Hunt, Volume Trend Continuation & Scenario Evaluation
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -541,25 +541,32 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     reversal_detected = (d4["trend"] == "DOWN" and long and structure_ok) or (d4["trend"] == "UP" and not long and structure_ok)
 
+    # شرط اختصاصی ادامه‌روند (پیشنهاد شما): اگر 1H نزولی باشد و پولبک صعودی 15m به مقاومت بخورد و حجم بالا برود
+    continuation_override = False
+    if side == "SHORT" and d1["trend"] == "DOWN":
+        if d15["vol_ratio"] >= 1.2 and structure_ok:
+            continuation_override = True
+            notes.append("🔥 تاییدیه ادامه‌روند 1H نزولی + حجم بالا در پولبک")
+
     if side == "LONG" and d4["trend"] == "DOWN" and not reversal_detected:
         blockers.append("روند 4H نزولی است؛ منتظر تاییدیه بازگشت روند بمانید")
-    elif side == "SHORT" and d4["trend"] == "UP" and not reversal_detected:
+    elif side == "SHORT" and d4["trend"] == "UP" and not reversal_detected and not continuation_override:
         blockers.append("روند 4H صعودی است؛ منتظر تغییر ساختار شورت بمانید")
 
-    s4 = 12 if d4["trend"] == want else 4 if (d4["trend"] == "RANGE" or reversal_detected) else 0
-    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
+    s4 = 12 if d4["trend"] == want else 4 if (d4["trend"] == "RANGE" or reversal_detected or continuation_override) else 0
+    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" or continuation_override else 0
     parts["htf"] = s4 + s1
     
     notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
     v_ratio = d15["vol_ratio"]
-    if v_ratio < 0.5:
+    if v_ratio < 0.5 and not continuation_override:
         soft.append("حجم معاملات ضعیف است")
     else:
         notes.append("حجم معاملات مطلوب")
 
     recovery_level = None
-    if not structure_ok:
+    if not structure_ok and not continuation_override:
         if sweep:
             recovery_level = d15["highs"][-1][1] if not long else d15["lows"][-1][1]
             soft.append("بازیابی ستاپ: منتظر شکست سطح کلیدی")
@@ -577,9 +584,9 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
     
     fib_matched, fib_note = check_fib_confluence(entry, swings_h, swings_l, side, atr15)
-    if fib_matched:
+    if fib_matched or continuation_override:
         parts["fibonacci"] = 8.0
-        notes.append("📐 " + fib_note)
+        notes.append("📐 " + (fib_note if fib_matched else "تاییدیه فیبو/پولبک مقاومتی"))
     else:
         parts["fibonacci"] = 0.0
 
@@ -612,15 +619,17 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     score = base_score
     if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE" or reversal_detected):
         score += 10
+    elif continuation_override:
+        score += 15
 
     score = max(0, min(100, score))
-    if not structure_ok:
+    if not structure_ok and not continuation_override:
         score = min(score, STRUCT_CAP)
         
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "recovery_level": recovery_level,
-            "structure_ok": structure_ok, "debug_plan": validated_plan}
+            "structure_ok": structure_ok or continuation_override, "debug_plan": validated_plan}
 # --------------------------------------------------------------------------
 # Part 5/5: Final Audited Reporting (Iran Local Time) & Execution
 # --------------------------------------------------------------------------
@@ -686,13 +695,13 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     D = res["D"]
     sc = res["scenarios"][c["side"]]
     dbg = sc.get("debug_plan", {})
-    notes = [n for n in sc["notes"] if n.startswith("📐")]
+    notes = [n for n in sc["notes"] if n.startswith("📐") or "تاییدیه ادامه‌روند" in n]
     lines = [
         "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: %s" % (html.escape(res["symbol"]), c["side"], sc["score"], c["decision"]),
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
     if notes:
-        lines.append("تحلیل فیبو: " + html.escape(" | ".join(notes)))
+        lines.append("تحلیل ساختار: " + html.escape(" | ".join(notes)))
     if dbg and p:
         lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%) | TP1: %s | Net RR2: <b>%.2f</b>" % (
             fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
@@ -705,11 +714,11 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + LIT + Fib</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Volume Continuation</b> — %s" % now]
     if sigs:
-        lines.append("🎯 سیگنال‌های تأییدشده: %d" % len(sigs))
+        lines.append("🎯 سیگنال‌های تأییدشده با حجم و ادامه‌روند: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — اسکن ساختار و نقدینگی انجام شد (%d ارز)." % len(results))
+        lines.append("NO TRADE — اسکن ساختار و حجم انجام شد (%d ارز)." % len(results))
     
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
@@ -724,7 +733,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | شکار نقدینگی (LIT) + فیبو Golden Pocket + ساعت ایران فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | فیلتر حجم ادامه‌روند (1H نزولی) + ساعت ایران فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
