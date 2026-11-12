@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Advanced SMC + Fibonacci Golden Pocket Confluence.
+Smart Market Analyst V3 - Advanced SMC + Liquidity Hunt + Fibonacci Confluence.
 """
 from __future__ import annotations
 
@@ -388,7 +388,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
         tp2 = entry_price - (risk * 2.8)
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Structural Analysis, Reversal Detector & Fibonacci Confluence
+# Part 4/5: Liquidity Hunt (Sweep), MSS & Scenario Evaluation Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -705,11 +705,11 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Fibonacci Confluence</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + LIT + Fib</b> — %s" % now]
     if sigs:
-        lines.append("🎯 سیگنال‌های تأییدشده با فیبو: %d" % len(sigs))
+        lines.append("🎯 سیگنال‌های تأییدشده: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — اسکن فیبوناچی و ساختار انجام شد (%d ارز)." % len(results))
+        lines.append("NO TRADE — اسکن ساختار و نقدینگی انجام شد (%d ارز)." % len(results))
     
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
@@ -724,7 +724,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | تاییدیه فیبوناچی Golden Pocket + ساعت محلی ایران فعال" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | شکار نقدینگی (LIT) + فیبو Golden Pocket + ساعت ایران فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
