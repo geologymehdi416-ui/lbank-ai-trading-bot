@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Corrected TP1/TP2 Risk Multiplier & Guaranteed Majors.
+Smart Market Analyst V3 - Dynamic Trend Reversal & Smart Long Detector.
 """
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-# قفل شدن روی ارزهای اصلی و آلت‌کوین‌های پرنوسان مدنظر شما
 DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,"
                    "ADA_USDT,NEAR_USDT,BCH_USDT,DOGE_USDT,ATOM_USDT,XRP_USDT")
 
@@ -171,7 +170,7 @@ def fetch_pairs() -> Optional[set]:
     pairs = {str(x).lower() for x in items if isinstance(x, str)}
     return pairs if "btc_usdt" in pairs else None
 # --------------------------------------------------------------------------
-# Part 3/5: Structure Calculations & Corrected Risk-Multiplier TP Logic
+# Part 3/5: Structure Calculations & Risk-Multiplier TP Logic
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -297,7 +296,6 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     if risk_pct > MAX_STOP_PCT:
         errors.append("حد ضرر ساختاری بیش از ۳٪ است (%.2f%%)" % risk_pct)
 
-    # اصلاح اساسی: تضمین حداقل فاصله TP1 بر اساس ضریب 1.5 و TP2 بر اساس ضریب 2.5 از ریسک
     min_reward1 = risk * 1.5
     min_reward2 = risk * 2.5
 
@@ -358,7 +356,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0, s
 
     return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2, None, swings_h, swings_l)
 # --------------------------------------------------------------------------
-# Part 4/5: Dual-Side Structural Analysis
+# Part 4/5: Dual-Side Structural Analysis & Smart Reversal Detector
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
@@ -490,22 +488,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     soft: List[str] = []
     parts: Dict[str, float] = {}
 
-    s4 = 12 if d4["trend"] == want else 4 if d4["trend"] == "RANGE" else 0
-    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
-    parts["htf"] = s4 + s1
-    
-    against = (d4["trend"] == opp) + (d1["trend"] == opp)
-    if against > 1:
-        blockers.append("روند کلان بازار مخالف جهت سناریو است")
-    else:
-        notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
-
-    v_ratio = d15["vol_ratio"]
-    if v_ratio < 0.5:
-        soft.append("حجم معاملات ضعیف است")
-    else:
-        notes.append("حجم معاملات مطلوب")
-
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(d5, side, 24)
     chosen = None
@@ -525,7 +507,29 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
     
     structure_ok = bool(chosen and chosen_mss)
+
+    # تشخیص هوشمند بازگشت روند: اگر روند ۴ ساعته نزولی است، اما در ۱۵ دقیقه اسویپ تمیز + تغییر ساختار (MSS) رخ داده یعنی کف‌سازی و بازگشت روند رخ داده است.
+    reversal_detected = (d4["trend"] == "DOWN" and long and structure_ok) or (d4["trend"] == "UP" and not long and structure_ok)
+
+    if side == "LONG" and d4["trend"] == "DOWN" and not reversal_detected:
+        blockers.append("روند 4H نزولی است؛ منتظر تاییدیه بازگشت روند (MSS) بمانید")
+    elif side == "SHORT" and d4["trend"] == "UP" and not reversal_detected:
+        blockers.append("روند 4H صعودی است؛ منتظر تغییر ساختار شورت بمانید")
+
+    s4 = 12 if d4["trend"] == want else 4 if (d4["trend"] == "RANGE" or reversal_detected) else 0
+    s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
+    parts["htf"] = s4 + s1
     
+    notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
+    if reversal_detected:
+        notes.append("⚡ تشخیص بازگشت روند در کف (Reversal Confirmed)")
+
+    v_ratio = d15["vol_ratio"]
+    if v_ratio < 0.5:
+        soft.append("حجم معاملات ضعیف است")
+    else:
+        notes.append("حجم معاملات مطلوب")
+
     recovery_level = None
     if not structure_ok:
         if sweep:
@@ -570,8 +574,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     base_score = int(round(sum(parts.values())))
     score = base_score
-    if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE"):
-        score += 10
+    if side == "LONG" and (d4["trend"] == "UP" or d1["trend"] == "RANGE" or reversal_detected):
+        score += 15
 
     score = max(0, min(100, score))
     if not structure_ok:
@@ -593,7 +597,7 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
     
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b]
+        critical_blockers = [b for b in s["blockers"] if "حد ضرر" in b or "روند 4H نزولی" in b]
         if s["score"] >= min_score and not critical_blockers and not gb and s["trade"] and s["structure_ok"]:
             signal = s
             break
@@ -648,7 +652,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: %s" % (html.escape(res["symbol"]), c["side"], sc["score"], c["decision"]),
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]]),
     ]
-    if dbg:
+    if dbg and p:
         lines.append("🎯 [طرح ممیزی‌شده] Entry: %s | SL: %s (%.2f%%) | TP1: %s | Net RR2: <b>%.2f</b>" % (
             fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0), fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR2", 0)
         ))
@@ -660,11 +664,11 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M (UTC+03:30)")
     sigs = [r for r in results if r["signal"]]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Strict Validator (Majors Included)</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3 + Reversal Detector</b> — %s" % now]
     if sigs:
         lines.append("🎯 سیگنال‌های تأییدشده: %d" % len(sigs))
     else:
-        lines.append("NO TRADE — ارزیابی کامل ارزهای اصلی و آلت‌کوین‌ها انجام شد (%d ارز)." % len(results))
+        lines.append("NO TRADE — اسکن بازگشت روند در بازار انجام شد (%d ارز)." % len(results))
     
     top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
     shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN][:8]
@@ -679,7 +683,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز: %d | بیت‌کوین، اتریوم، سولانا و آلت‌کوین‌ها تحت پایش" % MIN_SCORE)
+    lines.append("حداقل امتیاز: %d | قابلیت تشخیص بازگشت روند فعال" % MIN_SCORE)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
