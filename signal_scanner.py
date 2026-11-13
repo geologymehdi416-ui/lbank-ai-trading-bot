@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Clean Uncorrelated Assets.
+Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Uncorrelated Assets.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-# واچ‌لیست اصلاح‌شده (بدون TON و شامل ارزهای معتبر و مستقل در LBank)
+# واچ‌لیست ارزهای معتبر و مستقل از نوسانات لحظه‌ای بیت‌کوین در LBank
 DEFAULT_SYMBOLS = ("TRX_USDT,XMR_USDT,NEAR_USDT,ATOM_USDT,"
                    "BCH_USDT,DOGE_USDT,LINK_USDT,FIL_USDT")
 
@@ -429,28 +429,34 @@ def fmt_price(p: float) -> str:
 
 def format_brief(res: Dict[str, Any]) -> List[str]:
     sc = res["best_sc"]
-    D = res["D"]
     dbg = sc.get("debug_plan", {})
     dec = res["decision"]
-    notes = [n for n in sc["notes"] if n.startswith("📐") or "هم‌جهتی" in n or "حجم" in n]
+    symbol_clean = res["symbol"].replace("_", "")
+    side_fa = "لانگ (LONG)" if sc["side"] == "LONG" else "شورت (SHORT)"
     
     lines = [
-        "<b>%s</b> | سناریو: %s | امتیاز: %d | تصمیم: <b>%s</b>" % (html.escape(res["symbol"]), sc["side"], sc["score"], dec),
-        "روند 4H/1H/15m: %s %s %s (تازگی داده: %.1f دقیقه)" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]], res["data_age_min"]),
+        "⏳ <b>سفارش لیمیت در انتظار رسیدن قیمت</b>",
+        "",
+        "شناسه معامله: <code>TR-%s</code>" % datetime.now(IRAN_TZ).strftime("%H%M%S"),
+        "نماد: <code>%s</code> | جهت: <b>%s</b>" % (html.escape(symbol_clean), side_fa),
+        "امتیاز ارزیابی: <b>%d/100</b> | تصمیم: <b>%s</b>" % (sc["score"], dec),
+        "",
+        "🔹 <b>ورود لیمیت:</b> <code>%s</code>" % fmt_price(dbg.get("Entry", 0)),
+        "⚡ <b>اهرم پیشنهادی:</b> <code>2x (پویا)</code>",
+        "🎯 <b>اهداف (Targets):</b>",
+        "1️⃣ <code>%s</code> (Net RR1: <b>%.2f</b>)" % (fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0)),
+        "2️⃣ <code>%s</code> (Net RR2: <b>%.2f</b>)" % (fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)),
+        "",
+        "🛑 <b>حد ضرر (SL):</b> <code>%s</code> (ریسک: %.2f%%)" % (fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)),
     ]
-    if notes:
-        lines.append("تحلیل تکنیکال: " + html.escape(" | ".join(notes)))
-    if dbg and sc.get("trade"):
-        lines.append("🎯 [طرح معاملاتی کارمزدورزی] Entry: %s | SL: %s (%.2f%%)" % (fmt_price(dbg.get("Entry", 0)), fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)))
-        lines.append("▫️ TP1: %s (Net RR1: <b>%.2f</b>) | TP2: %s (Net RR2: <b>%.2f</b>)" % (fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0), fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)))
     if sc["blockers"] or sc["soft_blockers"]:
-        lines.append("❌ علت مسدودسازی: " + html.escape(" | ".join(sc["blockers"] + sc["soft_blockers"][:1])))
+        lines.append("❌ <b>علت مسدودسازی:</b> " + html.escape(" | ".join(sc["blockers"] + sc["soft_blockers"][:1])))
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], min_score: float) -> str:
     now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     sigs = [r for r in results if r["decision"] == "ENTER"]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3 (ارزهای مستقل)</b> — %s" % now]
+    lines = ["📊 <b>گزارش Smart Market Analyst V3</b> — %s" % now]
     lines.append("🎯 سیگنال‌های قطعی ورود (ENTER): %d" % len(sigs))
     
     top = sorted(results, key=lambda r: -r["best_sc"]["score"])
@@ -458,15 +464,16 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], 
     
     if shown:
         lines.append("")
-        lines.append("🧭 <b>واچ‌لیست ارزیابی‌شده (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        lines.append("🧭 <b>واچ‌لیست ارزیابی‌شده (امتیاز ≥ %d الخصوص ارزهای مستقل)</b>" % WATCH_MIN)
         for r in shown:
             lines.append("")
             lines.extend(format_brief(r))
+            lines.append("-" * 30)
             
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
-    lines.append("حداقل امتیاز استاندارد: %.0f | اسکن ارزهای غیرهمبسته فعال" % min_score)
+    lines.append("حداقل امتیاز استاندارد: %.0f | ثبت عملکرد و کنترل تازگی فعال" % min_score)
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
