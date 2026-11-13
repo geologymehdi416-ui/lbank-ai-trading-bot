@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Uncorrelated Assets.
+Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Major/Uncorrelated Assets.
 """
 from __future__ import annotations
 
@@ -26,9 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-# واچ‌لیست ارزهای معتبر و مستقل از نوسانات لحظه‌ای بیت‌کوین در LBank
-DEFAULT_SYMBOLS = ("TRX_USDT,XMR_USDT,NEAR_USDT,ATOM_USDT,"
-                   "BCH_USDT,DOGE_USDT,LINK_USDT,FIL_USDT")
+# واچ‌لیست جامع شامل بیت‌کوین، اتریوم و سایر ارزهای کلیدی و مستقل
+DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,TRX_USDT,XMR_USDT,"
+                   "NEAR_USDT,ATOM_USDT,BCH_USDT,DOGE_USDT,LINK_USDT,FIL_USDT")
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -40,7 +40,7 @@ MIN_SCORE = _env_float("MIN_SCORE", 65.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
-MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 6.0) # افزایش سقف حد ضرر برای جلوگیری از خطای مسدودی
+MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 6.0)
 MIN_CANDLES = 100
 FEE_PCT = _env_float("FEE_PCT", 0.06)
 WATCH_MIN = 60
@@ -440,7 +440,6 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     symbol_clean = res["symbol"].replace("_", "")
     side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
     
-    # ساختار گزارش همراه با اطلاعات تحلیلی و دلایل فنی
     lines = [
         "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
         "",
@@ -457,7 +456,6 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "• امتیاز کیفیت ستاپ: %d/100" % sc["score"],
     ]
     
-    # اضافه کردن یادداشت‌ها و تحلیل‌های انجام شده به پیام
     for note in sc.get("notes", []):
         lines.append("• %s" % note)
         
