@@ -302,17 +302,21 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     current_close = cs.c[-1]
     
     if direction == 'LONG':
-        entry = min(entry_price, current_close) * 0.998
-        sl = structural_low * 0.992
+        # برای لانگ: ورود لیمیت همیشه پایین‌تر از قیمت فعلی (روی حمایت / کف‌های اخیر)
+        recent_low = min(cs.l[-10:])
+        entry = min(current_close * 0.998, recent_low * 1.001)
+        sl = min(structural_low * 0.992, entry * 0.985)
         risk = entry - sl
-        tp1, tp2 = entry + (risk * 1.6), entry + (risk * 2.8)
+        tp1 = entry + (risk * 1.6)
+        tp2 = entry + (risk * 2.8)
     else:
-        # برای شورت: ورود لیمیت همیشه بالاتر از قیمت فعلی (روی مقاومت/سویگ بالا)
+        # برای شورت: ورود لیمیت همیشه بالاتر از قیمت فعلی (روی مقاومت / سویگ بالا)
         recent_high = max(cs.h[-10:])
         entry = max(current_close * 1.002, recent_high * 0.999)
         sl = max(structural_high * 1.008, entry * 1.015)
         risk = sl - entry
-        tp1, tp2 = entry - (risk * 1.6), entry - (risk * 2.8)
+        tp1 = entry - (risk * 1.6)
+        tp2 = entry - (risk * 2.8)
         
     return validate_and_correct_trade_plan(direction, entry, sl, tp1, tp2)
 # --------------------------------------------------------------------------
