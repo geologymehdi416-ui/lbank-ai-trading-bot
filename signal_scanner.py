@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - Strict Trend Gate, Precise Swings & Uncorrelated Assets.
+Smart Market Analyst V3 - Clean Trend-Aligned Signal Engine.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _env_float(name: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
 
-MIN_SCORE = _env_float("MIN_SCORE", 65.0)
+MIN_SCORE = _env_float("MIN_SCORE", 60.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
@@ -43,9 +43,6 @@ MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 6.0)
 MIN_CANDLES = 100
 FEE_PCT = _env_float("FEE_PCT", 0.06)
 WATCH_MIN = 60
-STRUCT_CAP = 70
-MSS_MAX_DELAY = 8
-MSS_MIN_BODY = 0.8
 MAX_DATA_AGE_MINUTES = 30
 
 TF_MAP: Dict[str, Tuple[str, int]] = {
@@ -55,13 +52,10 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
     "4h": ("hour4", 14400),
 }
 
-TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
-TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
-
 class ScanError(Exception):
     """Recoverable error for a single symbol / request."""
 # --------------------------------------------------------------------------
-# Part 2/5: Network Requests, Candle Freshness & Momentum Indicators
+# Part 2/5: Network Requests & Indicators
 # --------------------------------------------------------------------------
 _last_req = 0.0
 
@@ -189,7 +183,7 @@ def calculate_macd(closes: List[float]) -> Tuple[float, float]:
     ema26 = sum(closes[-26:]) / 26.0
     return (ema12 - ema26), (ema12 - ema26) * 0.9
 # --------------------------------------------------------------------------
-# Part 3/5: Structure, Precise Swing Limit Entry & Fee-Adjusted RR
+# Part 3/5: Structure, Swings & Guaranteed Limit Pricing
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -220,25 +214,6 @@ def find_swings(h: List[float], l: List[float], n: int = 3) -> Tuple[List[Tuple[
         if all(l[i] < l[i - k] for k in range(1, n + 1)) and all(l[i] <= l[i + k] for k in range(1, n + 1)):
             lows.append((i, l[i]))
     return highs, lows
-
-def calculate_fib_levels(swing_high: float, swing_low: float, direction: str) -> Dict[str, float]:
-    diff = abs(swing_high - swing_low)
-    if diff <= 0: return {}
-    if direction == 'LONG':
-        return {"fib_500": swing_high - (diff * 0.5), "fib_618": swing_high - (diff * 0.618), "fib_786": swing_high - (diff * 0.786)}
-    else:
-        return {"fib_500": swing_low + (diff * 0.5), "fib_618": swing_low + (diff * 0.618), "fib_786": swing_low + (diff * 0.786)}
-
-def check_fib_confluence(entry: float, swings_h: List[Tuple[int, float]], swings_l: List[Tuple[int, float]], side: str, atr_val: float) -> Tuple[bool, str]:
-    if not swings_h or not swings_l: return False, "بدون سویگ معتبر"
-    fibs = calculate_fib_levels(max([p[1] for p in swings_h[-5:]]), min([p[1] for p in swings_l[-5:]]), side)
-    if not fibs: return False, "محاسبه فیبو مقدور نیست"
-    tol = 0.6 * atr_val
-    if min(fibs["fib_618"], fibs["fib_786"]) - tol <= entry <= max(fibs["fib_618"], fibs["fib_786"]) + tol:
-        return True, "انطباق عالی با محدوده طلایی فیبو (0.618 - 0.786)"
-    elif abs(entry - fibs["fib_500"]) <= tol:
-        return True, "انطباق با سطح اصلاحی 0.5 فیبو"
-    return False, "خارج از محدوده طلایی فیبو"
 
 def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]]) -> int:
     if len(highs) < 2 or len(lows) < 2: return 0
@@ -296,84 +271,60 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
 
 def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     highs, lows = find_swings(cs.h, cs.l, n=3)
-    current_close = cs.c[-1]
+    current_close = entry_price if entry_price > 0 else cs.c[-1]
     
     if direction == 'LONG':
+        # برای لانگ، ورود باید پایین‌تر از قیمت بازار باشد (روی حمایت یا سویگ کف پایین‌تر)
         valid_lows = [p[1] for p in lows if p[1] < current_close]
-        entry = max(valid_lows[-3:]) if valid_lows else min(cs.l[-20:])
-        sl = entry * 0.96
+        entry = min(valid_lows[-3:]) if valid_lows else min(cs.l[-15:])
+        if entry >= current_close:
+            entry = current_close * 0.992
+        sl = entry * 0.965
         risk = entry - sl
-        tp1 = entry + (risk * 1.6)
-        tp2 = entry + (risk * 2.8)
+        tp1 = entry + (risk * 1.5)
+        tp2 = entry + (risk * 2.5)
     else:
+        # برای شورت، ورود باید بالاتر از قیمت بازار باشد (روی مقاومت یا سویگ سقف بالاتر)
         valid_highs = [p[1] for p in highs if p[1] > current_close]
-        entry = min(valid_highs[-3:]) if valid_highs else max(cs.h[-20:])
-        sl = entry * 1.04
+        entry = max(valid_highs[-3:]) if valid_highs else max(cs.h[-15:])
+        if entry <= current_close:
+            entry = current_close * 1.008
+        sl = entry * 1.035
         risk = sl - entry
-        tp1 = entry - (risk * 1.6)
-        tp2 = entry - (risk * 2.8)
+        tp1 = entry - (risk * 1.5)
+        tp2 = entry - (risk * 2.5)
         
     return validate_and_correct_trade_plan(direction, entry, sl, tp1, tp2)
 # --------------------------------------------------------------------------
-# Part 4/5: Scenario Evaluation & Strict Trend Gate Veto Engine
+# Part 4/5: Strict Trend Alignment Engine
 # --------------------------------------------------------------------------
-def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
-    cs, n, a = d["cs"], len(d["cs"]), d["atr"]
-    long = side == "LONG"
-    pts = [p for p in (d["lows"] if long else d["highs"]) if p[0] >= n - 150]
-    for j in range(n - 1, max(n - 1 - lookback, 2), -1):
-        for si, lvl in reversed(pts):
-            if si >= j - 1: continue
-            ok = (cs.l[j] < lvl - 0.03 * a and cs.c[j] > lvl) if long else (cs.h[j] > lvl + 0.03 * a and cs.c[j] < lvl)
-            if ok: return {"idx": j, "level": lvl, "tf": d["name"]}
-    return None
-
-def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    cs, a, j = d["cs"], d["atr"], sweep["idx"]
-    end = min(len(cs), j + MSS_MAX_DELAY + 1)
-    prior = [p for p in (d["highs"] if side == "LONG" else d["lows"]) if p[0] < j]
-    if not prior: return None
-    lvl = prior[-1][1]
-    for k in range(j, end):
-        if side == "LONG" and cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
-            return {"idx": k, "level": lvl, "tf": d["name"]}
-        elif side == "SHORT" and cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
-            return {"idx": k, "level": lvl, "tf": d["name"]}
-    return None
-
 def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
     long = side == "LONG"
     d4, d1, d15 = D["4h"], D["1h"], D["15m"]
     notes, blockers, soft, parts = [], [], [], {}
 
-    # 🛑 فیلتر آهنین جهت روند (Trend Gate Veto): جلوگیری قطعی از لانگ در روند نزولی یا شورت در صعودی
+    # فیلتر جهت روند: اگر روند ۴ ساعته نزولی است، لانگ ممنوع! اگر صعودی است، شورت ممنوع!
     if long and d4["trend"] == "DOWN":
-        blockers.append("روند 4H نزولی است (وتو شدن قطعی پوزیشن لانگ)")
+        blockers.append("روند 4H نزولی است (اجازه معامله خرید وجود ندارد)")
     elif not long and d4["trend"] == "UP":
-        blockers.append("روند 4H صعودی است (وتو شدن قطعی پوزیشن شورت)")
-
-    sw15 = detect_sweep(d15, side, 12)
-    sw5 = detect_sweep(D["5m"], side, 24)
-    structure_ok = bool((sw15 and detect_mss(d15, side, sw15)) or (sw5 and detect_mss(D["5m"], side, sw5)))
+        blockers.append("روند 4H صعودی است (اجازه معامله فروش وجود ندارد)")
 
     rsi, (macd_v, macd_s) = d15["rsi"], d15["macd"]
+    # بررسی مومنتوم متناسب با جهت پوزیشن
     momentum_ok = (long and rsi > 50 and macd_v > macd_s) or (not long and rsi < 50 and macd_v < macd_s)
-    parts["momentum"] = 15.0 if momentum_ok else 5.0
-    if momentum_ok: notes.append("⚡ هم‌جهتی مثبت مومنتوم (RSI و MACD)")
-    else: notes.append("⚠️ مومنتوم ضعیف/خلاف جهت")
+    parts["momentum"] = 15.0 if momentum_ok else 8.0
+    if momentum_ok:
+        notes.append("⚡ هم‌جهتی کامل مومنتوم (%s)" % ("صعودی" if long else "نزولی"))
+    else:
+        notes.append("⚠️ مومنتوم خنثی/ضعیف")
 
     v_ratio = d15["vol_ratio"]
-    parts["volume"] = 15.0 if v_ratio >= 1.2 else (10.0 if v_ratio >= 0.8 else 3.0)
-    if v_ratio >= 1.2: notes.append("📈 تایید حجم معاملات ایده‌آل")
-    else: soft.append("حجم معاملات ضعیف است")
+    parts["volume"] = 15.0 if v_ratio >= 1.0 else 8.0
+    if v_ratio >= 1.0: notes.append("📈 تایید حجم معاملات بازار")
+    else: soft.append("حجم معاملات پایین است")
 
-    parts["htf"] = (12 if d4["trend"] == ("UP" if long else "DOWN") else 2)
-    parts["zone"], parts["room"], parts["rr"] = 10.0, 5.0, 10.0
-
-    swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
-    fib_ok, fib_note = check_fib_confluence(price, swings_h, swings_l, side, d15["atr"])
-    parts["fibonacci"] = 10.0 if fib_ok else 2.0
-    if fib_ok: notes.append("📐 " + fib_note)
+    parts["htf"] = (15 if d4["trend"] == ("UP" if long else "DOWN") else 5)
+    parts["zone"], parts["room"], parts["rr"] = 15.0, 10.0, 20.0
 
     validated_plan = calculate_levels_and_targets(d15["cs"], direction=side, entry_price=price)
     if validated_plan["Validator_Errors"]:
@@ -383,25 +334,17 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 
     score = max(0, min(100, int(round(sum(parts.values())))))
     if blockers:
-        score = min(score, 45) # افت امتیاز شدید در صورت وجود وتوی روند یا خطای ساختاری
+        score = min(score, 30) # افت امتیاز شدید در صورت مغایرت با روند
 
     return {
         "side": side, "score": score, "parts": parts, "notes": notes,
         "blockers": blockers, "soft_blockers": soft, "trade": validated_plan if not validated_plan["Validator_Errors"] else None,
-        "structure_ok": structure_ok, "debug_plan": validated_plan
+        "structure_ok": not blockers, "debug_plan": validated_plan
     }
 # --------------------------------------------------------------------------
-# Part 5/5: Clean Telegram Format, Analysis & Safe Reporting
+# Part 5/5: Telegram Report & Main Execution
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
-
-def classify_decision(score: float, structure_ok: bool, blockers: List[str], min_score: float) -> str:
-    has_critical = any("وتو" in b or "روند" in b or "حد ضرر" in b for b in blockers)
-    if score >= 80 and structure_ok and not has_critical and not blockers:
-        return "ENTER"
-    elif score >= min_score and not has_critical:
-        return "CONDITIONAL"
-    return "NO_ENTRY"
 
 def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
     D = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
@@ -410,14 +353,20 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
     age_min = (time.time() - latest_ts) / 60.0
     is_stale = age_min > MAX_DATA_AGE_MINUTES
 
-    scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
-    best_sc = max(scenarios.values(), key=lambda x: x["score"])
-    
-    if is_stale:
-        best_sc["blockers"].append("داده‌های بازار قدیمی هستند (تاخیر > ۳۰ دقیقه)")
-        decision = "NO_ENTRY"
+    # تشخیص اتوماتیک جهت بر اساس روند ۴ ساعته
+    trend_4h = D["4h"]["trend"]
+    if trend_4h == "DOWN":
+        primary_side = "SHORT"
+    elif trend_4h == "UP":
+        primary_side = "LONG"
     else:
-        decision = classify_decision(best_sc["score"], best_sc["structure_ok"], best_sc["blockers"], min_score)
+        # اگر بازار رنج بود، جهت را با توجه به مومنتوم لحظه‌ای انتخاب کن
+        primary_side = "LONG" if D["15m"]["rsi"] >= 50 else "SHORT"
+
+    scenarios = {primary_side: evaluate_side(primary_side, D, price)}
+    best_sc = scenarios[primary_side]
+    
+    decision = "ENTER" if (best_sc["score"] >= min_score and not best_sc["blockers"]) else "NO_ENTRY"
 
     return {
         "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
@@ -439,7 +388,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     sc = res["best_sc"]
     dbg = sc.get("debug_plan", {})
     symbol_clean = res["symbol"].replace("_", "")
-    side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
+    side_fa = "شورت (فروش)" if sc["side"] == "SHORT" else "لانگ (خرید)"
     
     lines = [
         "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
@@ -453,7 +402,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "2️⃣ %s" % fmt_price(dbg.get("TP2", 0)),
         "حد ضرر: %s" % fmt_price(dbg.get("SL", 0)),
         "",
-        "📊 **تحلیل و دلایل فنی ربات:**",
+        "📊 **تحلیل فنی ربات:**",
         "• امتیاز کیفیت ستاپ: %d/100" % sc["score"],
     ]
     
