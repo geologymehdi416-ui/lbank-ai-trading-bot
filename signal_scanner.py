@@ -40,7 +40,7 @@ MIN_SCORE = _env_float("MIN_SCORE", 65.0)
 RISK_PCT = _env_float("RISK_PCT", 0.5)
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
-MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 4.0)
+MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 6.0) # افزایش سقف حد ضرر برای جلوگیری از خطای مسدودی
 MIN_CANDLES = 100
 FEE_PCT = _env_float("FEE_PCT", 0.06)
 WATCH_MIN = 60
@@ -300,7 +300,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     current_close = cs.c[-1]
     
     if direction == 'LONG':
-        # نقطه زنی لانگ روی معتبرترین حمایت (پایین‌ترین سویگ یا کف اخیر)
         valid_lows = [p[1] for p in lows if p[1] < current_close]
         entry = max(valid_lows[-3:]) if valid_lows else min(cs.l[-20:])
         sl = entry * 0.96
@@ -308,7 +307,6 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         tp1 = entry + (risk * 1.6)
         tp2 = entry + (risk * 2.8)
     else:
-        # نقطه زنی شورت دقیقاً روی معتبرترین مقاومت و سقف‌های سویگ (مثل الگوی AGT)
         valid_highs = [p[1] for p in highs if p[1] > current_close]
         entry = min(valid_highs[-3:]) if valid_highs else max(cs.h[-20:])
         sl = entry * 1.04
@@ -357,10 +355,11 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     momentum_ok = (long and rsi > 50 and macd_v > macd_s) or (not long and rsi < 50 and macd_v < macd_s)
     parts["momentum"] = 15.0 if momentum_ok else 5.0
     if momentum_ok: notes.append("⚡ هم‌جهتی مثبت RSI و MACD")
+    else: notes.append("⚠️ مومنتوم ضعیف/خلاف جهت")
 
     v_ratio = d15["vol_ratio"]
     parts["volume"] = 15.0 if v_ratio >= 1.2 else (10.0 if v_ratio >= 0.8 else 3.0)
-    if v_ratio >= 1.2: notes.append("📈 حجم معاملات ایده‌آل")
+    if v_ratio >= 1.2: notes.append("📈 حجم معاملات ایده‌آل و تایید شده")
     else: soft.append("حجم معاملات ضعیف است")
 
     continuation = (not long and d1["trend"] == "DOWN" and v_ratio >= 1.2 and structure_ok)
@@ -391,7 +390,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         "structure_ok": structure_ok or continuation, "debug_plan": validated_plan
     }
 # --------------------------------------------------------------------------
-# Part 5/5: Clean Telegram Format & Safe Reporting (Non-Empty)
+# Part 5/5: Clean Telegram Format, Analysis & Safe Reporting
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
@@ -441,6 +440,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     symbol_clean = res["symbol"].replace("_", "")
     side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
     
+    # ساختار گزارش همراه با اطلاعات تحلیلی و دلایل فنی
     lines = [
         "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
         "",
@@ -452,9 +452,18 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "اهداف: 1️⃣ %s" % fmt_price(dbg.get("TP1", 0)),
         "2️⃣ %s" % fmt_price(dbg.get("TP2", 0)),
         "حد ضرر: %s" % fmt_price(dbg.get("SL", 0)),
+        "",
+        "📊 **تحلیل و دلایل فنی ربات:**",
+        "• امتیاز کیفیت ستاپ: %d/100" % sc["score"],
     ]
+    
+    # اضافه کردن یادداشت‌ها و تحلیل‌های انجام شده به پیام
+    for note in sc.get("notes", []):
+        lines.append("• %s" % note)
+        
     if sc["blockers"]:
         lines.append("❌ علت رد: " + sc["blockers"][0])
+        
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], min_score: float) -> str:
@@ -463,7 +472,6 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], 
     lines = []
     
     if not shown and not errors:
-        # جلوگیری از خالی شدن فایل report.txt در گیت‌هاب اکشنز
         lines.append("⏳ اسکن بازار — %s" % now)
         lines.append("در این چرخه، فرصت معاملاتی باکیفیتی با امتیاز ≥ %d یافت نشد." % WATCH_MIN)
     else:
