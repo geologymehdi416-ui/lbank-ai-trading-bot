@@ -3,7 +3,7 @@
 """
 signal_scanner.py (Part 1/5)
 -----------------
-Smart Market Analyst V3 - 3-Tier Decision Engine, Fee-Adjusted RR & Major/Uncorrelated Assets.
+Smart Market Analyst V3 - Strict Trend Gate, Precise Swings & Uncorrelated Assets.
 """
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger("signal_scanner")
 
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-# واچ‌لیست جامع شامل بیت‌کوین، اتریوم و سایر ارزهای کلیدی و مستقل
 DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,TRX_USDT,XMR_USDT,"
                    "NEAR_USDT,ATOM_USDT,BCH_USDT,DOGE_USDT,LINK_USDT,FIL_USDT")
 
@@ -316,7 +315,7 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
         
     return validate_and_correct_trade_plan(direction, entry, sl, tp1, tp2)
 # --------------------------------------------------------------------------
-# Part 4/5: Scenario Evaluation & Blocker Consistency Engine
+# Part 4/5: Scenario Evaluation & Strict Trend Gate Veto Engine
 # --------------------------------------------------------------------------
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[str, Any]]:
     cs, n, a = d["cs"], len(d["cs"]), d["atr"]
@@ -347,6 +346,12 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     d4, d1, d15 = D["4h"], D["1h"], D["15m"]
     notes, blockers, soft, parts = [], [], [], {}
 
+    # 🛑 فیلتر آهنین جهت روند (Trend Gate Veto): جلوگیری قطعی از لانگ در روند نزولی یا شورت در صعودی
+    if long and d4["trend"] == "DOWN":
+        blockers.append("روند 4H نزولی است (وتو شدن قطعی پوزیشن لانگ)")
+    elif not long and d4["trend"] == "UP":
+        blockers.append("روند 4H صعودی است (وتو شدن قطعی پوزیشن شورت)")
+
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(D["5m"], side, 24)
     structure_ok = bool((sw15 and detect_mss(d15, side, sw15)) or (sw5 and detect_mss(D["5m"], side, sw5)))
@@ -354,20 +359,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     rsi, (macd_v, macd_s) = d15["rsi"], d15["macd"]
     momentum_ok = (long and rsi > 50 and macd_v > macd_s) or (not long and rsi < 50 and macd_v < macd_s)
     parts["momentum"] = 15.0 if momentum_ok else 5.0
-    if momentum_ok: notes.append("⚡ هم‌جهتی مثبت RSI و MACD")
+    if momentum_ok: notes.append("⚡ هم‌جهتی مثبت مومنتوم (RSI و MACD)")
     else: notes.append("⚠️ مومنتوم ضعیف/خلاف جهت")
 
     v_ratio = d15["vol_ratio"]
     parts["volume"] = 15.0 if v_ratio >= 1.2 else (10.0 if v_ratio >= 0.8 else 3.0)
-    if v_ratio >= 1.2: notes.append("📈 حجم معاملات ایده‌آل و تایید شده")
+    if v_ratio >= 1.2: notes.append("📈 تایید حجم معاملات ایده‌آل")
     else: soft.append("حجم معاملات ضعیف است")
 
-    continuation = (not long and d1["trend"] == "DOWN" and v_ratio >= 1.2 and structure_ok)
-
-    if long and d4["trend"] == "DOWN": blockers.append("روند 4H نزولی است")
-    elif not long and d4["trend"] == "UP" and not continuation: blockers.append("روند 4H صعودی است")
-
-    parts["htf"] = (12 if d4["trend"] == ("UP" if long else "DOWN") else 5)
+    parts["htf"] = (12 if d4["trend"] == ("UP" if long else "DOWN") else 2)
     parts["zone"], parts["room"], parts["rr"] = 10.0, 5.0, 10.0
 
     swings_h, swings_l = find_swings(d15["cs"].h, d15["cs"].l, n=3)
@@ -382,12 +382,13 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         blockers.append("RR خالص کمتر از حد نصاب است")
 
     score = max(0, min(100, int(round(sum(parts.values())))))
-    if continuation: score = max(score, 75)
+    if blockers:
+        score = min(score, 45) # افت امتیاز شدید در صورت وجود وتوی روند یا خطای ساختاری
 
     return {
         "side": side, "score": score, "parts": parts, "notes": notes,
         "blockers": blockers, "soft_blockers": soft, "trade": validated_plan if not validated_plan["Validator_Errors"] else None,
-        "structure_ok": structure_ok or continuation, "debug_plan": validated_plan
+        "structure_ok": structure_ok, "debug_plan": validated_plan
     }
 # --------------------------------------------------------------------------
 # Part 5/5: Clean Telegram Format, Analysis & Safe Reporting
@@ -395,7 +396,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 def classify_decision(score: float, structure_ok: bool, blockers: List[str], min_score: float) -> str:
-    has_critical = any("حد ضرر" in b or "روند" in b for b in blockers)
+    has_critical = any("وتو" in b or "روند" in b or "حد ضرر" in b for b in blockers)
     if score >= 80 and structure_ok and not has_critical and not blockers:
         return "ENTER"
     elif score >= min_score and not has_critical:
