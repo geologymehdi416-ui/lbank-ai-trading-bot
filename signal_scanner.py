@@ -383,7 +383,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         "structure_ok": structure_ok or continuation, "debug_plan": validated_plan
     }
 # --------------------------------------------------------------------------
-# Part 5/5: Unified Thresholds, Freshness Audit & Final Reporting
+# Part 5/5: Clean Telegram Format & Final Reporting
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
@@ -430,50 +430,36 @@ def fmt_price(p: float) -> str:
 def format_brief(res: Dict[str, Any]) -> List[str]:
     sc = res["best_sc"]
     dbg = sc.get("debug_plan", {})
-    dec = res["decision"]
     symbol_clean = res["symbol"].replace("_", "")
-    side_fa = "لانگ (LONG)" if sc["side"] == "LONG" else "شورت (SHORT)"
+    side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
     
+    # قالب کاملاً مینیمال، منظم و دقیق مشابه نمونه شما
     lines = [
-        "⏳ <b>سفارش لیمیت در انتظار رسیدن قیمت</b>",
+        "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
         "",
-        "شناسه معامله: <code>TR-%s</code>" % datetime.now(IRAN_TZ).strftime("%H%M%S"),
-        "نماد: <code>%s</code> | جهت: <b>%s</b>" % (html.escape(symbol_clean), side_fa),
-        "امتیاز ارزیابی: <b>%d/100</b> | تصمیم: <b>%s</b>" % (sc["score"], dec),
-        "",
-        "🔹 <b>ورود لیمیت:</b> <code>%s</code>" % fmt_price(dbg.get("Entry", 0)),
-        "⚡ <b>اهرم پیشنهادی:</b> <code>2x (پویا)</code>",
-        "🎯 <b>اهداف (Targets):</b>",
-        "1️⃣ <code>%s</code> (Net RR1: <b>%.2f</b>)" % (fmt_price(dbg.get("TP1", 0)), dbg.get("Net_RR1", 0)),
-        "2️⃣ <code>%s</code> (Net RR2: <b>%.2f</b>)" % (fmt_price(dbg.get("TP2", 0)), dbg.get("Net_RR2", 0)),
-        "",
-        "🛑 <b>حد ضرر (SL):</b> <code>%s</code> (ریسک: %.2f%%)" % (fmt_price(dbg.get("SL", 0)), dbg.get("Risk_Pct", 0)),
+        "شناسه معامله: TR-%s" % datetime.now(IRAN_TZ).strftime("%H%M%S"),
+        "نماد: %s" % symbol_clean,
+        "جهت: %s" % side_fa,
+        "ورود لیمیت: %s" % fmt_price(dbg.get("Entry", 0)),
+        "اهرم: 5x",
+        "اهداف: 1️⃣ %s" % fmt_price(dbg.get("TP1", 0)),
+        "2️⃣ %s" % fmt_price(dbg.get("TP2", 0)),
+        "حد ضرر: %s" % fmt_price(dbg.get("SL", 0)),
     ]
-    if sc["blockers"] or sc["soft_blockers"]:
-        lines.append("❌ <b>علت مسدودسازی:</b> " + html.escape(" | ".join(sc["blockers"] + sc["soft_blockers"][:1])))
+    if sc["blockers"]:
+        lines.append("❌ علت رد: " + sc["blockers"][0])
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], min_score: float) -> str:
-    now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
-    sigs = [r for r in results if r["decision"] == "ENTER"]
-    lines = ["📊 <b>گزارش Smart Market Analyst V3</b> — %s" % now]
-    lines.append("🎯 سیگنال‌های قطعی ورود (ENTER): %d" % len(sigs))
+    shown = [r for r in results if r["best_sc"]["score"] >= WATCH_MIN][:8]
+    lines = []
     
-    top = sorted(results, key=lambda r: -r["best_sc"]["score"])
-    shown = [r for r in top if r["best_sc"]["score"] >= WATCH_MIN][:8]
-    
-    if shown:
-        lines.append("")
-        lines.append("🧭 <b>واچ‌لیست ارزیابی‌شده (امتیاز ≥ %d الخصوص ارزهای مستقل)</b>" % WATCH_MIN)
-        for r in shown:
-            lines.append("")
-            lines.extend(format_brief(r))
-            lines.append("-" * 30)
+    for r in shown:
+        lines.extend(format_brief(r))
+        lines.append("-" * 25)
             
     for sym, err in errors:
-        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
-    lines.append("")
-    lines.append("حداقل امتیاز استاندارد: %.0f | ثبت عملکرد و کنترل تازگی فعال" % min_score)
+        lines.append("❗ %s: %s" % (sym, err[:100]))
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
