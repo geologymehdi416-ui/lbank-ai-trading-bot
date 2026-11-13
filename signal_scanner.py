@@ -190,7 +190,7 @@ def calculate_macd(closes: List[float]) -> Tuple[float, float]:
     ema26 = sum(closes[-26:]) / 26.0
     return (ema12 - ema26), (ema12 - ema26) * 0.9
 # --------------------------------------------------------------------------
-# Part 3/5: Structure, Precision Limit Entry & Fee-Adjusted RR
+# Part 3/5: Structure, Precise Swing Limit Entry & Fee-Adjusted RR
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -296,24 +296,22 @@ def validate_and_correct_trade_plan(direction: str, entry: float, sl: float, tp1
     }
 
 def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
-    highs_raw, lows_raw = cs.h[-60:], cs.l[-60:]
-    structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
-    structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
+    highs, lows = find_swings(cs.h, cs.l, n=3)
     current_close = cs.c[-1]
     
     if direction == 'LONG':
-        # برای لانگ: ورود لیمیت همیشه پایین‌تر از قیمت فعلی (روی حمایت / کف‌های اخیر)
-        recent_low = min(cs.l[-10:])
-        entry = min(current_close * 0.998, recent_low * 1.001)
-        sl = min(structural_low * 0.992, entry * 0.985)
+        # نقطه زنی لانگ روی معتبرترین حمایت (پایین‌ترین سویگ یا کف اخیر)
+        valid_lows = [p[1] for p in lows if p[1] < current_close]
+        entry = max(valid_lows[-3:]) if valid_lows else min(cs.l[-20:])
+        sl = entry * 0.96
         risk = entry - sl
         tp1 = entry + (risk * 1.6)
         tp2 = entry + (risk * 2.8)
     else:
-        # برای شورت: ورود لیمیت همیشه بالاتر از قیمت فعلی (روی مقاومت / سویگ بالا)
-        recent_high = max(cs.h[-10:])
-        entry = max(current_close * 1.002, recent_high * 0.999)
-        sl = max(structural_high * 1.008, entry * 1.015)
+        # نقطه زنی شورت دقیقاً روی معتبرترین مقاومت و سقف‌های سویگ (مثل الگوی AGT)
+        valid_highs = [p[1] for p in highs if p[1] > current_close]
+        entry = min(valid_highs[-3:]) if valid_highs else max(cs.h[-20:])
+        sl = entry * 1.04
         risk = sl - entry
         tp1 = entry - (risk * 1.6)
         tp2 = entry - (risk * 2.8)
