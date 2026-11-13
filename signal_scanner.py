@@ -190,7 +190,7 @@ def calculate_macd(closes: List[float]) -> Tuple[float, float]:
     ema26 = sum(closes[-26:]) / 26.0
     return (ema12 - ema26), (ema12 - ema26) * 0.9
 # --------------------------------------------------------------------------
-# Part 3/5: Structure, Fee-Adjusted RR Calibration & Trade Planning
+# Part 3/5: Structure, Precision Limit Entry & Fee-Adjusted RR
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -299,16 +299,22 @@ def calculate_levels_and_targets(cs: Candles, direction='LONG', entry_price=0):
     highs_raw, lows_raw = cs.h[-60:], cs.l[-60:]
     structural_low = min(lows_raw) if lows_raw else entry_price * 0.99
     structural_high = max(highs_raw) if highs_raw else entry_price * 1.01
+    current_close = cs.c[-1]
     
     if direction == 'LONG':
+        entry = min(entry_price, current_close) * 0.998
         sl = structural_low * 0.992
-        risk = entry_price - sl
-        tp1, tp2 = entry_price + (risk * 1.6), entry_price + (risk * 2.8)
+        risk = entry - sl
+        tp1, tp2 = entry + (risk * 1.6), entry + (risk * 2.8)
     else:
-        sl = structural_high * 1.008
-        risk = sl - entry_price
-        tp1, tp2 = entry_price - (risk * 1.6), entry_price - (risk * 2.8)
-    return validate_and_correct_trade_plan(direction, entry_price, sl, tp1, tp2)
+        # برای شورت: ورود لیمیت همیشه بالاتر از قیمت فعلی (روی مقاومت/سویگ بالا)
+        recent_high = max(cs.h[-10:])
+        entry = max(current_close * 1.002, recent_high * 0.999)
+        sl = max(structural_high * 1.008, entry * 1.015)
+        risk = sl - entry
+        tp1, tp2 = entry - (risk * 1.6), entry - (risk * 2.8)
+        
+    return validate_and_correct_trade_plan(direction, entry, sl, tp1, tp2)
 # --------------------------------------------------------------------------
 # Part 4/5: Scenario Evaluation & Blocker Consistency Engine
 # --------------------------------------------------------------------------
@@ -433,7 +439,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     symbol_clean = res["symbol"].replace("_", "")
     side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
     
-    # قالب کاملاً مینیمال، منظم و دقیق مشابه نمونه شما
+    # قالب کاملاً مینیمال، منظم و دقیق مشابه نمونه دلخواه شما
     lines = [
         "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
         "",
