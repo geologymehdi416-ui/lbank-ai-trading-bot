@@ -391,7 +391,7 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         "structure_ok": structure_ok or continuation, "debug_plan": validated_plan
     }
 # --------------------------------------------------------------------------
-# Part 5/5: Clean Telegram Format & Final Reporting
+# Part 5/5: Clean Telegram Format & Safe Reporting (Non-Empty)
 # --------------------------------------------------------------------------
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
@@ -441,7 +441,6 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     symbol_clean = res["symbol"].replace("_", "")
     side_fa = "شورت" if sc["side"] == "SHORT" else "لانگ"
     
-    # قالب کاملاً مینیمال، منظم و دقیق مشابه نمونه دلخواه شما
     lines = [
         "⏳ سفارش لیمیت در انتظار رسیدن قیمت",
         "",
@@ -459,15 +458,22 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     return lines
 
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], min_score: float) -> str:
+    now = datetime.now(IRAN_TZ).strftime("%Y-%m-%d %H:%M (به وقت ایران)")
     shown = [r for r in results if r["best_sc"]["score"] >= WATCH_MIN][:8]
     lines = []
     
-    for r in shown:
-        lines.extend(format_brief(r))
-        lines.append("-" * 25)
+    if not shown and not errors:
+        # جلوگیری از خالی شدن فایل report.txt در گیت‌هاب اکشنز
+        lines.append("⏳ اسکن بازار — %s" % now)
+        lines.append("در این چرخه، فرصت معاملاتی باکیفیتی با امتیاز ≥ %d یافت نشد." % WATCH_MIN)
+    else:
+        for r in shown:
+            lines.extend(format_brief(r))
+            lines.append("-" * 25)
+                
+        for sym, err in errors:
+            lines.append("❗ %s: %s" % (sym, err[:100]))
             
-    for sym, err in errors:
-        lines.append("❗ %s: %s" % (sym, err[:100]))
     return "\n".join(lines)
 
 def main(argv: Optional[List[str]] = None) -> int:
