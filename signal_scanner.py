@@ -1246,6 +1246,9 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
              side_word, fmt_price(entry), BREAKOUT_MIN_VOL) if entry is not None else "—",
          "invalidation": "کندل 15m بسته‌شده %s %s (حد ضرر)" % (
              "بالای" if short else "زیر", fmt_price(sl)) if sl is not None else "—"}
+    if entry is not None and ((short and entry > price) or ((not short) and entry < price)):
+        f["confirmation"] = "پولبک به %s و رد سطح با کندل 15m هم‌جهت و حجم ≥ %.1f× میانگین" % (
+            fmt_price(entry), BREAKOUT_MIN_VOL)
     return f
 
 
