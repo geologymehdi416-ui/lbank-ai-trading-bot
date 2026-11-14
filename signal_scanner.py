@@ -1093,7 +1093,8 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
     }
     if not signal and not gb:
         cands = [s for s in scenarios.values()
-                 if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN]
+                 if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN
+                 and (s["trade"]["rr2n"] or 0.0) >= 1.5]
         if cands:
             res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
     return res
@@ -1249,6 +1250,15 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
     if entry is not None and ((short and entry > price) or ((not short) and entry < price)):
         f["confirmation"] = "پولبک به %s و رد سطح با کندل 15m هم‌جهت و حجم ≥ %.1f× میانگین" % (
             fmt_price(entry), BREAKOUT_MIN_VOL)
+    if t is not None and t["rr1n"] < 1.0:
+        f.update({"state": "NO_TARGET", "status": "هشدار: RR خالص TP1 کمتر از ۱ — ورود پیشنهاد نمی‌شود",
+                  "activation": None, "zone": None, "confirmation": "—", "invalidation": "—"})
+    if t is not None and (t["tp2"] is None or t["rr2n"] is None or t["rr2n"] < 1.5):
+        f["tp2"] = None
+        f["rr2"] = None
+    if t is not None and ((not short and price >= t["tp1"]) or (short and price <= t["tp1"])):
+        f.update({"state": "EXPIRED", "status": "تارگت اول لمس شده؛ طرح منقضی است",
+                  "activation": None, "zone": None, "confirmation": "—", "invalidation": "—"})
     return f
 
 
@@ -1327,6 +1337,23 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def btc_corr(res: Dict[str, Any], btc: Dict[str, Any], n: int = 96) -> Optional[float]:
+    """Pearson correlation of the last n 15m returns with BTC (None if not computable)."""
+    a = res["D"]["15m"]["cs"].c[-n:]
+    b = btc["D"]["15m"]["cs"].c[-n:]
+    if len(a) < n or len(b) < n:
+        return None
+    ra = [a[i] / a[i - 1] - 1.0 for i in range(1, n)]
+    rb = [b[i] / b[i - 1] - 1.0 for i in range(1, n)]
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va = sum((x - ma) ** 2 for x in ra)
+    vb = sum((y - mb) ** 2 for y in rb)
+    if va <= 0 or vb <= 0:
+        return None
+    return cov / math.sqrt(va * vb)
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
@@ -1346,6 +1373,22 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
         lines.append("🧭 <b>طرح‌ها و تحلیل (امتیاز ≥ %d)</b>" % WATCH_MIN)
         for r in shown:
             lines.append("")
+            lines.extend(format_brief(r))
+    btc = next((r for r in results if r["symbol"] == "BTC_USDT"), None)
+    indep = []
+    if btc is not None:
+        for r in top:
+            if r["signal"] or r is btc or max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) < WATCH_MIN:
+                continue
+            c = btc_corr(r, btc)
+            if c is not None and abs(c) < 0.5:
+                indep.append((r, c))
+    if indep:
+        lines.append("")
+        lines.append("🧩 <b>ارزهای مستقل از BTC (|همبستگی| کمتر از 0.5)</b>")
+        for r, c in indep[:5]:
+            lines.append("")
+            lines.append("همبستگی 15m با BTC: %.2f" % c)
             lines.extend(format_brief(r))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
