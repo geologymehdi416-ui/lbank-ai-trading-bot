@@ -1,0 +1,24 @@
+import sys
+p = sys.argv[1] if len(sys.argv) > 1 else "signal_scanner.py"
+s = open(p, encoding="utf-8").read()
+def rep(old, new):
+    global s
+    n = s.count(old)
+    if n != 1:
+        sys.exit("ANCHOR NOT FOUND ONCE (%d): %s" % (n, old[:70]))
+    s = s.replace(old, new, 1)
+rep('MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)',
+    'MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)\n'
+    'CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting')
+rep('        state, label = "WAIT_CONFIRM", "منتظر تأیید: " + (c["missing"][0] if c["missing"] else "کندل و حجم")',
+    '        if t["rr1n"] < CONDITIONAL_MIN_RR:\n'
+    '            state, label = "NO_TARGET", "تارگت نزدیک است (RR خالص TP1 کمتر از %.1f)" % CONDITIONAL_MIN_RR\n'
+    '        else:\n'
+    '            state, label = "WAIT_CONFIRM", "منتظر تأیید: " + (c["missing"][0] if c["missing"] else "کندل و حجم")')
+rep('    if read:\n        lines.append("تحلیل: " + html.escape(" | ".join(read)))',
+    '    lines.insert(1, "قیمت لحظه‌ای: %s" % fmt_price(res["price"]))\n'
+    '    if read:\n        lines.append("تحلیل: " + html.escape(" | ".join(read)))')
+rep('    fp = fib_plan(D, side_key, res["price"])\n    if fp:',
+    '    fp = fib_plan(D, side_key, res["price"]) if p["trade"] is None else None\n    if fp:')
+open(p, "w", encoding="utf-8").write(s)
+print("patched:", p)
