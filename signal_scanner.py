@@ -58,7 +58,8 @@ log = logging.getLogger("signal_scanner")
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
 DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
                    "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,TON_USDT,"
-                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT")
+                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT,"
+                   "TRX_USDT,HBAR_USDT,ICP_USDT,FIL_USDT,ETC_USDT,XLM_USDT,ALGO_USDT,EOS_USDT,AGT_USDT,AKE_USDT")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1380,7 +1381,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     indep = []
     if btc is not None:
         for r in top:
-            if r["signal"] or r is btc or max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) < WATCH_MIN:
+            if r["signal"] or r is btc or any(r is x for x in shown) or max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) < WATCH_MIN:
                 continue
             c = btc_corr(r, btc)
             if c is not None and abs(c) < 0.5:
