@@ -8,13 +8,13 @@ Analysis-only crypto futures signal scanner (NO order execution).
 Pipeline per symbol:
   1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
   2. Higher-timeframe STRUCTURE trend (HH/HL, LH/LL, CHoCH); ATR and volume
-     are used only as market filters. Price action is the primary method.
+     are used only as market filters. No EMA/RSI/MACD (pure price action).
   3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
   5. Build Entry / SL / TP1 / TP2 / RR; signal only if score >= MIN_SCORE and
-     all risk gates pass (5m structure and momentum included).
-  6. Send main report (signals or NO TRADE, with entry/SL/TP and coin read) to Telegram.
+     all risk gates pass.
+  6. Send scan report + signals to Telegram.
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
@@ -27,24 +27,10 @@ Environment variables:
   REQUEST_INTERVAL   min seconds between API calls, default 0.25
   STATE_FILE         cooldown file, default signal_state.json
   SIGNAL_COOLDOWN_H  hours before the same symbol+side is re-sent, default 4
-  FEE_PCT            taker fee per side in %, default 0.06 (set your real fee)
-  TP_MIN_RR_NET      each structural target must have net RR >= this, default 0.5
-  MAX_TP_RR          targets with net RR above this are unrealistic and skipped, default 5
-  EXPIRY_H           hours a conditional opportunity stays valid, default 4
-  TZ_OFFSET_HOURS    report time zone offset from UTC, default 3.5 (Tehran)
-  REPORT_FILE        main Telegram output (plain text), default report.txt
-  DETAILS_FILE       full analysis for local review (never sent), default details_report.txt
-  SCAN_LOG_FILE      CSV log of every scan (one row per symbol), default scan_log.csv
-  DIAG_FILE          per-gate diagnostics (text), default diag_report.txt
-  INDICATOR_FILTER   1 = indicator check can block signals; 0 (default) = diagnostics only
-  FIB_CONFIRM        1 = Fibonacci affects score/TP; 0 (default) = diagnostics only
-  SWING_MIN_AMP      0 (default, off) or a swing needs a move >= this x ATR
-  CARD_MIN_RR        display only: hide conditional cards whose TP1 net RR is below this (default 0 = all)
 
 Usage:
   python signal_scanner.py
   python signal_scanner.py --symbols BTC_USDT,ETH_USDT --dry-run
-  python signal_scanner.py --diag
 """
 from __future__ import annotations
 
@@ -109,7 +95,8 @@ MIN_CANDLES = 100
 MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
-MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)  # targets with net RR above this are unrealistic and skipped
+MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)
+CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting  # targets beyond this net RR are unrealistic for the window and skipped
 EXPIRY_H = _env_float("EXPIRY_H", 4.0)  # hours a conditional opportunity stays valid
 TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)  # each structural target must have net RR >= this
 WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
@@ -201,6 +188,8 @@ def http_json(url: str, params: Optional[Dict[str, Any]] = None,
             log.warning("%s - retry %d/%d", last_err, attempt, retries)
             time.sleep(min(2 ** attempt, 20))
     raise ScanError("request failed after %d tries (%s)" % (retries, last_err))
+
+
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
@@ -570,6 +559,8 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
         out["ssl"] = s
         out["ssl_eq"] = sum(1 for _, p in d["lows"] if abs(p - s) <= tol) >= 2
     return out
+
+
 # --------------------------------------------------------------------------
 # Scenario evaluation
 # --------------------------------------------------------------------------
@@ -824,8 +815,7 @@ def fib_plan(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Optional[
 def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
                  fee_pct: float) -> List[Tuple[float, float]]:
     """Nearest structural levels in the trade direction whose NET reward/risk is positive.
-    The second target must sit at least 0.5R beyond the first (no near-duplicate TP2).
-    Returns up to two (price, rr_net)."""
+    Returns up to two (price, rr_net). Invalid or negative-RR levels are skipped."""
     cost = 2.0 * fee_pct
     risk_pct = risk / entry * 100.0
     pool = sorted([p for p in levels if (p > entry if long else p < entry)], reverse=not long)
@@ -834,6 +824,7 @@ def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
     for p in pool:
         dist = abs(p - entry) / entry * 100.0
         rr = (dist - cost) / (risk_pct + cost)
+        # the second target must sit at least 0.5R beyond the first (no near-duplicate TP2)
         min_gap = 0.5 * risk_pct if out else 0.0
         if rr < TP_MIN_RR_NET or rr > MAX_TP_RR or dist <= last or dist < last + min_gap:
             continue
@@ -1022,6 +1013,8 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     return {"side": side, "score": score, "parts": parts, "notes": notes,
             "blockers": blockers, "soft_blockers": soft, "trade": trade,
             "zone": zone, "sweep": sweep, "fib": fib, "ind": ind, "draft": draft}
+
+
 PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
             "momentum": 10 if FIB_CONFIRM else 15, "rr": 10, "room": 5,
             "fib": FIB_PTS_OVERLAP if FIB_CONFIRM else 0}
@@ -1233,7 +1226,10 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
     elif t is None:
         state, label = "NO_TARGET", "نقطه‌ی ورود پیش‌نویس؛ تارگت معتبر ندارد"
     else:
-        state, label = "WAIT_CONFIRM", "منتظر تأیید: " + (c["missing"][0] if c["missing"] else "کندل و حجم")
+        if t["rr1n"] < CONDITIONAL_MIN_RR:
+            state, label = "NO_TARGET", "تارگت نزدیک است (RR خالص TP1 کمتر از %.1f)" % CONDITIONAL_MIN_RR
+        else:
+            state, label = "WAIT_CONFIRM", "منتظر تأیید: " + (c["missing"][0] if c["missing"] else "کندل و حجم")
     zone = None
     if sc.get("zone"):
         zone = (sc["zone"]["bottom"], sc["zone"]["top"])
@@ -1303,6 +1299,7 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
                                      TREND_ARROW[D["15m"]["trend"]]),
     ]
+    lines.insert(1, "قیمت لحظه‌ای: %s" % fmt_price(res["price"]))
     if read:
         lines.append("تحلیل: " + html.escape(" | ".join(read)))
     if p["activation"] is not None:
@@ -1319,12 +1316,14 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
         else:
             lines.append("SL: %s (%.2f%%) | TP: — (تارگت معتبر نیست)" % (f(p["sl"]), p["stop_pct"]))
     lines.append("وضعیت: %s" % html.escape(p["status"]))
-    fp = fib_plan(D, side_key, res["price"])
+    fp = fib_plan(D, side_key, res["price"]) if p["trade"] is None else None
     if fp:
         lines.append("پلن فیبو: %s" % html.escape(fp["status"]))
     if p["state"] != "READY" and p["missing"]:
         lines.append("نواقص: " + html.escape(" | ".join(p["missing"][:2])))
     return lines
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
@@ -1395,7 +1394,6 @@ def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                 html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
                 q["range_atr"], q["range_rank"] * 100.0))
         lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
-
     def _card_ok(r: Dict[str, Any]) -> bool:
         c = build_card(r)
         if c["trade"] is None or CARD_MIN_RR <= 0:
