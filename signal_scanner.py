@@ -1259,6 +1259,8 @@ def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
     if t is not None and ((not short and price >= t["tp1"]) or (short and price <= t["tp1"])):
         f.update({"state": "EXPIRED", "status": "تارگت اول لمس شده؛ طرح منقضی است",
                   "activation": None, "zone": None, "confirmation": "—", "invalidation": "—"})
+    f["decision"] = {"READY": "ورود", "WAIT_CONFIRM": "منتظر تأیید", "NO_TARGET": "ورود نکن",
+                     "EXPIRED": "منقضی شد", "INVALID": "باطل شد"}.get(f["state"], f["decision"])
     return f
 
 
