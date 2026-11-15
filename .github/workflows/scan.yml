@@ -1,3 +1,4 @@
+
 name: LBank Futures Smart Scanner
 
 on:
@@ -48,10 +49,17 @@ jobs:
         run: |
           python collector.py
 
-      # تحلیل بازار
+      # تحلیل بازار با تأیید فیبوناچی
       - name: Run smart scanner
+        env:
+          FIB_CONFIRM: "1"
         run: |
           python signal_scanner.py
+
+      # اجرای تحلیل‌گر مستقل فیبوناچی
+      - name: Generate Fibonacci analysis
+        run: |
+          python fib_analyst.py
 
       # ارسال گزارش تلگرام
       - name: Send Telegram report
