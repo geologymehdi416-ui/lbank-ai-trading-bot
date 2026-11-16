@@ -1,0 +1,54 @@
+
+name: LBank Futures WS Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install WebSocket library
+        run: pip install websockets
+
+      - name: Test Futures WebSocket
+        run: |
+          python - <<'PY'
+          import asyncio
+          import websockets
+
+          URL = "wss://lbkperpws.lbank.com/ws"
+
+          async def main():
+              print("Connecting to LBank Futures...")
+              try:
+                  async with websockets.connect(
+                      URL,
+                      open_timeout=15,
+                      close_timeout=5
+                  ) as ws:
+                      print("HANDSHAKE_OK")
+                      print("Waiting for server messages...")
+                      for i in range(4):
+                          try:
+                              msg = await asyncio.wait_for(
+                                  ws.recv(), timeout=5
+                              )
+                              print("RAW MESSAGE:", str(msg)[:3000])
+                          except asyncio.TimeoutError:
+                              print("NO MESSAGE RECEIVED")
+                              break
+              except Exception as e:
+                  print("CONNECTION ERROR:", repr(e))
+
+          asyncio.run(main())
+          PY
