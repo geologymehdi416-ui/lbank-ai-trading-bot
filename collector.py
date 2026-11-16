@@ -1,340 +1,215 @@
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-LBank Futures Snapshot Collector
-Futures only - No Spot data - No order execution
-"""
-
 import json
-import math
 import os
-import tempfile
-import requests
-
-from pathlib import Path
+import time
 from datetime import datetime, timezone
 
-BASE_URL = "https://lbkperp.lbank.com"
-PRODUCT_GROUP = "SwapU"
+import requests
 
-INSTRUMENT_URL = (
-    BASE_URL + "/cfd/openApi/v1/pub/instrument"
-)
+BASE_URL = "https://api.lbank.com"
+FUTURES_BASE = "https://lbkperp.lbank.com"
 
-MARKET_URL = (
-    BASE_URL + "/cfd/openApi/v1/pub/marketData"
-)
+DATA_DIR = "data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "prices.jsonl")
 
-DATA_FILE = Path("data/prices.jsonl")
-TIMEOUT = 30
+TIMEOUT = 15
+RETRIES = 3
+SLEEP_BETWEEN_REQUESTS = 0.15
 
-
-def to_number(value):
-    try:
-        result = float(value)
-
-        if math.isfinite(result):
-            return result
-
-        return None
-
-    except (TypeError, ValueError):
-        return None
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "LBank-Futures-Scanner/1.0",
+    "Accept": "application/json",
+})
 
 
-def get_api_data(session, url):
-    response = session.get(
-        url,
-        params={"productGroup": PRODUCT_GROUP},
-        timeout=TIMEOUT,
-        headers={
-            "User-Agent": "LBank-Futures-Monitor/3.0"
-        },
-    )
+def request_json(url, params=None):
+    for attempt in range(RETRIES):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
 
-    response.raise_for_status()
+            if not isinstance(data, (dict, list)):
+                raise ValueError("Invalid API response")
 
-    payload = response.json()
+            return data
 
-    if not isinstance(payload, dict):
-        raise RuntimeError("Invalid API response")
-
-    data = payload.get("data")
-
-    if not isinstance(data, list):
-        raise RuntimeError(
-            "Unexpected API response structure. "
-            f"Response keys: {list(payload.keys())}"
-        )
-
-    return data
-
-
-def get_currency(item, possible_names):
-    for name in possible_names:
-        value = item.get(name)
-
-        if value is not None:
-            value = str(value).strip().upper()
-
-            if value:
-                return value
+        except Exception as exc:
+            print(
+                f"Request failed ({attempt + 1}/{RETRIES}): {exc}"
+            )
+            time.sleep(1 + attempt)
 
     return None
 
 
-def verify_contracts(instruments):
-    verified = {}
+def extract_list(data):
+    if isinstance(data, list):
+        return data
 
-    for item in instruments:
+    if isinstance(data, dict):
+        for key in ("data", "result", "list", "records"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
 
-        if not isinstance(item, dict):
-            continue
+            if isinstance(value, dict):
+                for nested in ("data", "list", "records"):
+                    if isinstance(value.get(nested), list):
+                        return value[nested]
 
-        symbol = str(
-            item.get("symbol", "")
-        ).strip().upper()
+    return []
 
-        if not symbol:
-            continue
 
-        if not symbol.endswith("USDT"):
-            continue
+def get_instruments():
+    url = f"{FUTURES_BASE}/cfd/openApi/v1/pub/instrument"
+    data = request_json(url)
 
-        quote_currency = get_currency(
-            item,
-            [
-                "quoteCurrency",
-                "priceCurrency",
-                "quoteCoin",
-            ],
+    if data is None:
+        raise RuntimeError("Could not retrieve Futures instruments")
+
+    instruments = extract_list(data)
+
+    if not instruments:
+        raise RuntimeError(
+            "Instrument response format is not verified"
         )
 
-        settle_currency = get_currency(
-            item,
-            [
-                "clearCurrency",
-                "settleCurrency",
-                "settlementCurrency",
-            ],
+    return instruments
+
+
+def get_market_data():
+    url = f"{FUTURES_BASE}/cfd/openApi/v1/pub/marketData"
+    data = request_json(url)
+
+    if data is None:
+        raise RuntimeError("Could not retrieve Futures market data")
+
+    records = extract_list(data)
+
+    if not records:
+        raise RuntimeError(
+            "Market data response format is not verified"
         )
 
-        # Fail closed:
-        # Symbol suffix alone is not enough.
-        if (
-            quote_currency != "USDT"
-            and settle_currency != "USDT"
-        ):
+    return records
+
+
+def get_symbol(record):
+    for key in ("symbol", "instrumentId", "contractCode", "name"):
+        value = record.get(key)
+        if value:
+            return str(value).upper()
+    return None
+
+
+def get_number(record, keys):
+    for key in keys:
+        value = record.get(key)
+        if value is None:
             continue
 
-        verified[symbol] = {
-            "quoteCurrency": quote_currency,
-            "settleCurrency": settle_currency,
-            "baseCurrency": item.get("baseCurrency"),
-        }
+        try:
+            number = float(value)
+            if number > 0:
+                return number
+        except (TypeError, ValueError):
+            continue
 
-    return verified
+    return None
+
+
+def normalize_market_record(record):
+    symbol = get_symbol(record)
+
+    if not symbol:
+        return None
+
+    price = get_number(
+        record,
+        ("lastPrice", "last", "close", "price", "last_price")
+    )
+
+    if price is None:
+        return None
+
+    volume = get_number(
+        record,
+        ("volume", "vol", "baseVolume", "turnover", "amount")
+    )
+
+    quote_volume = get_number(
+        record,
+        ("quoteVolume", "quoteVol", "turnover24h", "amount24h")
+    )
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "volume": volume,
+        "quote_volume": quote_volume,
+        "raw": record,
+    }
 
 
 def main():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    session = requests.Session()
+    print("Loading LBank Futures instruments...")
+    instruments = get_instruments()
 
-    print("Connecting to LBank Futures API...")
+    print("Loading LBank Futures market data...")
+    market_records = get_market_data()
 
-    instruments = get_api_data(
-        session,
-        INSTRUMENT_URL,
-    )
+    instrument_symbols = {
+        get_symbol(item)
+        for item in instruments
+        if get_symbol(item)
+    }
 
-    market_data = get_api_data(
-        session,
-        MARKET_URL,
-    )
+    timestamp = datetime.now(timezone.utc).isoformat()
 
-    print(
-        "Instrument records:",
-        len(instruments),
-    )
-
-    print(
-        "Market records:",
-        len(market_data),
-    )
-
-    verified_contracts = verify_contracts(
-        instruments
-    )
-
-    if not verified_contracts:
-
-        sample_keys = []
-
-        if instruments and isinstance(instruments[0], dict):
-            sample_keys = list(instruments[0].keys())
-
-        raise RuntimeError(
-            "No verified USDT Futures contracts found. "
-            "Instrument currency fields may differ from "
-            f"the expected schema. Sample keys: {sample_keys}"
-        )
-
-    timestamp = datetime.now(
-        timezone.utc
-    ).isoformat()
-
-    records = []
+    saved = 0
     skipped = 0
 
-    for item in market_data:
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as file:
+        for record in market_records:
+            normalized = normalize_market_record(record)
 
-        if not isinstance(item, dict):
-            skipped += 1
-            continue
+            if normalized is None:
+                skipped += 1
+                continue
 
-        symbol = str(
-            item.get("symbol", "")
-        ).strip().upper()
+            symbol = normalized["symbol"]
 
-        contract = verified_contracts.get(symbol)
+            if symbol not in instrument_symbols:
+                skipped += 1
+                continue
 
-        if contract is None:
-            skipped += 1
-            continue
+            output = {
+                "timestamp": timestamp,
+                "source": "LBank Futures",
+                **normalized,
+            }
 
-        last_price = to_number(
-            item.get("lastPrice")
-        )
-
-        if last_price is None or last_price <= 0:
-            skipped += 1
-            continue
-
-        record = {
-            "timestamp": timestamp,
-            "source": "LBank Futures",
-            "productGroup": PRODUCT_GROUP,
-            "symbol": symbol,
-            "contract": contract,
-
-            "lastPrice": last_price,
-
-            "markedPrice": to_number(
-                item.get("markedPrice")
-            ),
-
-            "openPrice": to_number(
-                item.get("openPrice")
-            ),
-
-            "highestPrice": to_number(
-                item.get("highestPrice")
-            ),
-
-            "lowestPrice": to_number(
-                item.get("lowestPrice")
-            ),
-
-            "volume24h": to_number(
-                item.get("volume")
-            ),
-
-            "turnover24h": to_number(
-                item.get("turnover")
-            ),
-
-            "fundingRate": to_number(
-                item.get("prePositionFeeRate")
-            ),
-
-            "candleDataAvailable": False,
-        }
-
-        records.append(record)
-
-    if not records:
-
-        raise RuntimeError(
-            "No valid Futures market snapshots found. "
-            "Existing data file was not modified."
-        )
-
-    records.sort(
-        key=lambda x: x.get("turnover24h") or 0,
-        reverse=True,
-    )
-
-    DATA_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Atomic replacement:
-    # prevents partially written data files.
-
-    fd, temp_path = tempfile.mkstemp(
-        prefix="prices_",
-        suffix=".tmp",
-        dir=str(DATA_FILE.parent),
-    )
-
-    try:
-
-        with os.fdopen(
-            fd,
-            "w",
-            encoding="utf-8",
-        ) as output:
-
-            for record in records:
-
-                output.write(
-                    json.dumps(
-                        record,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ) + "\n"
-                )
-
-        os.replace(
-            temp_path,
-            DATA_FILE,
-        )
-
-    finally:
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            file.write(
+                json.dumps(output, ensure_ascii=False) + "\n"
+            )
+            saved += 1
 
     print("--------------------------------")
-    print("LBank Futures collection complete")
+    print("LBank Futures Collector")
+    print(f"Instruments: {len(instrument_symbols)}")
+    print(f"Market records: {len(market_records)}")
+    print(f"Saved: {saved}")
+    print(f"Skipped: {skipped}")
+    print(f"Output: {OUTPUT_FILE}")
     print("--------------------------------")
-
-    print(
-        "Verified contracts:",
-        len(verified_contracts),
-    )
-
-    print(
-        "Saved snapshots:",
-        len(records),
-    )
-
-    print(
-        "Skipped records:",
-        skipped,
-    )
-
-    print(
-        "Data file:",
-        DATA_FILE,
-    )
-
-    print("OHLCV candles: NOT collected")
-    print("Trading signals: NOT generated")
-    print("Real orders: DISABLED")
 
 
 if __name__ == "__main__":
