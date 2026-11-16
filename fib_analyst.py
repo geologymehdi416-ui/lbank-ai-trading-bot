@@ -15,9 +15,9 @@ Logic (per symbol):
   3. State from live 15m data: WAITING / IN_ZONE / CONFIRMED (rejection candle) / INVALID / EXPIRED.
   4. Each target must have positive net RR after round-trip fee; TP1 net RR < 1 => no entry.
 Usage:
-  python fib_analyst.py                       # default symbols from signal_scanner
+  python fib_analyst.py
   python fib_analyst.py --symbols BTC_USDT,ETH_USDT
-  python fib_analyst.py --send                # also send to Telegram (needs env tokens)
+  python fib_analyst.py --send
 """
 from __future__ import annotations
 
