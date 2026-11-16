@@ -33,129 +33,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests websockets
+          pip install requests
 
-      - name: Sync with remote
+      - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git fetch origin "${GITHUB_REF_NAME}"
-          git rebase "origin/${GITHUB_REF_NAME}"
-
       - name: Collect LBank Futures prices
         run: |
           python collector.py
-
-      - name: Probe LBank Futures KLine channels
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          import asyncio
-          import json
-          import time
-          import websockets
-
-          URL = "wss://lbkperpws.lbank.com/ws"
-          SYMBOL = "Exchange_BTCUSDT"
-          TOPICS = ["11", "12", "13"]
-
-          async def main():
-              print("Connecting to LBank Futures...")
-              try:
-                  async with websockets.connect(
-                      URL,
-                      open_timeout=15,
-                      close_timeout=5,
-                      ping_interval=20,
-                      ping_timeout=20
-                  ) as ws:
-
-                      print("HANDSHAKE_OK")
-
-                      for index, topic in enumerate(TOPICS, start=1):
-                          message = {
-                              "SendTopicAction": {
-                                  "Action": "1",
-                                  "LocalNo": index,
-                                  "TopicID": topic,
-                                  "FilterValue": SYMBOL,
-                                  "ResumeNo": -1
-                              }
-                          }
-
-                          await ws.send(json.dumps(message))
-                          print(f"SUBSCRIBE_SENT: TOPIC={topic}")
-                          await asyncio.sleep(0.5)
-
-                      print("Waiting for KLine messages...")
-                      deadline = time.monotonic() + 60
-                      received = 0
-                      kline_count = 0
-
-                      while time.monotonic() < deadline:
-                          remaining = deadline - time.monotonic()
-
-                          try:
-                              raw = await asyncio.wait_for(
-                                  ws.recv(),
-                                  timeout=remaining
-                              )
-                          except asyncio.TimeoutError:
-                              print("WAIT_TIMEOUT")
-                              break
-
-                          if raw == "ping":
-                              await ws.send("pong")
-                              print("APP_PONG_SENT")
-                              continue
-
-                          received += 1
-                          print(f"RAW_MESSAGE_{received}:")
-                          print(str(raw)[:5000])
-
-                          try:
-                              data = json.loads(raw)
-                          except (json.JSONDecodeError, TypeError):
-                              continue
-
-                          if isinstance(data, dict):
-                              action = data.get("action")
-
-                              if action == "PushKLine":
-                                  kline_count += 1
-                                  print(
-                                      f"KLINE_DETECTED: {kline_count}"
-                                  )
-                                  print(
-                                      json.dumps(
-                                          data,
-                                          ensure_ascii=False,
-                                          indent=2
-                                      )[:5000]
-                                  )
-
-                              if "RecvTopicAction" in data:
-                                  print(
-                                      "SUBSCRIPTION_ACK:",
-                                      json.dumps(
-                                          data,
-                                          ensure_ascii=False
-                                      )
-                                  )
-
-                      print("PROBE_SUMMARY")
-                      print(f"TOTAL_MESSAGES={received}")
-                      print(f"KLINE_MESSAGES={kline_count}")
-
-                      if kline_count == 0:
-                          print("NO_VERIFIED_KLINE_RECEIVED")
-
-              except Exception as error:
-                  print("WEBSOCKET_PROBE_ERROR:", repr(error))
-
-          asyncio.run(main())
-          PY
 
       - name: Run Futures Sniper
         run: |
@@ -184,7 +71,9 @@ jobs:
           if not report_file.exists():
               raise RuntimeError("report.txt was not generated")
 
-          report = report_file.read_text(encoding="utf-8").strip()
+          report = report_file.read_text(
+              encoding="utf-8"
+          ).strip()
 
           if not report:
               report = "No valid trading setup. ورود نکن."
@@ -198,13 +87,18 @@ jobs:
                   if current:
                       chunks.append(current)
                       current = ""
+
                   chunks.append(line[:max_length])
                   line = line[max_length:]
 
-              candidate = current + "\n" + line if current else line
+              candidate = (
+                  current + "\n" + line
+                  if current else line
+              )
 
               if len(candidate) > max_length:
-                  chunks.append(current)
+                  if current:
+                      chunks.append(current)
                   current = line
               else:
                   current = candidate
@@ -212,7 +106,11 @@ jobs:
           if current:
               chunks.append(current)
 
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          url = (
+              f"https://api.telegram.org/"
+              f"bot{token}/sendMessage"
+          )
+
           session = requests.Session()
 
           for index, chunk in enumerate(chunks, start=1):
@@ -224,17 +122,17 @@ jobs:
               payload = {
                   "chat_id": chat_id,
                   "text": prefix + chunk,
-                  "disable_web_page_preview": True
+                  "disable_web_page_preview": True,
               }
 
               sent = False
 
-              for attempt in range(1, 11):
+              for attempt in range(1, 6):
                   try:
                       response = session.post(
                           url,
                           json=payload,
-                          timeout=30
+                          timeout=30,
                       )
 
                       try:
@@ -242,55 +140,52 @@ jobs:
                       except ValueError:
                           result = {}
 
-                      if response.status_code == 200 and result.get("ok"):
+                      if (
+                          response.status_code == 200
+                          and result.get("ok")
+                      ):
                           print(
-                              f"Message {index}/{len(chunks)} sent successfully"
+                              f"Telegram message "
+                              f"{index}/{len(chunks)} sent"
                           )
                           sent = True
                           break
 
                       if response.status_code == 429:
-                          retry_after = result.get(
-                              "parameters", {}
-                          ).get("retry_after", 10)
-
-                          wait_time = int(retry_after) + 2
-                          print(f"Rate limit. Waiting {wait_time}s")
-                          time.sleep(wait_time)
+                          wait = int(
+                              result.get(
+                                  "parameters", {}
+                              ).get("retry_after", 10)
+                          ) + 2
+                          time.sleep(wait)
                           continue
 
                       if response.status_code >= 500:
-                          wait_time = min(attempt * 5, 60)
-                          print(
-                              f"Telegram server error "
-                              f"{response.status_code}; retrying"
-                          )
-                          time.sleep(wait_time)
+                          time.sleep(min(attempt * 5, 30))
                           continue
 
                       raise RuntimeError(
                           f"Telegram API error: "
-                          f"{response.status_code} - {result}"
+                          f"{response.status_code} {result}"
                       )
 
                   except requests.RequestException as error:
-                      wait_time = min(attempt * 5, 60)
-                      print(f"Network error: {error}")
-                      time.sleep(wait_time)
+                      print("Telegram network error:", error)
+                      time.sleep(min(attempt * 5, 30))
 
               if not sent:
                   raise RuntimeError(
-                      f"Failed to send Telegram message "
-                      f"{index} after 10 attempts"
+                      f"Telegram delivery failed: message {index}"
                   )
 
               if index < len(chunks):
-                  time.sleep(5)
+                  time.sleep(3)
 
-          print(f"Telegram delivery completed: {len(chunks)} messages")
+          print("Telegram delivery completed")
           PY
 
       - name: Commit and push market data
+        if: success()
         run: |
           set -e
 
@@ -304,14 +199,11 @@ jobs:
           git commit -m "Update LBank futures market data"
 
           for attempt in 1 2 3 4 5; do
-            echo "Push attempt: ${attempt}"
-
             git fetch origin "${GITHUB_REF_NAME}"
 
             if ! git rebase "origin/${GITHUB_REF_NAME}"; then
-              echo "Rebase conflict detected"
               git rebase --abort || true
-              echo "Manual inspection required. No force push attempted."
+              echo "Rebase conflict. Manual inspection required."
               exit 1
             fi
 
