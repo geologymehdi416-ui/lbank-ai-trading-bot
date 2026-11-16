@@ -1,54 +1,95 @@
 
-name: LBank Futures WS Probe
+import asyncio
+import json
+from datetime import datetime, timezone
 
-on:
-  workflow_dispatch:
+import websockets
 
-permissions:
-  contents: read
+WS_URL = "wss://lbkperpws.lbank.com/ws"
+OUTPUT_FILE = "data/ws_probe.jsonl"
+TIMEOUT = 30
 
-jobs:
-  probe:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install WebSocket library
-        run: pip install websockets
+def save_message(data):
+    import os
 
-      - name: Test Futures WebSocket
-        run: |
-          python - <<'PY'
-          import asyncio
-          import websockets
+    os.makedirs("data", exist_ok=True)
 
-          URL = "wss://lbkperpws.lbank.com/ws"
+    record = {
+        "received_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "data": data,
+    }
 
-          async def main():
-              print("Connecting to LBank Futures...")
-              try:
-                  async with websockets.connect(
-                      URL,
-                      open_timeout=15,
-                      close_timeout=5
-                  ) as ws:
-                      print("HANDSHAKE_OK")
-                      print("Waiting for server messages...")
-                      for i in range(4):
-                          try:
-                              msg = await asyncio.wait_for(
-                                  ws.recv(), timeout=5
-                              )
-                              print("RAW MESSAGE:", str(msg)[:3000])
-                          except asyncio.TimeoutError:
-                              print("NO MESSAGE RECEIVED")
-                              break
-              except Exception as e:
-                  print("CONNECTION ERROR:", repr(e))
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+        f.write(
+            json.dumps(record, ensure_ascii=False) + "\n"
+        )
 
-          asyncio.run(main())
-          PY
+
+async def main():
+    print("Connecting to LBank Futures WebSocket...")
+    print(WS_URL)
+
+    try:
+        async with websockets.connect(
+            WS_URL,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=10,
+            open_timeout=20,
+        ) as ws:
+
+            print("CONNECTED")
+            print("Waiting for server messages...")
+
+            start = asyncio.get_running_loop().time()
+            received = 0
+
+            while (
+                asyncio.get_running_loop().time() - start
+                < TIMEOUT
+            ):
+                try:
+                    message = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=5,
+                    )
+
+                    received += 1
+
+                    try:
+                        parsed = json.loads(message)
+                    except json.JSONDecodeError:
+                        parsed = message
+
+                    print("MESSAGE:", parsed)
+                    save_message(parsed)
+
+                    if isinstance(parsed, dict):
+                        if parsed.get("ping") is not None:
+                            pong = {
+                                "action": "pong",
+                                "pong": parsed["ping"],
+                            }
+
+                            await ws.send(json.dumps(pong))
+                            print("PONG SENT")
+
+                except asyncio.TimeoutError:
+                    print("No message in last 5 seconds")
+
+            print("--------------------------------")
+            print("WebSocket probe completed")
+            print("Messages received:", received)
+            print("Saved:", OUTPUT_FILE)
+            print("--------------------------------")
+
+    except Exception as exc:
+        print("WEBSOCKET ERROR:", repr(exc))
+        raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
