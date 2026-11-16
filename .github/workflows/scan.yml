@@ -35,7 +35,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # ابتدا مخزن را به‌روز می‌کنیم
       - name: Sync with remote
         run: |
           git config user.name "github-actions[bot]"
@@ -44,16 +43,185 @@ jobs:
           git fetch origin "${GITHUB_REF_NAME}"
           git rebase "origin/${GITHUB_REF_NAME}"
 
-      # جمع‌آوری قیمت‌ها
       - name: Collect LBank Futures prices
         run: |
           python collector.py
 
-      # تحلیل بازار با تأیید فیبوناچی
-            # Futures-only Sniper safety gate
       - name: Run Futures Sniper
         run: |
           python sniper_entry.py
 
-      # ارسال گزارش تلگرام
-      https://api.telegram.org/bot{BOT_TOKEN}/sendMessage
+      - name: Send Telegram report
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import requests
+          from pathlib import Path
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+          if not token or not chat_id:
+              raise RuntimeError("Telegram secrets are missing")
+
+          report_file = Path("report.txt")
+
+          if not report_file.exists():
+              raise RuntimeError("report.txt was not generated")
+
+          report = report_file.read_text(encoding="utf-8").strip()
+
+          if not report:
+              report = "No valid trading setup. ورود نکن."
+
+          max_length = 3500
+          chunks = []
+          current = ""
+
+          for line in report.splitlines():
+              while len(line) > max_length:
+                  if current:
+                      chunks.append(current)
+                      current = ""
+                  chunks.append(line[:max_length])
+                  line = line[max_length:]
+
+              candidate = current + "\n" + line if current else line
+
+              if len(candidate) > max_length:
+                  chunks.append(current)
+                  current = line
+              else:
+                  current = candidate
+
+          if current:
+              chunks.append(current)
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          session = requests.Session()
+
+          for index, chunk in enumerate(chunks, start=1):
+              prefix = (
+                  f"📨 بخش {index}/{len(chunks)}\n\n"
+                  if len(chunks) > 1 else ""
+              )
+
+              payload = {
+                  "chat_id": chat_id,
+                  "text": prefix + chunk,
+                  "disable_web_page_preview": True
+              }
+
+              sent = False
+
+              for attempt in range(1, 11):
+                  try:
+                      response = session.post(
+                          url,
+                          json=payload,
+                          timeout=30
+                      )
+
+                      try:
+                          result = response.json()
+                      except ValueError:
+                          result = {}
+
+                      if response.status_code == 200 and result.get("ok"):
+                          print(
+                              f"Message {index}/{len(chunks)} sent successfully"
+                          )
+                          sent = True
+                          break
+
+                      if response.status_code == 429:
+                          retry_after = result.get(
+                              "parameters", {}
+                          ).get("retry_after", 10)
+
+                          wait_time = int(retry_after) + 2
+
+                          print(
+                              f"Rate limit reached. Waiting "
+                              f"{wait_time}s. Attempt {attempt}/10"
+                          )
+
+                          time.sleep(wait_time)
+                          continue
+
+                      if response.status_code >= 500:
+                          wait_time = min(attempt * 5, 60)
+                          print(
+                              f"Telegram server error "
+                              f"{response.status_code}; retrying "
+                              f"in {wait_time}s"
+                          )
+                          time.sleep(wait_time)
+                          continue
+
+                      raise RuntimeError(
+                          f"Telegram API error: "
+                          f"{response.status_code} - {result}"
+                      )
+
+                  except requests.RequestException as error:
+                      wait_time = min(attempt * 5, 60)
+                      print(
+                          f"Network error: {error}; "
+                          f"retrying in {wait_time}s"
+                      )
+                      time.sleep(wait_time)
+
+              if not sent:
+                  raise RuntimeError(
+                      f"Failed to send Telegram message "
+                      f"{index} after 10 attempts"
+                  )
+
+              if index < len(chunks):
+                  time.sleep(5)
+
+          print(f"Telegram delivery completed: {len(chunks)} messages")
+          PY
+
+      - name: Commit and push market data
+        run: |
+          set -e
+
+          git add data/prices.jsonl
+
+          if git diff --cached --quiet; then
+            echo "No market data changes"
+            exit 0
+          fi
+
+          git commit -m "Update LBank futures market data"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt: ${attempt}"
+
+            git fetch origin "${GITHUB_REF_NAME}"
+
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              echo "Rebase conflict detected"
+              git rebase --abort || true
+              echo "Manual inspection required. No force push attempted."
+              exit 1
+            fi
+
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Market data successfully pushed"
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "Push failed after 5 attempts"
+          exit 1
