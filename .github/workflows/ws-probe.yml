@@ -10,7 +10,7 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - name: Setup Python
@@ -18,8 +18,70 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install WebSocket library
-        run: pip install websockets
+      - name: Install Dependencies
+        run: |
+          pip install requests websockets
+
+      - name: Discover Active BTC Futures Contracts
+        run: |
+          python - <<'PY'
+          import requests
+          import json
+
+          BASE = "https://lbkperp.lbank.com"
+
+          endpoints = [
+              "instrument",
+              "marketData"
+          ]
+
+          for endpoint in endpoints:
+              url = f"{BASE}/cfd/openApi/v1/pub/{endpoint}"
+
+              print(f"\n===== {endpoint} =====")
+
+              try:
+                  response = requests.get(
+                      url,
+                      params={"productGroup": "SwapU"},
+                      timeout=20
+                  )
+
+                  print("HTTP:", response.status_code)
+
+                  data = response.json()
+
+                  print(
+                      "ERROR:",
+                      data.get("error_code")
+                  )
+
+                  print(
+                      "MESSAGE:",
+                      data.get("msg")
+                  )
+
+                  rows = data.get("data", [])
+
+                  if isinstance(rows, dict):
+                      rows = rows.get("data", [])
+
+                  if isinstance(rows, list):
+                      for item in rows:
+                          text = json.dumps(item).upper()
+
+                          if "BTC" in text:
+                              print(
+                                  json.dumps(
+                                      item,
+                                      indent=2,
+                                      ensure_ascii=False
+                                  )
+                              )
+
+              except Exception as e:
+                  print("REQUEST_ERROR:", repr(e))
+          PY
 
       - name: Subscribe to Futures KLine channels
         run: |
@@ -46,7 +108,10 @@ jobs:
 
                       topics = ["11", "12", "13"]
 
-                      for index, topic in enumerate(topics, start=1):
+                      for index, topic in enumerate(
+                          topics,
+                          start=1
+                      ):
                           payload = {
                               "SendTopicAction": {
                                   "Action": "1",
@@ -58,7 +123,10 @@ jobs:
                           }
 
                           await ws.send(json.dumps(payload))
-                          print(f"SUBSCRIBE_SENT: TOPIC={topic}")
+
+                          print(
+                              f"SUBSCRIBE_SENT: TOPIC={topic}"
+                          )
 
                       print("WAITING_FOR_KLINE_MESSAGES")
 
@@ -67,7 +135,8 @@ jobs:
                       )
 
                       while (
-                          asyncio.get_running_loop().time() < end_time
+                          asyncio.get_running_loop().time()
+                          < end_time
                       ):
                           try:
                               msg = await asyncio.wait_for(
@@ -81,7 +150,9 @@ jobs:
                               )
 
                               if "PushKLine" in str(msg):
-                                  print("KLINE_MESSAGE_RECEIVED")
+                                  print(
+                                      "KLINE_MESSAGE_RECEIVED"
+                                  )
 
                           except asyncio.TimeoutError:
                               print("STILL_WAITING_FOR_DATA")
@@ -89,7 +160,10 @@ jobs:
                       print("PROBE_FINISHED")
 
               except Exception as e:
-                  print("CONNECTION_ERROR:", repr(e))
+                  print(
+                      "CONNECTION_ERROR:",
+                      repr(e)
+                  )
 
           asyncio.run(main())
           PY
