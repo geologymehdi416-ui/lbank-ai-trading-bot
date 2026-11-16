@@ -16,7 +16,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -26,25 +26,41 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy
+          pip install requests pandas numpy websockets
+
+      - name: Check Python files
+        run: |
+          python -m py_compile collector.py
+          python -m py_compile sniper_entry.py
+          python -m py_compile signal_scanner.py
+          python -m py_compile ws_probe.py
 
       - name: Collect LBank Futures data
         run: |
-          python collector.py
+          python -u collector.py
 
-      - name: Run scanner
+      - name: Probe WebSocket
+        id: websocket
+        continue-on-error: true
+        run: |
+          python -u ws_probe.py
+
+      - name: Run Futures scanner
         env:
           LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
         run: |
-          python sniper_entry.py
+          python -u sniper_entry.py
+
+      - name: Filter signals
+        run: |
+          python -u signal_scanner.py
 
       - name: Send Telegram report
-        if: always() && hashFiles('data/signals.json') != ''
+        if: always() && hashFiles('data/final_signals.json') != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -61,23 +77,32 @@ jobs:
               print("Telegram secrets are missing")
               raise SystemExit(0)
 
-          with open("data/signals.json", encoding="utf-8") as f:
+          with open(
+              "data/final_signals.json",
+              encoding="utf-8"
+          ) as f:
               signals = json.load(f)
 
           if not signals:
-              message = "LBank Futures Scanner\n\nNO SETUP - DO NOT ENTER"
+              message = (
+                  "LBank Futures Scanner\n\n"
+                  "NO SETUP - DO NOT ENTER"
+              )
           else:
-              lines = ["LBank Futures Scanner", ""]
+              lines = [
+                  "LBank Futures Scanner",
+                  "--------------------"
+              ]
 
               for s in signals:
                   lines.extend([
-                      f"{s['symbol']} | {s['direction']}",
+                      f"Symbol: {s['symbol']}",
+                      f"Direction: {s['direction']}",
                       f"Entry: {s['entry']}",
-                      f"SL: {s['stop_loss']}",
-                      f"TP: {s['take_profit']}",
+                      f"Stop Loss: {s['stop_loss']}",
+                      f"Take Profit: {s['take_profit']}",
                       f"RR: {s['rr']}",
-                      f"RSI 15m: {s['rsi_15m']}",
-                      f"Volume ratio: {s['volume_ratio']}",
+                      f"Quality: {s.get('quality_score', 'N/A')}",
                       "--------------------"
                   ])
 
@@ -89,7 +114,7 @@ jobs:
                   "chat_id": chat_id,
                   "text": message
               },
-              timeout=15
+              timeout=20
           )
 
           response.raise_for_status()
