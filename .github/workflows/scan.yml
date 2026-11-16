@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests websockets
 
       - name: Sync with remote
         run: |
@@ -46,6 +46,116 @@ jobs:
       - name: Collect LBank Futures prices
         run: |
           python collector.py
+
+      - name: Probe LBank Futures KLine channels
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import asyncio
+          import json
+          import time
+          import websockets
+
+          URL = "wss://lbkperpws.lbank.com/ws"
+          SYMBOL = "Exchange_BTCUSDT"
+          TOPICS = ["11", "12", "13"]
+
+          async def main():
+              print("Connecting to LBank Futures...")
+              try:
+                  async with websockets.connect(
+                      URL,
+                      open_timeout=15,
+                      close_timeout=5,
+                      ping_interval=20,
+                      ping_timeout=20
+                  ) as ws:
+
+                      print("HANDSHAKE_OK")
+
+                      for index, topic in enumerate(TOPICS, start=1):
+                          message = {
+                              "SendTopicAction": {
+                                  "Action": "1",
+                                  "LocalNo": index,
+                                  "TopicID": topic,
+                                  "FilterValue": SYMBOL,
+                                  "ResumeNo": -1
+                              }
+                          }
+
+                          await ws.send(json.dumps(message))
+                          print(f"SUBSCRIBE_SENT: TOPIC={topic}")
+                          await asyncio.sleep(0.5)
+
+                      print("Waiting for KLine messages...")
+                      deadline = time.monotonic() + 60
+                      received = 0
+                      kline_count = 0
+
+                      while time.monotonic() < deadline:
+                          remaining = deadline - time.monotonic()
+
+                          try:
+                              raw = await asyncio.wait_for(
+                                  ws.recv(),
+                                  timeout=remaining
+                              )
+                          except asyncio.TimeoutError:
+                              print("WAIT_TIMEOUT")
+                              break
+
+                          if raw == "ping":
+                              await ws.send("pong")
+                              print("APP_PONG_SENT")
+                              continue
+
+                          received += 1
+                          print(f"RAW_MESSAGE_{received}:")
+                          print(str(raw)[:5000])
+
+                          try:
+                              data = json.loads(raw)
+                          except (json.JSONDecodeError, TypeError):
+                              continue
+
+                          if isinstance(data, dict):
+                              action = data.get("action")
+
+                              if action == "PushKLine":
+                                  kline_count += 1
+                                  print(
+                                      f"KLINE_DETECTED: {kline_count}"
+                                  )
+                                  print(
+                                      json.dumps(
+                                          data,
+                                          ensure_ascii=False,
+                                          indent=2
+                                      )[:5000]
+                                  )
+
+                              if "RecvTopicAction" in data:
+                                  print(
+                                      "SUBSCRIPTION_ACK:",
+                                      json.dumps(
+                                          data,
+                                          ensure_ascii=False
+                                      )
+                                  )
+
+                      print("PROBE_SUMMARY")
+                      print(f"TOTAL_MESSAGES={received}")
+                      print(f"KLINE_MESSAGES={kline_count}")
+
+                      if kline_count == 0:
+                          print("NO_VERIFIED_KLINE_RECEIVED")
+
+              except Exception as error:
+                  print("WEBSOCKET_PROBE_ERROR:", repr(error))
+
+          asyncio.run(main())
+          PY
 
       - name: Run Futures Sniper
         run: |
@@ -103,7 +213,6 @@ jobs:
               chunks.append(current)
 
           url = f"https://api.telegram.org/bot{token}/sendMessage"
-
           session = requests.Session()
 
           for index, chunk in enumerate(chunks, start=1):
@@ -146,12 +255,7 @@ jobs:
                           ).get("retry_after", 10)
 
                           wait_time = int(retry_after) + 2
-
-                          print(
-                              f"Rate limit reached. Waiting "
-                              f"{wait_time}s. Attempt {attempt}/10"
-                          )
-
+                          print(f"Rate limit. Waiting {wait_time}s")
                           time.sleep(wait_time)
                           continue
 
@@ -159,8 +263,7 @@ jobs:
                           wait_time = min(attempt * 5, 60)
                           print(
                               f"Telegram server error "
-                              f"{response.status_code}; retrying "
-                              f"in {wait_time}s"
+                              f"{response.status_code}; retrying"
                           )
                           time.sleep(wait_time)
                           continue
@@ -172,10 +275,7 @@ jobs:
 
                   except requests.RequestException as error:
                       wait_time = min(attempt * 5, 60)
-                      print(
-                          f"Network error: {error}; "
-                          f"retrying in {wait_time}s"
-                      )
+                      print(f"Network error: {error}")
                       time.sleep(wait_time)
 
               if not sent:
