@@ -1,21 +1,12 @@
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import os
 import json
-import math
 import time
 import requests
+import numpy as np
+import pandas as pd
 
-from pathlib import Path
-from datetime import datetime, timezone
-
-# ================= CONFIG =================
-
-DATA_FILE = Path("data/prices.jsonl")
-REPORT_FILE = Path("report.txt")
-
-BASE = "https://fapi.binance.com"
+DATA_FILE = "data/prices.jsonl"
 
 TIMEFRAMES = {
     "4h": "4h",
@@ -25,507 +16,359 @@ TIMEFRAMES = {
     "1m": "1m",
 }
 
-MAX_SYMBOLS = 30
+MIN_RR = 1.5
 MAX_SIGNALS = 5
-MAX_DIVERGENCE = 0.0020
+MAX_SYMBOLS = 30
 
-MIN_NET_RR = 1.5
-TARGET_RR = 1.8
-
-FEE_PER_SIDE = 0.0005
-SLIPPAGE_PER_SIDE = 0.0002
+# Candle endpoint is intentionally configurable.
+# Do not point this to a Spot or Binance endpoint.
+LBANK_FUTURES_CANDLE_URL = os.getenv(
+    "LBANK_FUTURES_CANDLE_URL", ""
+)
 
 session = requests.Session()
-session.headers.update({"User-Agent": "LBank-Futures-Sniper/4.0"})
-
-# ================= HTTP =================
-
-def api(path, params=None):
-    response = session.get(
-        BASE + path,
-        params=params,
-        timeout=20
-    )
-    response.raise_for_status()
-    return response.json()
+session.headers.update({
+    "User-Agent": "LBank-Futures-Scanner/1.0"
+})
 
 
-def number(value):
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else None
-    except (TypeError, ValueError):
-        return None
+def load_symbols():
+    if not os.path.exists(DATA_FILE):
+        return []
 
+    latest = {}
 
-# ================= LBank DATA =================
-
-def load_lbank():
-    prices = {}
-
-    if not DATA_FILE.exists():
-        return prices
-
-    with DATA_FILE.open("r", encoding="utf-8") as file:
-        for line in file:
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        for line in f:
             try:
                 item = json.loads(line)
-                symbol = str(item.get("symbol", "")).upper()
-                price = number(item.get("lastPrice"))
-
-                if (
-                    symbol.endswith("USDT")
-                    and price
-                    and price > 0
-                    and item.get("source") == "LBank Futures"
-                ):
-                    prices[symbol] = {
-                        "price": price,
-                        "turnover": number(item.get("turnover24h")) or 0
-                    }
-            except Exception:
+                symbol = item.get("symbol")
+                if symbol:
+                    latest[symbol] = item
+            except json.JSONDecodeError:
                 continue
 
-    return prices
+    return sorted(
+        latest.values(),
+        key=lambda x: x.get("quote_volume") or 0,
+        reverse=True
+    )[:MAX_SYMBOLS]
 
 
-# ================= INDICATORS =================
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    result = sum(values[:period]) / period
-    alpha = 2 / (period + 1)
-
-    for value in values[period:]:
-        result = value * alpha + result * (1 - alpha)
-
-    return result
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def macd_hist(values):
-    if len(values) < 35:
-        return None
-
-    fast = []
-    slow = []
-
-    for i in range(len(values)):
-        fast.append(ema(values[:i + 1], 12))
-        slow.append(ema(values[:i + 1], 26))
-
-    macd_values = [
-        a - b for a, b in zip(fast, slow)
-        if a is not None and b is not None
-    ]
-
-    if len(macd_values) < 9:
-        return None
-
-    signal = ema(macd_values, 9)
-
-    if signal is None:
-        return None
-
-    return macd_values[-1] - signal
-
-
-def atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return None
-
-    trs = []
-
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
+def fetch_candles(symbol, timeframe, limit=250):
+    if not LBANK_FUTURES_CANDLE_URL:
+        raise RuntimeError(
+            "LBank Futures candle endpoint is not configured. "
+            "No Binance or Spot fallback is allowed."
         )
-        trs.append(tr)
 
-    return sum(trs[-period:]) / period
+    response = session.get(
+        LBANK_FUTURES_CANDLE_URL,
+        params={
+            "symbol": symbol,
+            "interval": timeframe,
+            "limit": limit,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
 
+    payload = response.json()
 
-# ================= BINANCE FUTURES =================
+    if isinstance(payload, dict):
+        rows = payload.get("data")
+        if rows is None:
+            rows = payload.get("result")
+    else:
+        rows = payload
 
-def get_symbols(lbank):
-    info = api("/fapi/v1/exchangeInfo")
+    if not isinstance(rows, list) or len(rows) < 100:
+        raise ValueError(f"Invalid candles for {symbol} {timeframe}")
 
-    allowed = {
-        item["symbol"]
-        for item in info.get("symbols", [])
-        if item.get("status") == "TRADING"
-        and item.get("contractType") == "PERPETUAL"
-        and item.get("quoteAsset") == "USDT"
-        and item.get("marginAsset") == "USDT"
-    }
+    df = pd.DataFrame(rows)
 
-    candidates = [
-        (symbol, data["turnover"])
-        for symbol, data in lbank.items()
-        if symbol in allowed
+    # Expected normalized candle columns:
+    # timestamp, open, high, low, close, volume
+    required = [
+        "timestamp", "open", "high",
+        "low", "close", "volume"
     ]
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    if not all(col in df.columns for col in required):
+        raise ValueError(
+            "Candle response must be normalized to: "
+            + ", ".join(required)
+        )
 
-    return [symbol for symbol, _ in candidates[:MAX_SYMBOLS]]
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=required)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    if len(df) < 100:
+        raise ValueError("Not enough valid candles")
+
+    return df
 
 
-def get_candles(symbol, interval):
-    raw = api(
-        "/fapi/v1/klines",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": 120
-        }
+def indicators(df):
+    df = df.copy()
+
+    df["ema20"] = df["close"].ewm(
+        span=20, adjust=False
+    ).mean()
+
+    df["ema50"] = df["close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    df["ema100"] = df["close"].ewm(
+        span=100, adjust=False
+    ).mean()
+
+    delta = df["close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    ema12 = df["close"].ewm(
+        span=12, adjust=False
+    ).mean()
+
+    ema26 = df["close"].ewm(
+        span=26, adjust=False
+    ).mean()
+
+    df["macd"] = ema12 - ema26
+
+    df["macd_signal"] = df["macd"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["macd_hist"] = (
+        df["macd"] - df["macd_signal"]
     )
 
-    now_ms = int(time.time() * 1000)
-    candles = []
+    previous_close = df["close"].shift(1)
 
-    for row in raw:
-        # Only fully closed candles are accepted.
-        if int(row[6]) >= now_ms:
-            continue
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - previous_close).abs(),
+        (df["low"] - previous_close).abs(),
+    ], axis=1).max(axis=1)
 
-        values = [
-            number(row[1]),
-            number(row[2]),
-            number(row[3]),
-            number(row[4]),
-            number(row[5])
-        ]
+    df["atr"] = tr.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
 
-        if any(v is None for v in values):
-            continue
+    df["volume_avg"] = df["volume"].rolling(20).mean()
 
-        candles.append({
-            "open": values[0],
-            "high": values[1],
-            "low": values[2],
-            "close": values[3],
-            "volume": values[4],
-        })
-
-    if len(candles) < 60:
-        raise ValueError("Not enough closed candles: " + interval)
-
-    return candles
+    return df.dropna().reset_index(drop=True)
 
 
-# ================= STRATEGY =================
+def market_trend(df):
+    last = df.iloc[-1]
 
-def trend(candles):
-    closes = [x["close"] for x in candles]
-
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    e200 = ema(closes, 100)
-
-    if None in (e20, e50, e200):
-        return None
-
-    price = closes[-1]
-
-    if price > e20 > e50 and price > e200:
+    if (
+        last["close"] > last["ema20"]
+        and last["ema20"] > last["ema50"]
+        and last["ema50"] > last["ema100"]
+    ):
         return "LONG"
 
-    if price < e20 < e50 and price < e200:
+    if (
+        last["close"] < last["ema20"]
+        and last["ema20"] < last["ema50"]
+        and last["ema50"] < last["ema100"]
+    ):
         return "SHORT"
 
-    return None
+    return "NEUTRAL"
 
 
-def analyze(symbol, lbank_price):
-    candles = {
-        tf: get_candles(symbol, interval)
-        for tf, interval in TIMEFRAMES.items()
-    }
+def structure(df):
+    recent = df.iloc[-21:-1]
 
-    # Compare current Binance Futures ticker with LBank snapshot.
-    ticker = api(
-        "/fapi/v1/ticker/price",
-        {"symbol": symbol}
-    )
+    high = recent["high"].max()
+    low = recent["low"].min()
 
-    binance_price = number(ticker.get("price"))
+    close = df.iloc[-1]["close"]
 
-    if not binance_price or binance_price <= 0:
-        return None, "Invalid Binance price"
+    if close > high:
+        return "BULLISH_BREAKOUT"
 
-    divergence = abs(lbank_price - binance_price) / binance_price
+    if close < low:
+        return "BEARISH_BREAKDOWN"
 
-    if divergence > MAX_DIVERGENCE:
-        return None, "LBank/Binance price divergence"
-
-    # Higher timeframe alignment.
-    t4h = trend(candles["4h"])
-    t1h = trend(candles["1h"])
-
-    if not t4h or t4h != t1h:
-        return None, "HTF trend not aligned"
-
-    direction = t4h
-
-    # 15m setup.
-    c15 = candles["15m"]
-    close15 = [x["close"] for x in c15]
-    rsi15 = rsi(close15)
-    macd15 = macd_hist(close15)
-
-    if rsi15 is None or macd15 is None:
-        return None, "15m indicators unavailable"
-
-    e20_15 = ema(close15, 20)
-    e50_15 = ema(close15, 50)
-
-    if direction == "LONG":
-        setup_ok = (
-            close15[-1] > e20_15 > e50_15
-            and 50 < rsi15 < 72
-            and macd15 > 0
-        )
-    else:
-        setup_ok = (
-            close15[-1] < e20_15 < e50_15
-            and 28 < rsi15 < 50
-            and macd15 < 0
-        )
-
-    if not setup_ok:
-        return None, "15m setup not confirmed"
-
-    # 5m market structure breakout.
-    c5 = candles["5m"]
-    previous5 = c5[-21:-1]
-    close5 = c5[-1]["close"]
-
-    if direction == "LONG":
-        structure_ok = close5 > max(x["high"] for x in previous5)
-    else:
-        structure_ok = close5 < min(x["low"] for x in previous5)
-
-    if not structure_ok:
-        return None, "5m structure breakout missing"
-
-    # 1m entry confirmation.
-    c1 = candles["1m"]
-    closes = [x["close"] for x in c1]
-    volumes = [x["volume"] for x in c1]
-
-    current = c1[-1]
-    previous = c1[-11:-1]
-
-    rsi1 = rsi(closes)
-    macd1 = macd_hist(closes)
-    atr1 = atr(
-        [x["high"] for x in c1],
-        [x["low"] for x in c1],
-        closes
-    )
-
-    if None in (rsi1, macd1, atr1) or atr1 <= 0:
-        return None, "1m indicators unavailable"
-
-    avg_volume = sum(volumes[-21:-1]) / 20
-
-    if avg_volume <= 0:
-        return None, "Invalid volume"
-
-    volume_ok = current["volume"] > avg_volume * 1.2
-
-    if direction == "LONG":
-        entry_ok = (
-            current["close"] > max(x["high"] for x in previous)
-            and 52 < rsi1 < 72
-            and macd1 > 0
-            and volume_ok
-        )
-    else:
-        entry_ok = (
-            current["close"] < min(x["low"] for x in previous)
-            and 28 < rsi1 < 48
-            and macd1 < 0
-            and volume_ok
-        )
-
-    if not entry_ok:
-        return None, "1m entry not confirmed"
-
-    entry = current["close"]
-    stop_distance = atr1 * 1.5
-
-    if direction == "LONG":
-        stop = entry - stop_distance
-        target = entry + stop_distance * TARGET_RR
-    else:
-        stop = entry + stop_distance
-        target = entry - stop_distance * TARGET_RR
-
-    # Conservative round-trip cost estimate.
-    cost_rate = 2 * (FEE_PER_SIDE + SLIPPAGE_PER_SIDE)
-    cost = entry * cost_rate
-
-    gross_risk = abs(entry - stop)
-    gross_reward = abs(target - entry)
-
-    net_risk = gross_risk + cost
-    net_reward = gross_reward - cost
-
-    if net_reward <= 0:
-        return None, "Net reward is not positive"
-
-    net_rr = net_reward / net_risk
-
-    if net_rr < MIN_NET_RR:
-        return None, "Net RR below minimum"
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "net_rr": net_rr,
-        "rsi1": rsi1,
-        "rsi15": rsi15,
-        "macd1": macd1,
-        "volume_ratio": current["volume"] / avg_volume,
-        "divergence": divergence * 100,
-    }, None
+    return "RANGE"
 
 
-# ================= REPORT =================
-
-def main():
-    now = datetime.now(timezone.utc)
-    lines = [
-        "🎯 LBank FUTURES SNIPER",
-        "MODE: SNIPER BALANCED",
-        "",
-        "DATA: Binance USD-M Futures OHLCV",
-        "PRICE CHECK: LBank Futures snapshots",
-        "Candles are NOT LBank-native candles.",
-        "Real orders: DISABLED",
-        ""
-    ]
-
-    lbank = load_lbank()
-    valid = len(lbank)
-
-    signals = []
-    rejected = 0
-    errors = 0
-
+def analyze_symbol(symbol):
     try:
-        symbols = get_symbols(lbank)
-    except Exception as exc:
-        symbols = []
-        errors += 1
-        lines.append("Exchange info error: " + str(exc)[:160])
+        candles = {}
 
-    for symbol in symbols:
-        if len(signals) >= MAX_SIGNALS:
-            break
+        for tf in TIMEFRAMES:
+            candles[tf] = indicators(
+                fetch_candles(symbol, tf)
+            )
+            time.sleep(0.1)
 
-        try:
-            result, reason = analyze(
-                symbol,
-                lbank[symbol]["price"]
+        h4 = market_trend(candles["4h"])
+        h1 = market_trend(candles["1h"])
+        m15 = candles["15m"]
+        m5 = candles["5m"]
+        m1 = candles["1m"]
+
+        if h4 != h1 or h4 == "NEUTRAL":
+            return None
+
+        trend = h4
+
+        last15 = m15.iloc[-1]
+        last5 = m5.iloc[-1]
+        last1 = m1.iloc[-1]
+
+        structure5 = structure(m5)
+
+        volume_ok = (
+            last1["volume_avg"] > 0
+            and last1["volume"] > last1["volume_avg"] * 1.2
+        )
+
+        if trend == "LONG":
+            setup_ok = (
+                last15["close"] > last15["ema50"]
+                and last15["macd_hist"] > 0
+                and 50 < last15["rsi"] < 72
+                and structure5 == "BULLISH_BREAKOUT"
+                and last5["close"] > last5["ema20"]
+                and last1["close"] > last1["ema20"]
+                and last1["macd_hist"] > 0
+                and volume_ok
             )
 
-            if result:
-                signals.append(result)
-            else:
-                rejected += 1
+            direction = "LONG"
 
-        except Exception as exc:
-            errors += 1
-            print("Symbol error:", symbol, str(exc)[:160])
+        else:
+            setup_ok = (
+                last15["close"] < last15["ema50"]
+                and last15["macd_hist"] < 0
+                and 28 < last15["rsi"] < 50
+                and structure5 == "BEARISH_BREAKDOWN"
+                and last5["close"] < last5["ema20"]
+                and last1["close"] < last1["ema20"]
+                and last1["macd_hist"] < 0
+                and volume_ok
+            )
 
-    lines += [
-        "📊 MARKET DATA",
-        f"LBank valid snapshots: {valid}",
-        f"Binance symbols checked: {len(symbols)}",
-        f"Rejected setups: {rejected}",
-        f"Data/API errors: {errors}",
-        "",
-        "📈 STRATEGY",
-        "HTF: 4H / 1H",
-        "Setup: 15m",
-        "Structure: 5m",
-        "Entry: 1m",
-        f"Minimum net RR: {MIN_NET_RR}",
-        f"Maximum signals: {MAX_SIGNALS}",
-        "",
-    ]
+            direction = "SHORT"
 
-    if signals:
-        lines.append("🟢 CONFIRMED SIGNALS")
+        if not setup_ok:
+            return None
 
-        for i, s in enumerate(signals, 1):
-            lines += [
-                "",
-                f"{i}. {s['symbol']} — {s['direction']}",
-                f"Entry: {s['entry']:.8g}",
-                f"Stop Loss: {s['stop']:.8g}",
-                f"Take Profit: {s['target']:.8g}",
-                f"Net RR: {s['net_rr']:.2f}",
-                f"RSI 1m: {s['rsi1']:.1f}",
-                f"RSI 15m: {s['rsi15']:.1f}",
-                f"MACD 1m: {s['macd1']:.8g}",
-                f"Volume ratio: {s['volume_ratio']:.2f}x",
-                f"LBank/Binance divergence: {s['divergence']:.3f}%",
-            ]
-    else:
-        lines += [
-            "🔴 STATUS: NO VALID ENTRY",
-            "No setup passed all confirmation filters.",
-            "نتیجه: ورود نکن",
-        ]
+        entry = float(last1["close"])
+        atr = float(last1["atr"])
 
-    lines += [
-        "",
-        "⚠️ Risk note:",
-        "Fees/slippage are estimates, not guaranteed costs.",
-        "High leverage increases liquidation risk.",
-        "Signals are informational; no orders are placed.",
-        "",
-        "UTC: " + now.strftime("%Y-%m-%d %H:%M:%S"),
-    ]
+        if not np.isfinite(atr) or atr <= 0:
+            return None
 
-    report = "\n".join(lines)
-    REPORT_FILE.write_text(report + "\n", encoding="utf-8")
-    print(report)
+        if direction == "LONG":
+            swing_low = float(m5["low"].iloc[-10:].min())
+            sl = min(swing_low, entry - 1.2 * atr)
+
+            risk = entry - sl
+            tp = entry + risk * MIN_RR
+
+        else:
+            swing_high = float(m5["high"].iloc[-10:].max())
+            sl = max(swing_high, entry + 1.2 * atr)
+
+            risk = sl - entry
+            tp = entry - risk * MIN_RR
+
+        if risk <= 0 or tp <= 0:
+            return None
+
+        rr = abs(tp - entry) / risk
+
+        if rr < MIN_RR:
+            return None
+
+        return {
+            "symbol": symbol,
+            "direction": direction,
+            "entry": round(entry, 8),
+            "stop_loss": round(sl, 8),
+            "take_profit": round(tp, 8),
+            "rr": round(rr, 2),
+            "rsi_15m": round(float(last15["rsi"]), 2),
+            "atr_1m": round(atr, 8),
+            "trend_4h": h4,
+            "trend_1h": h1,
+            "structure_5m": structure5,
+            "volume_ratio": round(
+                float(last1["volume"] / last1["volume_avg"]), 2
+            ),
+        }
+
+    except Exception as exc:
+        print(f"{symbol}: {exc}")
+        return None
+
+
+def main():
+    symbols = load_symbols()
+
+    print(f"Loaded {len(symbols)} Futures symbols")
+
+    signals = []
+
+    for item in symbols:
+        symbol = item["symbol"]
+
+        result = analyze_symbol(symbol)
+
+        if result:
+            signals.append(result)
+            print("SIGNAL:", result)
+
+    signals.sort(
+        key=lambda x: x["rr"],
+        reverse=True
+    )
+
+    signals = signals[:MAX_SIGNALS]
+
+    os.makedirs("data", exist_ok=True)
+
+    with open(
+        "data/signals.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            signals,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    if not signals:
+        print("NO SETUP - DO NOT ENTER")
+
+    print(f"Final signals: {len(signals)}")
 
 
 if __name__ == "__main__":
