@@ -1,17 +1,17 @@
-
-name: LBank Futures Scanner
+name: LBank Futures Smart Scanner
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "*/5 * * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: lbank-futures-scanner
-  cancel-in-progress: true
+  group: lbank-market-data-writer
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -30,145 +32,131 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy websockets
+          pip install requests
 
-      - name: Check Python files
+      - name: Sync with remote
         run: |
-          python -m py_compile collector.py
-          python -m py_compile sniper_entry.py
-          python -m py_compile signal_scanner.py
-          python -m py_compile ws_probe.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Collect LBank Futures data
-        run: |
-          python -u collector.py
+          git fetch origin "${GITHUB_REF_NAME}"
+          git rebase "origin/${GITHUB_REF_NAME}"
 
-      - name: Probe WebSocket
-        continue-on-error: true
+      - name: Collect LBank Futures prices
         run: |
-          python -u ws_probe.py
+          python collector.py
 
-      - name: Check candle endpoint
-        id: candle_config
-        env:
-          LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
+      - name: Run smart scanner
         run: |
-          if [ -n "$LBANK_FUTURES_CANDLE_URL" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "Candle endpoint is configured"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "Candle endpoint missing. Scanner will be skipped."
-          fi
-
-      - name: Run Futures scanner
-        id: futures_scanner
-        if: steps.candle_config.outputs.configured == 'true'
-        env:
-          LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
-        run: |
-          python -u sniper_entry.py
-
-      - name: Filter signals
-        id: filter_signals
-        if: steps.futures_scanner.outcome == 'success'
-        run: |
-          python -u signal_scanner.py
+          python signal_scanner.py
 
       - name: Send Telegram report
-        if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CANDLE_CONFIGURED: ${{ steps.candle_config.outputs.configured }}
-          SCANNER_OUTCOME: ${{ steps.futures_scanner.outcome }}
-          FILTER_OUTCOME: ${{ steps.filter_signals.outcome }}
         run: |
           python - <<'PY'
-          import json
           import os
+          import time
           import requests
+          from pathlib import Path
 
-          token = os.getenv("TELEGRAM_BOT_TOKEN")
-          chat_id = os.getenv("TELEGRAM_CHAT_ID")
+          token = os.environ.get("TELEGRAM_BOT_TOKEN")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 
           if not token or not chat_id:
-              print("Telegram secrets are missing")
-              raise SystemExit(0)
+              raise RuntimeError("Telegram secrets are missing")
 
-          configured = os.getenv("CANDLE_CONFIGURED")
-          scanner = os.getenv("SCANNER_OUTCOME")
-          filter_result = os.getenv("FILTER_OUTCOME")
+          report_file = Path("report.txt")
 
-          if configured != "true":
-              message = (
-                  "LBank Futures Scanner\n\n"
-                  "CANDLE DATA NOT CONFIGURED\n"
-                  "SCANNER NOT RUN\n"
-                  "No trading signals generated."
-              )
+          if not report_file.exists():
+              raise RuntimeError("report.txt was not generated")
 
-          elif scanner != "success":
-              message = (
-                  "LBank Futures Scanner\n\n"
-                  "SCANNER FAILED\n"
-                  "No valid trading signals available."
-              )
+          report = report_file.read_text(encoding="utf-8").strip()
 
-          elif filter_result != "success":
-              message = (
-                  "LBank Futures Scanner\n\n"
-                  "SIGNAL FILTER FAILED\n"
-                  "No verified report available."
-              )
+          if not report:
+              raise RuntimeError("Telegram report is empty")
 
-          else:
-              path = "data/final_signals.json"
+          max_length = 3800
+          chunks = []
+          current = ""
 
-              if not os.path.exists(path):
-                  message = (
-                      "LBank Futures Scanner\n\n"
-                      "SIGNAL FILE NOT FOUND\n"
-                      "Report unavailable."
-                  )
+          for line in report.splitlines():
+              if len(line) > max_length:
+                  raise RuntimeError("A report line exceeds Telegram limit")
+
+              candidate = current + "\n" + line if current else line
+
+              if len(candidate) > max_length:
+                  chunks.append(current)
+                  current = line
               else:
-                  with open(path, encoding="utf-8") as f:
-                      signals = json.load(f)
+                  current = candidate
 
-                  if not signals:
-                      message = (
-                          "LBank Futures Scanner\n\n"
-                          "NO SETUP - DO NOT ENTER"
-                      )
-                  else:
-                      lines = [
-                          "LBank Futures Scanner",
-                          "--------------------"
-                      ]
+          if current:
+              chunks.append(current)
 
-                      for s in signals:
-                          lines.extend([
-                              f"Symbol: {s['symbol']}",
-                              f"Direction: {s['direction']}",
-                              f"Entry: {s['entry']}",
-                              f"Stop Loss: {s['stop_loss']}",
-                              f"Take Profit: {s['take_profit']}",
-                              f"RR: {s['rr']}",
-                              f"Quality: {s.get('quality_score', 'N/A')}",
-                              "--------------------"
-                          ])
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-                      message = "\n".join(lines)
+          for index, chunk in enumerate(chunks, start=1):
+              prefix = f"📨 بخش {index}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
 
-          response = requests.post(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              json={
-                  "chat_id": chat_id,
-                  "text": message
-              },
-              timeout=20
-          )
+              response = requests.post(
+                  url,
+                  json={
+                      "chat_id": chat_id,
+                      "text": prefix + chunk
+                  },
+                  timeout=30
+              )
 
-          response.raise_for_status()
-          print("Telegram report sent")
+              response.raise_for_status()
+
+              result = response.json()
+
+              if not result.get("ok"):
+                  raise RuntimeError(f"Telegram error: {result}")
+
+              print(f"Telegram message {index}/{len(chunks)} sent")
+              time.sleep(1)
+
+          print(f"Successfully sent {len(chunks)} messages")
           PY
+
+      - name: Commit and push market data
+        run: |
+          set -e
+
+          git add data/prices.jsonl
+
+          if git diff --cached --quiet; then
+            echo "No market data changes"
+            exit 0
+          fi
+
+          git commit -m "Update LBank futures market data"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt: ${attempt}"
+
+            git fetch origin "${GITHUB_REF_NAME}"
+
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              echo "Rebase conflict detected"
+
+              git rebase --abort || true
+
+              echo "Manual inspection required. No force push attempted."
+              exit 1
+            fi
+
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "Market data successfully pushed"
+              exit 0
+            fi
+
+            sleep 3
+          done
+
+          echo "Push failed after 5 attempts"
+          exit 1
