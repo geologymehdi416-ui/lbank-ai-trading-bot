@@ -1,95 +1,39 @@
 
-import asyncio
-import json
-from datetime import datetime, timezone
+name: LBank Futures WebSocket Probe
 
-import websockets
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ws_probe.py"
+      - ".github/workflows/ws-probe.yml"
 
-WS_URL = "wss://lbkperpws.lbank.com/ws"
-OUTPUT_FILE = "data/ws_probe.jsonl"
-TIMEOUT = 30
+permissions:
+  contents: read
 
+jobs:
+  websocket-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
 
-def save_message(data):
-    import os
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    os.makedirs("data", exist_ok=True)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    record = {
-        "received_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "data": data,
-    }
+      - name: Install WebSocket library
+        run: |
+          python -m pip install --upgrade pip
+          pip install websockets
 
-    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-        f.write(
-            json.dumps(record, ensure_ascii=False) + "\n"
-        )
+      - name: Validate Python
+        run: |
+          python -m py_compile ws_probe.py
 
-
-async def main():
-    print("Connecting to LBank Futures WebSocket...")
-    print(WS_URL)
-
-    try:
-        async with websockets.connect(
-            WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=10,
-            open_timeout=20,
-        ) as ws:
-
-            print("CONNECTED")
-            print("Waiting for server messages...")
-
-            start = asyncio.get_running_loop().time()
-            received = 0
-
-            while (
-                asyncio.get_running_loop().time() - start
-                < TIMEOUT
-            ):
-                try:
-                    message = await asyncio.wait_for(
-                        ws.recv(),
-                        timeout=5,
-                    )
-
-                    received += 1
-
-                    try:
-                        parsed = json.loads(message)
-                    except json.JSONDecodeError:
-                        parsed = message
-
-                    print("MESSAGE:", parsed)
-                    save_message(parsed)
-
-                    if isinstance(parsed, dict):
-                        if parsed.get("ping") is not None:
-                            pong = {
-                                "action": "pong",
-                                "pong": parsed["ping"],
-                            }
-
-                            await ws.send(json.dumps(pong))
-                            print("PONG SENT")
-
-                except asyncio.TimeoutError:
-                    print("No message in last 5 seconds")
-
-            print("--------------------------------")
-            print("WebSocket probe completed")
-            print("Messages received:", received)
-            print("Saved:", OUTPUT_FILE)
-            print("--------------------------------")
-
-    except Exception as exc:
-        print("WEBSOCKET ERROR:", repr(exc))
-        raise
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+      - name: Test LBank Futures WebSocket
+        run: |
+          python -u ws_probe.py
