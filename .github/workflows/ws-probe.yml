@@ -1,39 +1,118 @@
 
-name: LBank Futures WebSocket Probe
+import asyncio
+import json
+import time
+import websockets
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "ws_probe.py"
-      - ".github/workflows/ws-probe.yml"
+URL = "wss://lbkperpws.lbank.com/ws"
+SYMBOL = "Exchange_BTCUSDT"
+TOPICS = ["11", "12", "13"]
 
-permissions:
-  contents: read
 
-jobs:
-  websocket-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
+async def main():
+    print("Connecting to LBank Futures...")
+    local_no = 0
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    try:
+        async with websockets.connect(
+            URL,
+            open_timeout=15,
+            close_timeout=5,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=8 * 1024 * 1024,
+        ) as ws:
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+            print("CONNECTED")
 
-      - name: Install WebSocket library
-        run: |
-          python -m pip install --upgrade pip
-          pip install websockets
+            for topic in TOPICS:
+                local_no += 1
 
-      - name: Validate Python
-        run: |
-          python -m py_compile ws_probe.py
+                frame = {
+                    "SendTopicAction": {
+                        "Action": "1",
+                        "LocalNo": local_no,
+                        "TopicID": topic,
+                        "FilterValue": SYMBOL,
+                        "ResumeNo": -1,
+                    }
+                }
 
-      - name: Test LBank Futures WebSocket
-        run: |
-          python -u ws_probe.py
+                await ws.send(json.dumps(frame))
+
+                print(
+                    f"SUBSCRIBE SENT: "
+                    f"topic={topic}, symbol={SYMBOL}"
+                )
+
+                await asyncio.sleep(0.6)
+
+            print("Listening for 60 seconds...")
+
+            deadline = time.monotonic() + 60
+
+            while time.monotonic() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=max(
+                            0.1,
+                            deadline - time.monotonic()
+                        )
+                    )
+
+                except asyncio.TimeoutError:
+                    break
+
+                if raw == "ping":
+                    await ws.send("pong")
+                    print("PONG SENT")
+                    continue
+
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    print("NON JSON:", str(raw)[:1000])
+                    continue
+
+                if not isinstance(payload, dict):
+                    continue
+
+                action = payload.get("action", "")
+
+                if action == "RecvTopicAction":
+                    print(
+                        "SUBSCRIPTION ACK:",
+                        json.dumps(payload, ensure_ascii=False)
+                    )
+
+                elif action == "PushKLine":
+                    print(
+                        "*** FUTURES KLINE RECEIVED ***"
+                    )
+                    print(
+                        json.dumps(
+                            payload,
+                            indent=2,
+                            ensure_ascii=False
+                        )
+                    )
+
+                else:
+                    print(
+                        "OTHER MESSAGE:",
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False
+                        )[:3000]
+                    )
+
+            print("PROBE FINISHED")
+
+    except Exception as exc:
+        print("CONNECTION ERROR:", repr(exc))
+        raise
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
