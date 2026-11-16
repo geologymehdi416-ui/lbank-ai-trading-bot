@@ -1,53 +1,4 @@
 
-name: LBank Futures Smart Scanner
-
-on:
-  workflow_dispatch:
-
-  schedule:
-    - cron: "*/5 * * * *"
-
-permissions:
-  contents: write
-
-concurrency:
-  group: lbank-market-data-writer
-  cancel-in-progress: false
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Collect LBank Futures prices
-        run: |
-          python collector.py
-
-      - name: Run Futures Sniper
-        run: |
-          python sniper_entry.py
-
       - name: Send Telegram report
         if: always()
         env:
@@ -60,79 +11,62 @@ jobs:
           import requests
           from pathlib import Path
 
-          token = os.environ.get("TELEGRAM_BOT_TOKEN")
-          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-          if not token or not chat_id:
-              raise RuntimeError("Telegram secrets are missing")
+          REPORT_FILE = Path("report.txt")
+          MAX_LENGTH = 3500
+          MAX_ATTEMPTS = 10
 
-          report_file = Path("report.txt")
+          if not BOT_TOKEN or not CHAT_ID:
+              raise RuntimeError("Telegram secrets are missing.")
 
-          if not report_file.exists():
-              raise RuntimeError("report.txt was not generated")
+          if not REPORT_FILE.exists():
+              raise FileNotFoundError("report.txt was not found.")
 
-          report = report_file.read_text(
-              encoding="utf-8"
-          ).strip()
+          report = REPORT_FILE.read_text(encoding="utf-8").strip()
 
           if not report:
-              report = "No valid trading setup. ورود نکن."
+              report = "No report content available."
 
-          max_length = 3500
-          chunks = []
-          current = ""
+          def split_message(text, limit):
+              chunks = []
 
-          for line in report.splitlines():
-              while len(line) > max_length:
-                  if current:
-                      chunks.append(current)
-                      current = ""
+              while len(text) > limit:
+                  cut = text.rfind("\n", 0, limit)
 
-                  chunks.append(line[:max_length])
-                  line = line[max_length:]
+                  if cut < limit // 2:
+                      cut = limit
 
-              candidate = (
-                  current + "\n" + line
-                  if current else line
-              )
+                  chunks.append(text[:cut])
+                  text = text[cut:].lstrip()
 
-              if len(candidate) > max_length:
-                  if current:
-                      chunks.append(current)
-                  current = line
-              else:
-                  current = candidate
+              if text:
+                  chunks.append(text)
 
-          if current:
-              chunks.append(current)
+              return chunks
 
-          url = (
-              f"https://api.telegram.org/"
-              f"bot{token}/sendMessage"
-          )
+          chunks = split_message(report, MAX_LENGTH)
+
+          url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
           session = requests.Session()
 
           for index, chunk in enumerate(chunks, start=1):
-              prefix = (
-                  f"📨 بخش {index}/{len(chunks)}\n\n"
-                  if len(chunks) > 1 else ""
-              )
-
               payload = {
-                  "chat_id": chat_id,
-                  "text": prefix + chunk,
-                  "disable_web_page_preview": True,
+                  "chat_id": CHAT_ID,
+                  "text": chunk,
+                  "disable_web_page_preview": True
               }
 
               sent = False
 
-              for attempt in range(1, 6):
+              for attempt in range(1, MAX_ATTEMPTS + 1):
                   try:
                       response = session.post(
                           url,
                           json=payload,
-                          timeout=30,
+                          timeout=30
                       )
 
                       try:
@@ -140,80 +74,64 @@ jobs:
                       except ValueError:
                           result = {}
 
-                      if (
-                          response.status_code == 200
-                          and result.get("ok")
-                      ):
+                      if response.status_code == 200 and result.get("ok"):
                           print(
-                              f"Telegram message "
-                              f"{index}/{len(chunks)} sent"
+                              f"Message {index}/{len(chunks)} sent successfully."
                           )
                           sent = True
                           break
 
                       if response.status_code == 429:
-                          wait = int(
-                              result.get(
-                                  "parameters", {}
-                              ).get("retry_after", 10)
-                          ) + 2
-                          time.sleep(wait)
+                          retry_after = result.get(
+                              "parameters", {}
+                          ).get("retry_after", 10)
+
+                          wait_time = int(retry_after) + 2
+
+                          print(
+                              f"Rate limit reached. "
+                              f"Waiting {wait_time} seconds. "
+                              f"Attempt {attempt}/{MAX_ATTEMPTS}"
+                          )
+
+                          time.sleep(wait_time)
                           continue
 
                       if response.status_code >= 500:
-                          time.sleep(min(attempt * 5, 30))
+                          wait_time = min(5 * attempt, 60)
+
+                          print(
+                              f"Telegram server error: "
+                              f"{response.status_code}. "
+                              f"Retrying in {wait_time} seconds."
+                          )
+
+                          time.sleep(wait_time)
                           continue
 
                       raise RuntimeError(
                           f"Telegram API error: "
-                          f"{response.status_code} {result}"
+                          f"{response.status_code} - {result}"
                       )
 
                   except requests.RequestException as error:
-                      print("Telegram network error:", error)
-                      time.sleep(min(attempt * 5, 30))
+                      wait_time = min(5 * attempt, 60)
+
+                      print(
+                          f"Network error: {error}. "
+                          f"Retrying in {wait_time} seconds."
+                      )
+
+                      time.sleep(wait_time)
 
               if not sent:
                   raise RuntimeError(
-                      f"Telegram delivery failed: message {index}"
+                      f"Could not send message {index} "
+                      f"after {MAX_ATTEMPTS} attempts."
                   )
 
               if index < len(chunks):
-                  time.sleep(3)
+                  time.sleep(5)
 
-          print("Telegram delivery completed")
+          print("Telegram report delivery completed.")
           PY
-
-      - name: Commit and push market data
-        if: success()
-        run: |
-          set -e
-
-          git add data/prices.jsonl
-
-          if git diff --cached --quiet; then
-            echo "No market data changes"
-            exit 0
-          fi
-
-          git commit -m "Update LBank futures market data"
-
-          for attempt in 1 2 3 4 5; do
-            git fetch origin "${GITHUB_REF_NAME}"
-
-            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
-              git rebase --abort || true
-              echo "Rebase conflict. Manual inspection required."
-              exit 1
-            fi
-
-            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Market data successfully pushed"
-              exit 0
-            fi
-
-            sleep 3
-          done
-
-          echo "Push failed after 5 attempts"
-          exit 1
