@@ -44,26 +44,45 @@ jobs:
           python -u collector.py
 
       - name: Probe WebSocket
-        id: websocket
         continue-on-error: true
         run: |
           python -u ws_probe.py
 
+      - name: Check candle endpoint
+        id: candle_config
+        env:
+          LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
+        run: |
+          if [ -n "$LBANK_FUTURES_CANDLE_URL" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "Candle endpoint is configured"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Candle endpoint missing. Scanner will be skipped."
+          fi
+
       - name: Run Futures scanner
+        id: futures_scanner
+        if: steps.candle_config.outputs.configured == 'true'
         env:
           LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
         run: |
           python -u sniper_entry.py
 
       - name: Filter signals
+        id: filter_signals
+        if: steps.futures_scanner.outcome == 'success'
         run: |
           python -u signal_scanner.py
 
       - name: Send Telegram report
-        if: always() && hashFiles('data/final_signals.json') != ''
+        if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CANDLE_CONFIGURED: ${{ steps.candle_config.outputs.configured }}
+          SCANNER_OUTCOME: ${{ steps.futures_scanner.outcome }}
+          FILTER_OUTCOME: ${{ steps.filter_signals.outcome }}
         run: |
           python - <<'PY'
           import json
@@ -77,36 +96,69 @@ jobs:
               print("Telegram secrets are missing")
               raise SystemExit(0)
 
-          with open(
-              "data/final_signals.json",
-              encoding="utf-8"
-          ) as f:
-              signals = json.load(f)
+          configured = os.getenv("CANDLE_CONFIGURED")
+          scanner = os.getenv("SCANNER_OUTCOME")
+          filter_result = os.getenv("FILTER_OUTCOME")
 
-          if not signals:
+          if configured != "true":
               message = (
                   "LBank Futures Scanner\n\n"
-                  "NO SETUP - DO NOT ENTER"
+                  "CANDLE DATA NOT CONFIGURED\n"
+                  "SCANNER NOT RUN\n"
+                  "No trading signals generated."
               )
+
+          elif scanner != "success":
+              message = (
+                  "LBank Futures Scanner\n\n"
+                  "SCANNER FAILED\n"
+                  "No valid trading signals available."
+              )
+
+          elif filter_result != "success":
+              message = (
+                  "LBank Futures Scanner\n\n"
+                  "SIGNAL FILTER FAILED\n"
+                  "No verified report available."
+              )
+
           else:
-              lines = [
-                  "LBank Futures Scanner",
-                  "--------------------"
-              ]
+              path = "data/final_signals.json"
 
-              for s in signals:
-                  lines.extend([
-                      f"Symbol: {s['symbol']}",
-                      f"Direction: {s['direction']}",
-                      f"Entry: {s['entry']}",
-                      f"Stop Loss: {s['stop_loss']}",
-                      f"Take Profit: {s['take_profit']}",
-                      f"RR: {s['rr']}",
-                      f"Quality: {s.get('quality_score', 'N/A')}",
-                      "--------------------"
-                  ])
+              if not os.path.exists(path):
+                  message = (
+                      "LBank Futures Scanner\n\n"
+                      "SIGNAL FILE NOT FOUND\n"
+                      "Report unavailable."
+                  )
+              else:
+                  with open(path, encoding="utf-8") as f:
+                      signals = json.load(f)
 
-              message = "\n".join(lines)
+                  if not signals:
+                      message = (
+                          "LBank Futures Scanner\n\n"
+                          "NO SETUP - DO NOT ENTER"
+                      )
+                  else:
+                      lines = [
+                          "LBank Futures Scanner",
+                          "--------------------"
+                      ]
+
+                      for s in signals:
+                          lines.extend([
+                              f"Symbol: {s['symbol']}",
+                              f"Direction: {s['direction']}",
+                              f"Entry: {s['entry']}",
+                              f"Stop Loss: {s['stop_loss']}",
+                              f"Take Profit: {s['take_profit']}",
+                              f"RR: {s['rr']}",
+                              f"Quality: {s.get('quality_score', 'N/A')}",
+                              "--------------------"
+                          ])
+
+                      message = "\n".join(lines)
 
           response = requests.post(
               f"https://api.telegram.org/bot{token}/sendMessage",
