@@ -1,137 +1,97 @@
 
+name: LBank Futures Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lbank-futures-scanner
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Collect LBank Futures data
+        run: |
+          python collector.py
+
+      - name: Run scanner
+        env:
+          LBANK_FUTURES_CANDLE_URL: ${{ secrets.LBANK_FUTURES_CANDLE_URL }}
+        run: |
+          python sniper_entry.py
+
       - name: Send Telegram report
-        if: always()
+        if: always() && hashFiles('data/signals.json') != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
+          import json
           import os
-          import time
           import requests
-          from pathlib import Path
 
-          BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-          CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+          token = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-          REPORT_FILE = Path("report.txt")
-          MAX_LENGTH = 3500
-          MAX_ATTEMPTS = 10
+          if not token or not chat_id:
+              print("Telegram secrets are missing")
+              raise SystemExit(0)
 
-          if not BOT_TOKEN or not CHAT_ID:
-              raise RuntimeError("Telegram secrets are missing.")
+          with open("data/signals.json", encoding="utf-8") as f:
+              signals = json.load(f)
 
-          if not REPORT_FILE.exists():
-              raise FileNotFoundError("report.txt was not found.")
+          if not signals:
+              message = "LBank Futures Scanner\n\nNO SETUP - DO NOT ENTER"
+          else:
+              lines = ["LBank Futures Scanner", ""]
 
-          report = REPORT_FILE.read_text(encoding="utf-8").strip()
+              for s in signals:
+                  lines.extend([
+                      f"{s['symbol']} | {s['direction']}",
+                      f"Entry: {s['entry']}",
+                      f"SL: {s['stop_loss']}",
+                      f"TP: {s['take_profit']}",
+                      f"RR: {s['rr']}",
+                      f"RSI 15m: {s['rsi_15m']}",
+                      f"Volume ratio: {s['volume_ratio']}",
+                      "--------------------"
+                  ])
 
-          if not report:
-              report = "No report content available."
+              message = "\n".join(lines)
 
-          def split_message(text, limit):
-              chunks = []
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={
+                  "chat_id": chat_id,
+                  "text": message
+              },
+              timeout=15
+          )
 
-              while len(text) > limit:
-                  cut = text.rfind("\n", 0, limit)
-
-                  if cut < limit // 2:
-                      cut = limit
-
-                  chunks.append(text[:cut])
-                  text = text[cut:].lstrip()
-
-              if text:
-                  chunks.append(text)
-
-              return chunks
-
-          chunks = split_message(report, MAX_LENGTH)
-
-          url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-          session = requests.Session()
-
-          for index, chunk in enumerate(chunks, start=1):
-              payload = {
-                  "chat_id": CHAT_ID,
-                  "text": chunk,
-                  "disable_web_page_preview": True
-              }
-
-              sent = False
-
-              for attempt in range(1, MAX_ATTEMPTS + 1):
-                  try:
-                      response = session.post(
-                          url,
-                          json=payload,
-                          timeout=30
-                      )
-
-                      try:
-                          result = response.json()
-                      except ValueError:
-                          result = {}
-
-                      if response.status_code == 200 and result.get("ok"):
-                          print(
-                              f"Message {index}/{len(chunks)} sent successfully."
-                          )
-                          sent = True
-                          break
-
-                      if response.status_code == 429:
-                          retry_after = result.get(
-                              "parameters", {}
-                          ).get("retry_after", 10)
-
-                          wait_time = int(retry_after) + 2
-
-                          print(
-                              f"Rate limit reached. "
-                              f"Waiting {wait_time} seconds. "
-                              f"Attempt {attempt}/{MAX_ATTEMPTS}"
-                          )
-
-                          time.sleep(wait_time)
-                          continue
-
-                      if response.status_code >= 500:
-                          wait_time = min(5 * attempt, 60)
-
-                          print(
-                              f"Telegram server error: "
-                              f"{response.status_code}. "
-                              f"Retrying in {wait_time} seconds."
-                          )
-
-                          time.sleep(wait_time)
-                          continue
-
-                      raise RuntimeError(
-                          f"Telegram API error: "
-                          f"{response.status_code} - {result}"
-                      )
-
-                  except requests.RequestException as error:
-                      wait_time = min(5 * attempt, 60)
-
-                      print(
-                          f"Network error: {error}. "
-                          f"Retrying in {wait_time} seconds."
-                      )
-
-                      time.sleep(wait_time)
-
-              if not sent:
-                  raise RuntimeError(
-                      f"Could not send message {index} "
-                      f"after {MAX_ATTEMPTS} attempts."
-                  )
-
-              if index < len(chunks):
-                  time.sleep(5)
-
-          print("Telegram report delivery completed.")
+          response.raise_for_status()
+          print("Telegram report sent")
           PY
