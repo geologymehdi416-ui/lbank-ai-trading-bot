@@ -1,273 +1,54 @@
 
-name: LBank Futures WebSocket Probe
+name: LBank Futures WS Probe
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/15 * * * *"
 
 permissions:
   contents: read
 
 jobs:
-  futures-probe:
+  probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
+    timeout-minutes: 2
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests websockets
+      - name: Install WebSocket library
+        run: pip install websockets
 
-      - name: Discover BTC Futures and test Order Book
-        run: |
-          python - <<'PY'
-          import requests
-          import json
-          import time
-
-          BASE = "https://lbkperp.lbank.com"
-          SYMBOL = "BTCUSDT"
-          PRODUCT_GROUP = "SwapU"
-
-          session = requests.Session()
-          session.headers.update({
-              "User-Agent": "Mozilla/5.0",
-              "Accept": "application/json"
-          })
-
-          def get_json(path, params):
-              url = BASE + path
-              print("\nREQUEST:", url)
-              print("PARAMS:", params)
-
-              response = session.get(
-                  url,
-                  params=params,
-                  timeout=20
-              )
-
-              print("HTTP STATUS:", response.status_code)
-              response.raise_for_status()
-
-              data = response.json()
-              print("RESPONSE:")
-              print(json.dumps(data, indent=2)[:12000])
-
-              return data
-
-          # 1. Exchange time
-          print("\n========== EXCHANGE TIME ==========")
-
-          try:
-              get_json(
-                  "/cfd/openApi/v1/pub/getTime",
-                  {}
-              )
-          except Exception as exc:
-              print("TIME_ERROR:", repr(exc))
-
-          # 2. Futures instruments
-          print("\n========== FUTURES INSTRUMENTS ==========")
-
-          try:
-              instruments = get_json(
-                  "/cfd/openApi/v1/pub/instrument",
-                  {"productGroup": PRODUCT_GROUP}
-              )
-
-              print("\nBTCUSDT INSTRUMENT MATCH:")
-
-              text = json.dumps(instruments)
-
-              if SYMBOL in text:
-                  print("BTCUSDT_FOUND")
-              else:
-                  print("BTCUSDT_NOT_FOUND")
-
-          except Exception as exc:
-              print("INSTRUMENT_ERROR:", repr(exc))
-
-          # 3. Futures market data
-          print("\n========== FUTURES MARKET DATA ==========")
-
-          try:
-              market = get_json(
-                  "/cfd/openApi/v1/pub/marketData",
-                  {"productGroup": PRODUCT_GROUP}
-              )
-
-              print("\nMARKET DATA BTCUSDT MATCH:")
-
-              print(
-                  "BTCUSDT_PRESENT:",
-                  SYMBOL in json.dumps(market)
-              )
-
-          except Exception as exc:
-              print("MARKET_DATA_ERROR:", repr(exc))
-
-          # 4. Order book
-          print("\n========== BTCUSDT ORDER BOOK ==========")
-
-          try:
-              orderbook = get_json(
-                  "/cfd/openApi/v1/pub/marketOrder",
-                  {
-                      "symbol": SYMBOL,
-                      "depth": 20
-                  }
-              )
-
-              print("\nORDERBOOK_TEST_COMPLETED")
-
-          except Exception as exc:
-              print("ORDERBOOK_ERROR:", repr(exc))
-
-          print("\nREST_PROBE_FINISHED")
-          PY
-
-      - name: Subscribe to Futures KLine channels
+      - name: Test Futures WebSocket
         run: |
           python - <<'PY'
           import asyncio
-          import json
-          import time
           import websockets
 
           URL = "wss://lbkperpws.lbank.com/ws"
 
-          TOPICS = ["11", "12", "13"]
-          FILTER = "Exchange_BTCUSDT"
-
           async def main():
-              message_count = 0
-              kline_count = 0
-
+              print("Connecting to LBank Futures...")
               try:
-                  print("Connecting to LBank Futures...")
-
                   async with websockets.connect(
                       URL,
-                      open_timeout=20,
-                      close_timeout=5,
-                      ping_interval=None,
-                      ping_timeout=None,
-                      max_size=10 * 1024 * 1024
+                      open_timeout=15,
+                      close_timeout=5
                   ) as ws:
-
                       print("HANDSHAKE_OK")
-                      print("AUTOMATIC_CLIENT_PING_DISABLED")
-                      print("SERVER_PING_RESPONSES_REMAIN_ENABLED")
-
-                      # Subscribe to each candidate channel
-                      for index, topic in enumerate(
-                          TOPICS,
-                          start=1
-                      ):
-                          payload = {
-                              "SendTopicAction": {
-                                  "Action": "1",
-                                  "LocalNo": index,
-                                  "TopicID": topic,
-                                  "FilterValue": FILTER,
-                                  "ResumeNo": -1
-                              }
-                          }
-
-                          await ws.send(json.dumps(payload))
-
-                          print(
-                              "SUBSCRIBE_SENT:",
-                              "TOPIC=" + topic,
-                              "FILTER=" + FILTER
-                          )
-
-                          await asyncio.sleep(1)
-
-                      print("WAITING_FOR_MESSAGES")
-
-                      end_time = (
-                          asyncio.get_running_loop().time() + 90
-                      )
-
-                      while (
-                          asyncio.get_running_loop().time()
-                          < end_time
-                      ):
-                          remaining = (
-                              end_time
-                              - asyncio.get_running_loop().time()
-                          )
-
+                      print("Waiting for server messages...")
+                      for i in range(4):
                           try:
-                              raw = await asyncio.wait_for(
-                                  ws.recv(),
-                                  timeout=min(20, remaining)
+                              msg = await asyncio.wait_for(
+                                  ws.recv(), timeout=5
                               )
-
-                              message_count += 1
-
-                              print(
-                                  "\nRAW_MESSAGE_NUMBER:",
-                                  message_count
-                              )
-
-                              if isinstance(raw, bytes):
-                                  raw = raw.decode(
-                                      "utf-8",
-                                      errors="replace"
-                                  )
-
-                              print("RAW:", str(raw)[:8000])
-
-                              if "PushKLine" in str(raw):
-                                  kline_count += 1
-                                  print("KLINE_MESSAGE_RECEIVED")
-
-                                  try:
-                                      parsed = json.loads(raw)
-
-                                      print(
-                                          "KLINE_JSON:",
-                                          json.dumps(
-                                              parsed,
-                                              indent=2
-                                          )[:8000]
-                                      )
-
-                                  except Exception as exc:
-                                      print(
-                                          "KLINE_PARSE_ERROR:",
-                                          repr(exc)
-                                      )
-
+                              print("RAW MESSAGE:", str(msg)[:3000])
                           except asyncio.TimeoutError:
-                              print("NO_MESSAGE_YET")
-
-                      print("\n========== WS SUMMARY ==========")
-                      print("TOTAL_MESSAGES:", message_count)
-                      print("KLINE_MESSAGES:", kline_count)
-
-                      if kline_count == 0:
-                          print("NO_KLINE_DATA_RECEIVED")
-
-                      print("PROBE_FINISHED")
-
-              except Exception as exc:
-                  print(
-                      "CONNECTION_ERROR:",
-                      repr(exc)
-                  )
+                              print("NO MESSAGE RECEIVED")
+                              break
+              except Exception as e:
+                  print("CONNECTION ERROR:", repr(e))
 
           asyncio.run(main())
           PY
