@@ -95,6 +95,8 @@ MIN_CANDLES = 100
 
 MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
 FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
+CONFIRM_VOL = _env_float("CONFIRM_VOL", 1.2)     # 1m confirmation: volume >= this x avg
+CONFIRM_BODY = _env_float("CONFIRM_BODY", 0.5)   # 1m confirmation: body >= this x avg body
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
 MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)
 CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting  # targets beyond this net RR are unrealistic for the window and skipped
@@ -114,6 +116,7 @@ BREAKOUT_MIN_VOL = 1.2      # breakout candle volume >= this x mean volume of th
 
 # tf name -> (LBank type, seconds)
 TF_MAP: Dict[str, Tuple[str, int]] = {
+    "1m": ("minute1", 60),
     "5m": ("minute5", 300),
     "15m": ("minute15", 900),
     "1h": ("hour1", 3600),
@@ -1058,8 +1061,33 @@ def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict
             "condition": cond, "extra": extra}
 
 
+def confirm_1m_entry(side: str, entry: float, c1: Optional[Candles]) -> Tuple[bool, str]:
+    """1m trigger on closed candles: touch the entry, close back on the trade side,
+    body >= CONFIRM_BODY x avg body and volume >= CONFIRM_VOL x avg volume."""
+    if c1 is None or len(c1.c) < 25:
+        return False, "کندل ۱m دریافت نشد؛ تأیید ورود انجام نشد"
+    o, h, l, c, v = c1.o[-1], c1.h[-1], c1.l[-1], c1.c[-1], c1.v[-1]
+    avg_body = sum(abs(c1.c[i] - c1.o[i]) for i in range(-21, -1)) / 20.0
+    avg_vol = sum(c1.v[-21:-1]) / 20.0
+    body_ok = avg_body > 0 and abs(c - o) >= CONFIRM_BODY * avg_body
+    vol_ok = avg_vol > 0 and v >= CONFIRM_VOL * avg_vol
+    if side == "SHORT":
+        touched, rejected = h >= entry, (c < o and c < entry)
+    else:
+        touched, rejected = l <= entry, (c > o and c > entry)
+    if touched and rejected and body_ok and vol_ok:
+        return True, "تأیید ۱m: کندل رد بسته‌شده با بدنه و حجم کافی"
+    if not touched:
+        return False, "منتظر رسیدن قیمت به ورود %s (۱m هنوز لمس نکرده)" % fmt_price(entry)
+    return False, "در ناحیه‌ی ورود؛ منتظر کندل ۱m رد با بدنه و حجم کافی"
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
+    try:
+        C["1m"] = fetch_klines(symbol, "1m", size=120)
+    except ScanError:
+        C["1m"] = None
     price = fetch_price(symbol) or C["5m"].c[-1]
     return analyze_candles(symbol, C, price, min_score)
 
@@ -1087,11 +1115,16 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
                 and not gb and s["trade"]):
             signal = s
             break
+    one_min_msg = ""
+    if signal is not None:
+        ok1, one_min_msg = confirm_1m_entry(signal["side"], signal["trade"]["entry"], C.get("1m"))
+        if not ok1:
+            signal = None
     age_min = (time.time() - (D["5m"]["cs"].t[-1] + TF_MAP["5m"][1])) / 60.0
     res: Dict[str, Any] = {
         "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
         "global_blockers": gb, "signal": signal, "watch": None,
-        "reason_override": None, "data_age_min": age_min, "regime": regime,
+        "reason_override": (one_min_msg or None), "data_age_min": age_min, "regime": regime,
         "liq": liquidity_map(D["15m"], price),
     }
     if not signal and not gb:
