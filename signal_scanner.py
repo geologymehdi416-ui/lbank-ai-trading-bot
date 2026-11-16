@@ -1,374 +1,211 @@
 
-import os
 import json
-import time
-import requests
-import numpy as np
-import pandas as pd
+import os
+from datetime import datetime, timezone
 
-DATA_FILE = "data/prices.jsonl"
-
-TIMEFRAMES = {
-    "4h": "4h",
-    "1h": "1h",
-    "15m": "15m",
-    "5m": "5m",
-    "1m": "1m",
-}
+SIGNALS_FILE = "data/signals.json"
+OUTPUT_FILE = "data/final_signals.json"
+HISTORY_FILE = "data/signal_history.json"
 
 MIN_RR = 1.5
 MAX_SIGNALS = 5
-MAX_SYMBOLS = 30
-
-# Candle endpoint is intentionally configurable.
-# Do not point this to a Spot or Binance endpoint.
-LBANK_FUTURES_CANDLE_URL = os.getenv(
-    "LBANK_FUTURES_CANDLE_URL", ""
-)
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "LBank-Futures-Scanner/1.0"
-})
 
 
-def load_symbols():
-    if not os.path.exists(DATA_FILE):
-        return []
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
 
-    latest = {}
-
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                item = json.loads(line)
-                symbol = item.get("symbol")
-                if symbol:
-                    latest[symbol] = item
-            except json.JSONDecodeError:
-                continue
-
-    return sorted(
-        latest.values(),
-        key=lambda x: x.get("quote_volume") or 0,
-        reverse=True
-    )[:MAX_SYMBOLS]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
-def fetch_candles(symbol, timeframe, limit=250):
-    if not LBANK_FUTURES_CANDLE_URL:
-        raise RuntimeError(
-            "LBank Futures candle endpoint is not configured. "
-            "No Binance or Spot fallback is allowed."
-        )
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    response = session.get(
-        LBANK_FUTURES_CANDLE_URL,
-        params={
-            "symbol": symbol,
-            "interval": timeframe,
-            "limit": limit,
-        },
-        timeout=15,
-    )
-    response.raise_for_status()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-    payload = response.json()
 
-    if isinstance(payload, dict):
-        rows = payload.get("data")
-        if rows is None:
-            rows = payload.get("result")
-    else:
-        rows = payload
-
-    if not isinstance(rows, list) or len(rows) < 100:
-        raise ValueError(f"Invalid candles for {symbol} {timeframe}")
-
-    df = pd.DataFrame(rows)
-
-    # Expected normalized candle columns:
-    # timestamp, open, high, low, close, volume
+def validate_signal(signal):
     required = [
-        "timestamp", "open", "high",
-        "low", "close", "volume"
+        "symbol",
+        "direction",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "rr",
     ]
 
-    if not all(col in df.columns for col in required):
-        raise ValueError(
-            "Candle response must be normalized to: "
-            + ", ".join(required)
-        )
+    if not all(key in signal for key in required):
+        return False
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    try:
+        entry = float(signal["entry"])
+        sl = float(signal["stop_loss"])
+        tp = float(signal["take_profit"])
+        rr = float(signal["rr"])
+    except (TypeError, ValueError):
+        return False
 
-    df = df.dropna(subset=required)
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    if min(entry, sl, tp) <= 0:
+        return False
 
-    if len(df) < 100:
-        raise ValueError("Not enough valid candles")
+    if rr < MIN_RR:
+        return False
 
-    return df
+    direction = signal["direction"].upper()
+
+    if direction == "LONG":
+        if not (sl < entry < tp):
+            return False
+
+        actual_rr = (tp - entry) / (entry - sl)
+
+    elif direction == "SHORT":
+        if not (tp < entry < sl):
+            return False
+
+        actual_rr = (entry - tp) / (sl - entry)
+
+    else:
+        return False
+
+    # Recalculate RR instead of trusting the supplied value.
+    if actual_rr < MIN_RR:
+        return False
+
+    signal["rr"] = round(actual_rr, 2)
+    return True
 
 
-def indicators(df):
-    df = df.copy()
+def quality_score(signal):
+    score = 0
 
-    df["ema20"] = df["close"].ewm(
-        span=20, adjust=False
-    ).mean()
+    rr = float(signal["rr"])
+    rsi = float(signal.get("rsi_15m", 50))
+    volume = float(signal.get("volume_ratio", 0))
 
-    df["ema50"] = df["close"].ewm(
-        span=50, adjust=False
-    ).mean()
+    if rr >= 2:
+        score += 2
+    elif rr >= 1.5:
+        score += 1
 
-    df["ema100"] = df["close"].ewm(
-        span=100, adjust=False
-    ).mean()
+    if signal["direction"] == "LONG" and 52 <= rsi <= 68:
+        score += 2
 
-    delta = df["close"].diff()
+    elif signal["direction"] == "SHORT" and 32 <= rsi <= 48:
+        score += 2
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    if volume >= 1.5:
+        score += 2
+    elif volume >= 1.2:
+        score += 1
 
-    avg_gain = gain.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
+    if signal.get("trend_4h") == signal.get("trend_1h"):
+        score += 1
 
-    avg_loss = loss.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    ema12 = df["close"].ewm(
-        span=12, adjust=False
-    ).mean()
-
-    ema26 = df["close"].ewm(
-        span=26, adjust=False
-    ).mean()
-
-    df["macd"] = ema12 - ema26
-
-    df["macd_signal"] = df["macd"].ewm(
-        span=9, adjust=False
-    ).mean()
-
-    df["macd_hist"] = (
-        df["macd"] - df["macd_signal"]
+    expected_structure = (
+        "BULLISH_BREAKOUT"
+        if signal["direction"] == "LONG"
+        else "BEARISH_BREAKDOWN"
     )
 
-    previous_close = df["close"].shift(1)
+    if signal.get("structure_5m") == expected_structure:
+        score += 1
 
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - previous_close).abs(),
-        (df["low"] - previous_close).abs(),
-    ], axis=1).max(axis=1)
-
-    df["atr"] = tr.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
-
-    df["volume_avg"] = df["volume"].rolling(20).mean()
-
-    return df.dropna().reset_index(drop=True)
+    return score
 
 
-def market_trend(df):
-    last = df.iloc[-1]
-
-    if (
-        last["close"] > last["ema20"]
-        and last["ema20"] > last["ema50"]
-        and last["ema50"] > last["ema100"]
-    ):
-        return "LONG"
-
-    if (
-        last["close"] < last["ema20"]
-        and last["ema20"] < last["ema50"]
-        and last["ema50"] < last["ema100"]
-    ):
-        return "SHORT"
-
-    return "NEUTRAL"
-
-
-def structure(df):
-    recent = df.iloc[-21:-1]
-
-    high = recent["high"].max()
-    low = recent["low"].min()
-
-    close = df.iloc[-1]["close"]
-
-    if close > high:
-        return "BULLISH_BREAKOUT"
-
-    if close < low:
-        return "BEARISH_BREAKDOWN"
-
-    return "RANGE"
-
-
-def analyze_symbol(symbol):
-    try:
-        candles = {}
-
-        for tf in TIMEFRAMES:
-            candles[tf] = indicators(
-                fetch_candles(symbol, tf)
-            )
-            time.sleep(0.1)
-
-        h4 = market_trend(candles["4h"])
-        h1 = market_trend(candles["1h"])
-        m15 = candles["15m"]
-        m5 = candles["5m"]
-        m1 = candles["1m"]
-
-        if h4 != h1 or h4 == "NEUTRAL":
-            return None
-
-        trend = h4
-
-        last15 = m15.iloc[-1]
-        last5 = m5.iloc[-1]
-        last1 = m1.iloc[-1]
-
-        structure5 = structure(m5)
-
-        volume_ok = (
-            last1["volume_avg"] > 0
-            and last1["volume"] > last1["volume_avg"] * 1.2
-        )
-
-        if trend == "LONG":
-            setup_ok = (
-                last15["close"] > last15["ema50"]
-                and last15["macd_hist"] > 0
-                and 50 < last15["rsi"] < 72
-                and structure5 == "BULLISH_BREAKOUT"
-                and last5["close"] > last5["ema20"]
-                and last1["close"] > last1["ema20"]
-                and last1["macd_hist"] > 0
-                and volume_ok
-            )
-
-            direction = "LONG"
-
-        else:
-            setup_ok = (
-                last15["close"] < last15["ema50"]
-                and last15["macd_hist"] < 0
-                and 28 < last15["rsi"] < 50
-                and structure5 == "BEARISH_BREAKDOWN"
-                and last5["close"] < last5["ema20"]
-                and last1["close"] < last1["ema20"]
-                and last1["macd_hist"] < 0
-                and volume_ok
-            )
-
-            direction = "SHORT"
-
-        if not setup_ok:
-            return None
-
-        entry = float(last1["close"])
-        atr = float(last1["atr"])
-
-        if not np.isfinite(atr) or atr <= 0:
-            return None
-
-        if direction == "LONG":
-            swing_low = float(m5["low"].iloc[-10:].min())
-            sl = min(swing_low, entry - 1.2 * atr)
-
-            risk = entry - sl
-            tp = entry + risk * MIN_RR
-
-        else:
-            swing_high = float(m5["high"].iloc[-10:].max())
-            sl = max(swing_high, entry + 1.2 * atr)
-
-            risk = sl - entry
-            tp = entry - risk * MIN_RR
-
-        if risk <= 0 or tp <= 0:
-            return None
-
-        rr = abs(tp - entry) / risk
-
-        if rr < MIN_RR:
-            return None
-
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": round(entry, 8),
-            "stop_loss": round(sl, 8),
-            "take_profit": round(tp, 8),
-            "rr": round(rr, 2),
-            "rsi_15m": round(float(last15["rsi"]), 2),
-            "atr_1m": round(atr, 8),
-            "trend_4h": h4,
-            "trend_1h": h1,
-            "structure_5m": structure5,
-            "volume_ratio": round(
-                float(last1["volume"] / last1["volume_avg"]), 2
-            ),
-        }
-
-    except Exception as exc:
-        print(f"{symbol}: {exc}")
-        return None
+def signal_key(signal):
+    return (
+        f"{signal['symbol']}:"
+        f"{signal['direction']}"
+    )
 
 
 def main():
-    symbols = load_symbols()
+    signals = load_json(SIGNALS_FILE, [])
+    history = load_json(HISTORY_FILE, {})
 
-    print(f"Loaded {len(symbols)} Futures symbols")
+    if not isinstance(signals, list):
+        signals = []
 
-    signals = []
+    accepted = []
 
-    for item in symbols:
-        symbol = item["symbol"]
+    for signal in signals:
+        if not validate_signal(signal):
+            continue
 
-        result = analyze_symbol(symbol)
+        score = quality_score(signal)
 
-        if result:
-            signals.append(result)
-            print("SIGNAL:", result)
+        # Minimum quality score.
+        if score < 5:
+            continue
 
-    signals.sort(
-        key=lambda x: x["rr"],
+        signal["quality_score"] = score
+        signal["created_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        key = signal_key(signal)
+
+        # Prevent repeating the same direction for the same symbol.
+        previous = history.get(key)
+
+        if previous:
+            previous_entry = float(previous.get("entry", 0))
+            current_entry = float(signal["entry"])
+
+            if previous_entry > 0:
+                difference = abs(
+                    current_entry - previous_entry
+                ) / previous_entry
+
+                if difference < 0.002:
+                    continue
+
+        accepted.append(signal)
+
+    accepted.sort(
+        key=lambda x: (
+            x["quality_score"],
+            x["rr"]
+        ),
         reverse=True
     )
 
-    signals = signals[:MAX_SIGNALS]
+    accepted = accepted[:MAX_SIGNALS]
 
-    os.makedirs("data", exist_ok=True)
+    for signal in accepted:
+        history[signal_key(signal)] = {
+            "entry": signal["entry"],
+            "created_at": signal["created_at"],
+        }
 
-    with open(
-        "data/signals.json",
-        "w",
-        encoding="utf-8"
-    ) as f:
-        json.dump(
-            signals,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
+    save_json(OUTPUT_FILE, accepted)
+    save_json(HISTORY_FILE, history)
 
-    if not signals:
-        print("NO SETUP - DO NOT ENTER")
+    print("=" * 40)
 
-    print(f"Final signals: {len(signals)}")
+    if not accepted:
+        print("NO VALID SIGNAL")
+        print("DO NOT ENTER")
+    else:
+        for signal in accepted:
+            print(
+                signal["symbol"],
+                signal["direction"],
+                "Entry:", signal["entry"],
+                "SL:", signal["stop_loss"],
+                "TP:", signal["take_profit"],
+                "RR:", signal["rr"],
+                "Score:", signal["quality_score"],
+            )
+
+    print("=" * 40)
 
 
 if __name__ == "__main__":
