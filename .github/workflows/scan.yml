@@ -50,16 +50,10 @@ jobs:
           python collector.py
 
       # تحلیل بازار با تأیید فیبوناچی
-      - name: Run smart scanner
-        env:
-          FIB_CONFIRM: "1"
+            # Futures-only Sniper safety gate
+      - name: Run Futures Sniper
         run: |
-          python signal_scanner.py
-
-      # اجرای تحلیل‌گر مستقل فیبوناچی
-      - name: Generate Fibonacci analysis
-        run: |
-          python fib_analyst.py
+          python sniper_entry.py
 
       # ارسال گزارش تلگرام
       - name: Send Telegram report
