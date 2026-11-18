@@ -1082,6 +1082,74 @@ def confirm_1m_entry(side: str, entry: float, c1: Optional[Candles]) -> Tuple[bo
     return False, "در ناحیه‌ی ورود؛ منتظر کندل ۱m رد با بدنه و حجم کافی"
 
 
+FIB_MIN_IMPULSE_ATR = _env_float("MIN_IMPULSE_ATR", 1.5)
+FIB_RECENT_BARS = int(_env_float("RECENT_BARS", 120))
+FIB_SL_BUF_ATR = 0.2
+
+
+def recent_impulse(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Last clear impulse (last swing high and low inside the recent window)."""
+    n = len(d["cs"])
+    lo_bar = n - FIB_RECENT_BARS
+    hs = [h for h in d["highs"] if h[0] >= lo_bar]
+    ls = [l for l in d["lows"] if l[0] >= lo_bar]
+    if not hs or not ls:
+        return None
+    hi_i, hi_v = hs[-1]
+    lo_i, lo_v = ls[-1]
+    if lo_i > hi_i:
+        A, B, direction = hi_v, lo_v, "DOWN"
+    else:
+        A, B, direction = lo_v, hi_v, "UP"
+    diff = abs(A - B)
+    if diff < FIB_MIN_IMPULSE_ATR * d["atr"]:
+        return None
+    return {"dir": direction, "A": A, "B": B, "diff": diff, "tf": d["name"]}
+
+
+def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
+    """Entry at 0.618 retrace of the latest impulse, stop beyond 0.786, targets at the
+    impulse extreme (TP1) and the 1.272 extension (TP2). Always produces a plan if an impulse exists."""
+    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"]) or recent_impulse(D["15m"])
+    if imp is None:
+        return None
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    atr15 = D["15m"]["atr"]
+    cost = 2.0 * FEE_PCT
+    if imp["dir"] == "DOWN":
+        side = "SHORT"
+        entry = B + 0.618 * d
+        sl = B + 0.786 * d + FIB_SL_BUF_ATR * atr15
+        tp1, tp2 = B, A - 1.272 * d
+        if price > sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price >= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (بالا)"
+    else:
+        side = "LONG"
+        entry = B - 0.618 * d
+        sl = B - 0.786 * d - FIB_SL_BUF_ATR * atr15
+        tp1, tp2 = B, A + 1.272 * d
+        if price < sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price <= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (پایین)"
+
+    def net(t: float) -> float:
+        risk_pct = abs(sl - entry) / entry * 100.0
+        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+
+    risk_pct = abs(sl - entry) / entry * 100.0
+    return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
+            "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
+            "dist_pct": (entry - price) / price * 100.0, "status": status,
+            "A": A, "B": B}
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
     try:
@@ -1127,6 +1195,7 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
         "reason_override": (one_min_msg or None), "data_age_min": age_min, "regime": regime,
         "liq": liquidity_map(D["15m"], price),
     }
+    res["fib_plan"] = fib_point_plan(D, price)
     if not signal and not gb:
         cands = [s for s in scenarios.values()
                  if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN
@@ -1428,6 +1497,19 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             lines.append("")
             lines.append("همبستگی 15m با BTC: %.2f" % c)
             lines.extend(format_brief(r))
+    lines.append("")
+    lines.append("🎯 <b>نقاط ورود (فیبوناچی ۰٫۶۱۸ / حد ضرر ۰٫۷۸۶)</b>")
+    for r in results:
+        p = r.get("fib_plan")
+        if not p:
+            lines.append("%s | ایمپالس واضح نیست" % html.escape(r["symbol"]))
+            continue
+        lines.append(
+            "<b>%s</b> %s | ورود <code>%s</code> (%+.2f%%) | SL <code>%s</code> (%.2f%%) | "
+            "TP1 <code>%s</code> (RR %.2f) | TP2 <code>%s</code> (RR %.2f) | %s" % (
+                html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), p["dist_pct"],
+                fmt_price(p["sl"]), p["risk_pct"], fmt_price(p["tp1"]), p["rr1"],
+                fmt_price(p["tp2"]), p["rr2"], html.escape(p["status"])))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
