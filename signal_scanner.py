@@ -1144,6 +1144,13 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
         return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
 
     risk_pct = abs(sl - entry) / entry * 100.0
+    confluence = False
+    for dd in (D["15m"], D["5m"]):
+        sw = detect_sweep(dd, side, 24)
+        if sw and detect_mss(dd, side, sw):
+            confluence = True
+            break
+    status = status + (" | تأیید: Sweep + MSS (نقدینگی گرفته شده)" if confluence else " | بدون Sweep+MSS (احتیاط)")
     return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
             "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
             "dist_pct": (entry - price) / price * 100.0, "status": status,
