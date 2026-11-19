@@ -1082,6 +1082,8 @@ def confirm_1m_entry(side: str, entry: float, c1: Optional[Candles]) -> Tuple[bo
     return False, "در ناحیه‌ی ورود؛ منتظر کندل ۱m رد با بدنه و حجم کافی"
 
 
+PLAN_FILE = os.getenv("PLAN_FILE", "plans_state.json")
+PLAN_TTL_H = _env_float("PLAN_TTL_H", 12.0)   # a stored entry plan stays fixed for this long (or until it is invalid/hit)
 FIB_MIN_IMPULSE_ATR = _env_float("MIN_IMPULSE_ATR", 1.5)
 FIB_RECENT_BARS = int(_env_float("RECENT_BARS", 120))
 FIB_SL_BUF_ATR = 0.2
@@ -1157,6 +1159,62 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
             "A": A, "B": B}
 
 
+def _plan_status(side: str, entry: float, sl: float, tp1: float, price: float) -> str:
+    if side == "SHORT":
+        if price > sl:
+            return "قیمت از حد ضرر گذشته؛ منقضی"
+        if price <= tp1:
+            return "تارگت اول لمس شده؛ منقضی"
+        return "در ناحیه‌ی ورود؛ منتظر کندل رد" if price >= entry else "منتظر رسیدن قیمت به ورود (بالا)"
+    if price < sl:
+        return "قیمت از حد ضرر گذشته؛ منقضی"
+    if price >= tp1:
+        return "تارگت اول لمس شده؛ منقضی"
+    return "در ناحیه‌ی ورود؛ منتظر کندل رد" if price <= entry else "منتظر رسیدن قیمت به ورود (پایین)"
+
+
+def _load_plans() -> Dict[str, Any]:
+    try:
+        with open(PLAN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_plans(plans: Dict[str, Any]) -> None:
+    try:
+        with open(PLAN_FILE, "w", encoding="utf-8") as f:
+            json.dump(plans, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log.warning("could not save plans: %s", e)
+
+
+def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
+    """Keep the entry/SL/TP of a symbol fixed while the stored plan is still valid.
+    A new plan is stored only when there is no valid one (same side, not hit, not expired)."""
+    if plan is None:
+        return None
+    now = time.time()
+    plans = _load_plans()
+    old = plans.get(symbol)
+    if (old and old.get("side") == plan["side"] and now < old.get("until", 0)
+            and _plan_status(old["side"], old["entry"], old["sl"], old["tp1"], price).find("منقضی") < 0):
+        keep = dict(old)
+        keep["status"] = _plan_status(old["side"], old["entry"], old["sl"], old["tp1"], price)
+        keep["dist_pct"] = (old["entry"] - price) / price * 100.0
+        keep["stored"] = True
+        return keep
+    fresh = dict(plan)
+    fresh["until"] = now + PLAN_TTL_H * 3600.0
+    fresh["since"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fresh["stored"] = False
+    if "منقضی" not in _plan_status(plan["side"], plan["entry"], plan["sl"], plan["tp1"], price):
+        plans[symbol] = fresh
+        _save_plans(plans)
+    return fresh
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
     try:
@@ -1202,7 +1260,7 @@ def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score:
         "reason_override": (one_min_msg or None), "data_age_min": age_min, "regime": regime,
         "liq": liquidity_map(D["15m"], price),
     }
-    res["fib_plan"] = fib_point_plan(D, price)
+    res["fib_plan"] = stable_plan(symbol, fib_point_plan(D, price), price)
     if not signal and not gb:
         cands = [s for s in scenarios.values()
                  if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN
@@ -1516,7 +1574,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             "TP1 <code>%s</code> (RR %.2f) | TP2 <code>%s</code> (RR %.2f) | %s" % (
                 html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), p["dist_pct"],
                 fmt_price(p["sl"]), p["risk_pct"], fmt_price(p["tp1"]), p["rr1"],
-                fmt_price(p["tp2"]), p["rr2"], html.escape(p["status"])))
+                fmt_price(p["tp2"]), p["rr2"], html.escape(p["status"]) + (" | ثابت از %s" % p.get("since", "قبل") if p.get("stored") else " | جدید")))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
     lines.append("")
