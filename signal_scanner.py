@@ -1209,6 +1209,9 @@ def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Op
     fresh["until"] = now + PLAN_TTL_H * 3600.0
     fresh["since"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     fresh["stored"] = False
+    if "منقضی" in fresh["status"]:
+        # an expired plan must not carry a confirmation label
+        fresh["status"] = fresh["status"].split(" | ")[0]
     if "منقضی" not in _plan_status(plan["side"], plan["entry"], plan["sl"], plan["tp1"], price):
         plans[symbol] = fresh
         _save_plans(plans)
