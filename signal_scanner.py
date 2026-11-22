@@ -1112,9 +1112,19 @@ def recent_impulse(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
     """Entry at 0.618 retrace of the latest impulse, stop beyond 0.786, targets at the
     impulse extreme (TP1) and the 1.272 extension (TP2). Always produces a plan if an impulse exists."""
-    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"]) or recent_impulse(D["15m"])
+    t1, t4 = D["1h"]["trend"], D["4h"]["trend"]
+    imp = None
+    for tf in ("1h", "4h"):
+        cand = recent_impulse(D[tf])
+        if cand is None:
+            continue
+        agrees = (cand["dir"] == "UP" and t1 == "UP" and t4 != "DOWN") or \
+                 (cand["dir"] == "DOWN" and t1 == "DOWN" and t4 != "UP")
+        if agrees:
+            imp = cand
+            break
     if imp is None:
-        return None
+        return None  # no impulse that agrees with the trend: no point is shown
     A, B, d = imp["A"], imp["B"], imp["diff"]
     atr15 = D["15m"]["atr"]
     cost = 2.0 * FEE_PCT
@@ -1572,7 +1582,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     for r in results:
         p = r.get("fib_plan")
         if not p:
-            lines.append("%s | ایمپالس واضح نیست" % html.escape(r["symbol"]))
+            lines.append("%s | نقطه‌ای نیست: ایمپالس با روند ۱H/۴H هم‌جهت نیست" % html.escape(r["symbol"]))
             continue
         lines.append(
             "<b>%s</b> %s | ورود <code>%s</code> (%+.2f%%) | SL <code>%s</code> (%.2f%%) | "
