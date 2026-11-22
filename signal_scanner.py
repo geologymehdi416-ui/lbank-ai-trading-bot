@@ -1245,6 +1245,30 @@ def fib_signal_ready(r: Dict[str, Any]) -> bool:
     return r["price"] <= p["entry"] and c > o and c > p["entry"] and "منقضی" not in p["status"]
 
 
+SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
+
+
+def log_fib_signals(results: List[Dict[str, Any]]) -> None:
+    """Append every definite Fibonacci signal to a CSV so its outcome can be checked later."""
+    ready = [r for r in results if fib_signal_ready(r)]
+    if not ready:
+        return
+    new_file = (not os.path.exists(SIGNAL_LOG_FILE)) or os.path.getsize(SIGNAL_LOG_FILE) == 0
+    try:
+        with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts_utc", "symbol", "side", "price", "entry", "sl", "tp1", "tp2",
+                            "rr1_net", "rr2_net", "result"])
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for r in ready:
+                p = r["fib_plan"]
+                w.writerow([ts, r["symbol"], p["side"], r["price"], p["entry"], p["sl"],
+                            p["tp1"], p["tp2"], round(p["rr1"], 3), round(p["rr2"], 3), "OPEN"])
+    except OSError as e:
+        log.warning("could not write signal log: %s", e)
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
     try:
@@ -2015,6 +2039,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.diag or args.dry_run:
         write_diag(results, args.min_score)
     write_details(results, errors, sent)
+    log_fib_signals(results)
     send(format_report(results, errors, sent))
     write_report_file(outbox)
     return 0
