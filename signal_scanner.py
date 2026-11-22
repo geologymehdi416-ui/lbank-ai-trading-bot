@@ -1118,8 +1118,8 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
         cand = recent_impulse(D[tf])
         if cand is None:
             continue
-        agrees = (cand["dir"] == "UP" and t1 == "UP" and t4 != "DOWN") or \
-                 (cand["dir"] == "DOWN" and t1 == "DOWN" and t4 != "UP")
+        agrees = (cand["dir"] == "UP" and t4 != "DOWN" and (t1 == "UP" or (t1 == "RANGE" and t4 == "UP"))) or \
+                 (cand["dir"] == "DOWN" and t4 != "UP" and (t1 == "DOWN" or (t1 == "RANGE" and t4 == "DOWN")))
         if agrees:
             imp = cand
             break
@@ -1165,6 +1165,8 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
     status = status + (" | تأیید: Sweep + MSS (نقدینگی گرفته شده)" if confluence else " | بدون Sweep+MSS (احتیاط)")
     if risk_pct > MAX_STOP_PCT:
         status = status + " | حد ضرر بیش از سقف %.1f%% — ورود معتبر نیست" % MAX_STOP_PCT
+    if risk_pct > MAX_STOP_PCT or abs(entry - price) / price > 0.10:
+        return None
     return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
             "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
             "dist_pct": (entry - price) / price * 100.0, "status": status,
@@ -1582,7 +1584,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     for r in results:
         p = r.get("fib_plan")
         if not p:
-            lines.append("%s | نقطه‌ای نیست: ایمپالس با روند ۱H/۴H هم‌جهت نیست" % html.escape(r["symbol"]))
+            lines.append("%s | نقطه‌ای نیست (ایمپالس با روند هم‌جهت نیست، یا حد ضرر/فاصله‌ی ورود نامناسب است)" % html.escape(r["symbol"]))
             continue
         lines.append(
             "<b>%s</b> %s | ورود <code>%s</code> (%+.2f%%) | SL <code>%s</code> (%.2f%%) | "
