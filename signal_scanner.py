@@ -1232,17 +1232,26 @@ def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Op
     return fresh
 
 
+FIB_SIGNAL_MODE = os.getenv("FIB_SIGNAL_MODE", "touch").strip().lower()  # touch | reject
+
+
 def fib_signal_ready(r: Dict[str, Any]) -> bool:
-    """Definite Fibonacci entry: price is in the entry zone AND the last closed 15m candle
-    rejected it (closed back on the trade side of the entry)."""
+    """Definite Fibonacci entry.
+    touch  (default): the last closed 15m candle reached the entry level, the plan is still valid
+                      (not stopped out, not expired) -> signal.
+    reject (stricter): price is in the entry zone and the last 15m candle rejected it."""
     p = r.get("fib_plan")
-    if not p or p.get("state_ok") is False:
+    if not p or "منقضی" in p["status"]:
         return False
     c15 = r["D"]["15m"]["cs"]
-    o, c = c15.o[-1], c15.c[-1]
+    o, c, h, l = c15.o[-1], c15.c[-1], c15.h[-1], c15.l[-1]
+    if FIB_SIGNAL_MODE == "reject":
+        if p["side"] == "SHORT":
+            return r["price"] >= p["entry"] and c < o and c < p["entry"]
+        return r["price"] <= p["entry"] and c > o and c > p["entry"]
     if p["side"] == "SHORT":
-        return r["price"] >= p["entry"] and c < o and c < p["entry"] and "منقضی" not in p["status"]
-    return r["price"] <= p["entry"] and c > o and c > p["entry"] and "منقضی" not in p["status"]
+        return h >= p["entry"] and r["price"] < p["sl"]
+    return l <= p["entry"] and r["price"] > p["sl"]
 
 
 SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
