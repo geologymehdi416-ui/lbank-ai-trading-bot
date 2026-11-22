@@ -1232,6 +1232,19 @@ def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Op
     return fresh
 
 
+def fib_signal_ready(r: Dict[str, Any]) -> bool:
+    """Definite Fibonacci entry: price is in the entry zone AND the last closed 15m candle
+    rejected it (closed back on the trade side of the entry)."""
+    p = r.get("fib_plan")
+    if not p or p.get("state_ok") is False:
+        return False
+    c15 = r["D"]["15m"]["cs"]
+    o, c = c15.o[-1], c15.c[-1]
+    if p["side"] == "SHORT":
+        return r["price"] >= p["entry"] and c < o and c < p["entry"] and "منقضی" not in p["status"]
+    return r["price"] <= p["entry"] and c > o and c > p["entry"] and "منقضی" not in p["status"]
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
     try:
@@ -1579,6 +1592,19 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             lines.append("")
             lines.append("همبستگی 15m با BTC: %.2f" % c)
             lines.extend(format_brief(r))
+    fib_ready = [r for r in results if fib_signal_ready(r)]
+    lines.append("")
+    if fib_ready:
+        lines.append("✅ <b>سیگنال قطعی فیبوناچی: %d</b>" % len(fib_ready))
+        for r in fib_ready:
+            p = r["fib_plan"]
+            lines.append(
+                "<b>%s</b> %s | ورود <code>%s</code> | SL <code>%s</code> (%.2f%%) | "
+                "TP1 <code>%s</code> (RR %.2f) | TP2 <code>%s</code> (RR %.2f) | کندل ۱۵m رد داد" % (
+                    html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), fmt_price(p["sl"]),
+                    p["risk_pct"], fmt_price(p["tp1"]), p["rr1"], fmt_price(p["tp2"]), p["rr2"]))
+    else:
+        lines.append("⏸ سیگنال قطعی فیبوناچی: ندارد (هیچ ارزی در ناحیه‌ی ورود با کندل ۱۵m رد نیست)")
     lines.append("")
     lines.append("🎯 <b>نقاط ورود (فیبوناچی ۰٫۶۱۸ / حد ضرر ۰٫۷۸۶)</b>")
     for r in results:
