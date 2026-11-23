@@ -1278,6 +1278,25 @@ def log_fib_signals(results: List[Dict[str, Any]]) -> None:
         log.warning("could not write signal log: %s", e)
 
 
+def format_limit_block(r: Dict[str, Any]) -> List[str]:
+    """Signal in the limit-order layout: id, symbol, side, limit entry, leverage, targets, stop."""
+    p = r["fib_plan"]
+    side_fa = "لانگ" if p["side"] == "LONG" else "شورت"
+    lev = min(MAX_LEVERAGE, RISK_PCT / (p["risk_pct"] + 2.0 * FEE_PCT))
+    trade_id = "TR-%s" % datetime.now(timezone.utc).strftime("%H%M%S")
+    return [
+        "⏳ <b>سفارش لیمیت در انتظار رسیدن قیمت</b>",
+        "شناسه معامله: %s" % trade_id,
+        "نماد: %s" % html.escape(r["symbol"]),
+        "جهت: %s" % side_fa,
+        "ورود لیمیت: <code>%s</code>" % fmt_price(p["entry"]),
+        "اهرم پیشنهادی: %.1fx (بر اساس ریسک %.2f%% و کارمزد)" % (lev, RISK_PCT),
+        "اهداف: 1️⃣ <code>%s</code> (RR %.2f) | 2️⃣ <code>%s</code> (RR %.2f)" % (
+            fmt_price(p["tp1"]), p["rr1"], fmt_price(p["tp2"]), p["rr2"]),
+        "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(p["sl"]), p["risk_pct"]),
+    ]
+
+
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
     C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
     try:
@@ -1630,12 +1649,8 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     if fib_ready:
         lines.append("✅ <b>سیگنال قطعی فیبوناچی: %d</b>" % len(fib_ready))
         for r in fib_ready:
-            p = r["fib_plan"]
-            lines.append(
-                "<b>%s</b> %s | ورود <code>%s</code> | SL <code>%s</code> (%.2f%%) | "
-                "TP1 <code>%s</code> (RR %.2f) | TP2 <code>%s</code> (RR %.2f) | کندل ۱۵m رد داد" % (
-                    html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), fmt_price(p["sl"]),
-                    p["risk_pct"], fmt_price(p["tp1"]), p["rr1"], fmt_price(p["tp2"]), p["rr2"]))
+            lines.append("")
+            lines.extend(format_limit_block(r))
     else:
         lines.append("⏸ سیگنال قطعی فیبوناچی: ندارد (هیچ ارزی در ناحیه‌ی ورود با کندل ۱۵m رد نیست)")
     lines.append("")
