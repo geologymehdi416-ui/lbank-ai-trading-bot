@@ -1,4 +1,8 @@
+
 requests
 websocket-client
 flask
 gunicorn
+ccxt
+numpy
+pandas
