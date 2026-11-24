@@ -1112,9 +1112,19 @@ def recent_impulse(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
     """Entry at 0.618 retrace of the latest impulse, stop beyond 0.786, targets at the
     impulse extreme (TP1) and the 1.272 extension (TP2). Always produces a plan if an impulse exists."""
-    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"]) or recent_impulse(D["15m"])
+    t1, t4 = D["1h"]["trend"], D["4h"]["trend"]
+    imp = None
+    for tf in ("1h", "4h"):
+        cand = recent_impulse(D[tf])
+        if cand is None:
+            continue
+        agrees = (cand["dir"] == "UP" and t4 != "DOWN" and (t1 == "UP" or (t1 == "RANGE" and t4 == "UP"))) or \
+                 (cand["dir"] == "DOWN" and t4 != "UP" and (t1 == "DOWN" or (t1 == "RANGE" and t4 == "DOWN")))
+        if agrees:
+            imp = cand
+            break
     if imp is None:
-        return None
+        return None  # no impulse that agrees with the trend: no point is shown
     A, B, d = imp["A"], imp["B"], imp["diff"]
     atr15 = D["15m"]["atr"]
     cost = 2.0 * FEE_PCT
@@ -1155,6 +1165,8 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
     status = status + (" | تأیید: Sweep + MSS (نقدینگی گرفته شده)" if confluence else " | بدون Sweep+MSS (احتیاط)")
     if risk_pct > MAX_STOP_PCT:
         status = status + " | حد ضرر بیش از سقف %.1f%% — ورود معتبر نیست" % MAX_STOP_PCT
+    if risk_pct > MAX_STOP_PCT or abs(entry - price) / price > 0.10:
+        return None
     return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
             "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
             "dist_pct": (entry - price) / price * 100.0, "status": status,
@@ -1218,6 +1230,79 @@ def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Op
         plans[symbol] = fresh
         _save_plans(plans)
     return fresh
+
+
+FIB_SIGNAL_MODE = os.getenv("FIB_SIGNAL_MODE", "reject").strip().lower()  # reject (default, stricter) | touch
+
+
+def fib_signal_ready(r: Dict[str, Any]) -> bool:
+    """Definite Fibonacci entry.
+    touch  (default): the last closed 15m candle reached the entry level, the plan is still valid
+                      (not stopped out, not expired) -> signal.
+    reject (stricter): price is in the entry zone and the last 15m candle rejected it."""
+    p = r.get("fib_plan")
+    if not p or "منقضی" in p["status"]:
+        return False
+    c15 = r["D"]["15m"]["cs"]
+    o, c, h, l = c15.o[-1], c15.c[-1], c15.h[-1], c15.l[-1]
+    if FIB_SIGNAL_MODE == "reject":
+        if p["side"] == "SHORT":
+            return r["price"] >= p["entry"] and c < o and c < p["entry"]
+        return r["price"] <= p["entry"] and c > o and c > p["entry"]
+    if p["side"] == "SHORT":
+        return h >= p["entry"] and r["price"] < p["sl"]
+    return l <= p["entry"] and r["price"] > p["sl"]
+
+
+SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
+
+
+def log_fib_signals(results: List[Dict[str, Any]]) -> None:
+    """Append every definite Fibonacci signal to a CSV so its outcome can be checked later."""
+    ready = [r for r in results if fib_signal_ready(r)]
+    if not ready:
+        return
+    new_file = (not os.path.exists(SIGNAL_LOG_FILE)) or os.path.getsize(SIGNAL_LOG_FILE) == 0
+    try:
+        with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts_utc", "symbol", "side", "price", "entry", "sl", "tp1", "tp2",
+                            "rr1_net", "rr2_net", "result"])
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for r in ready:
+                p = r["fib_plan"]
+                w.writerow([ts, r["symbol"], p["side"], r["price"], p["entry"], p["sl"],
+                            p["tp1"], p["tp2"], round(p["rr1"], 3), round(p["rr2"], 3), "OPEN"])
+    except OSError as e:
+        log.warning("could not write signal log: %s", e)
+
+
+def format_limit_block(r: Dict[str, Any]) -> List[str]:
+    """Signal in the limit-order layout: id, symbol, side, limit entry, leverage, targets, stop."""
+    p = r["fib_plan"]
+    side_fa = "لانگ" if p["side"] == "LONG" else "شورت"
+    lev = min(MAX_LEVERAGE, RISK_PCT / (p["risk_pct"] + 2.0 * FEE_PCT))
+    trade_id = "TR-%s" % datetime.now(timezone.utc).strftime("%H%M%S")
+    return [
+        "⏳ <b>سفارش لیمیت در انتظار رسیدن قیمت</b>",
+        "شناسه معامله: %s" % trade_id,
+        "نماد: %s" % html.escape(r["symbol"]),
+        "جهت: %s" % side_fa,
+        "ورود لیمیت: <code>%s</code>" % fmt_price(p["entry"]),
+        "اهرم پیشنهادی: %.1fx (بر اساس ریسک %.2f%% و کارمزد)" % (lev, RISK_PCT),
+        "اهداف: 1️⃣ <code>%s</code> (RR %.2f) | 2️⃣ <code>%s</code> (RR %.2f)" % (
+            fmt_price(p["tp1"]), p["rr1"], fmt_price(p["tp2"]), p["rr2"]),
+        "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(p["sl"]), p["risk_pct"]),
+        "شاخص‌ها: %s" % _indicator_line(r, p["side"]),
+    ]
+
+
+def _indicator_line(r: Dict[str, Any], side: str) -> str:
+    ind = indicator_info(r["D"], side)
+    ok = [k for k, v in ind["checks"].items() if v]
+    return "RSI %.0f | تأیید %d از %d (%s)" % (ind["rsi"], ind["passed"], ind["total"],
+                                             "، ".join(ok) if ok else "هیچ‌کدام")
 
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
@@ -1531,10 +1616,31 @@ def btc_corr(res: Dict[str, Any], btc: Dict[str, Any], n: int = 96) -> Optional[
     return cov / math.sqrt(va * vb)
 
 
+def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
+    """Short Telegram message: only definite signals (limit layout), or one line saying there are none."""
+    lines = ["📊 <b>گزارش اسکن</b> — %s" % local_now()]
+    ready = [r for r in results if fib_signal_ready(r)]
+    conditional = [r for r in results if r not in ready and r.get("fib_plan")
+                   and ("منتظر" in r["fib_plan"]["status"] or "در ناحیه" in r["fib_plan"]["status"])]
+    rejected = [r for r in results if r not in ready and r not in conditional]
+    lines.append("قطعی: %d | شرطی: %d | ردشده: %d" % (len(ready), len(conditional), len(rejected)))
+    if ready:
+        for r in ready:
+            lines.append("")
+            lines.extend(format_limit_block(r))
+    else:
+        lines.append("⏸ سیگنال قطعی: ندارد")
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:120])))
+    return "\n".join(lines)
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
     """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
     for the strongest symbols. Full analysis goes to details_report.txt."""
+    if os.getenv("REPORT_MODE", "minimal").strip().lower() == "minimal":
+        return format_minimal_report(results, errors)
     now = local_now()
     sigs = [r for r in results if r["signal"]]
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now]
@@ -1567,12 +1673,21 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
             lines.append("")
             lines.append("همبستگی 15m با BTC: %.2f" % c)
             lines.extend(format_brief(r))
+    fib_ready = [r for r in results if fib_signal_ready(r)]
+    lines.append("")
+    if fib_ready:
+        lines.append("✅ <b>سیگنال قطعی فیبوناچی: %d</b>" % len(fib_ready))
+        for r in fib_ready:
+            lines.append("")
+            lines.extend(format_limit_block(r))
+    else:
+        lines.append("⏸ سیگنال قطعی فیبوناچی: ندارد (هیچ ارزی در ناحیه‌ی ورود با کندل ۱۵m رد نیست)")
     lines.append("")
     lines.append("🎯 <b>نقاط ورود (فیبوناچی ۰٫۶۱۸ / حد ضرر ۰٫۷۸۶)</b>")
     for r in results:
         p = r.get("fib_plan")
         if not p:
-            lines.append("%s | ایمپالس واضح نیست" % html.escape(r["symbol"]))
+            lines.append("%s | نقطه‌ای نیست (ایمپالس با روند هم‌جهت نیست، یا حد ضرر/فاصله‌ی ورود نامناسب است)" % html.escape(r["symbol"]))
             continue
         lines.append(
             "<b>%s</b> %s | ورود <code>%s</code> (%+.2f%%) | SL <code>%s</code> (%.2f%%) | "
@@ -1977,6 +2092,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.diag or args.dry_run:
         write_diag(results, args.min_score)
     write_details(results, errors, sent)
+    log_fib_signals(results)
     send(format_report(results, errors, sent))
     write_report_file(outbox)
     return 0
