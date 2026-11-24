@@ -57,6 +57,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import random
           import time
           import requests
           from pathlib import Path
@@ -100,22 +101,27 @@ jobs:
 
           for index, chunk in enumerate(chunks, start=1):
               prefix = f"📨 بخش {index}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
+              sent = False
 
-              response = requests.post(
-                  url,
-                  json={
-                      "chat_id": chat_id,
-                      "text": prefix + chunk
-                  },
-                  timeout=30
-              )
+              for attempt in range(1, 6):
+                  try:
+                      response = requests.post(
+                          url,
+                          json={"chat_id": chat_id, "text": prefix + chunk},
+                          timeout=30
+                      )
+                      response.raise_for_status()
+                      result = response.json()
+                      if not result.get("ok"):
+                          raise RuntimeError(f"Telegram error: {result}")
+                      sent = True
+                      break
+                  except requests.exceptions.RequestException as e:
+                      print(f"Telegram attempt {attempt}/5 failed: {e}")
+                      time.sleep(3 * attempt + random.random())
 
-              response.raise_for_status()
-
-              result = response.json()
-
-              if not result.get("ok"):
-                  raise RuntimeError(f"Telegram error: {result}")
+              if not sent:
+                  raise RuntimeError("Telegram message failed after 5 attempts")
 
               print(f"Telegram message {index}/{len(chunks)} sent")
               time.sleep(1)
@@ -127,14 +133,19 @@ jobs:
         run: |
           set -e
 
-          git add data/prices.jsonl
+          # Add only files that exist (git add fails on a missing path)
+          for f in data/prices.jsonl plans_state.json signals_log.csv; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
+          done
 
           if git diff --cached --quiet; then
             echo "No market data changes"
             exit 0
           fi
 
-          git commit -m "Update LBank futures market data"
+          git commit -m "Update LBank futures market data and signal state"
 
           for attempt in 1 2 3 4 5; do
             echo "Push attempt: ${attempt}"
