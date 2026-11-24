@@ -1153,6 +1153,8 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
             confluence = True
             break
     status = status + (" | تأیید: Sweep + MSS (نقدینگی گرفته شده)" if confluence else " | بدون Sweep+MSS (احتیاط)")
+    if risk_pct > MAX_STOP_PCT:
+        status = status + " | حد ضرر بیش از سقف %.1f%% — ورود معتبر نیست" % MAX_STOP_PCT
     return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
             "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
             "dist_pct": (entry - price) / price * 100.0, "status": status,
