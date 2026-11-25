@@ -18,20 +18,16 @@ class ExchangeDataError(Exception):
 
 class PerpetualDataClient:
     """
-    LBank data client.
+    LBank market data client.
 
-    Candles:
-        LBank Spot API.
-
-    Derivatives context:
-        LBank Perpetual API.
+    Candles: LBank Spot
+    Derivatives: LBank Perpetual
 
     Binance and Bybit are not used.
-    Spot candles are explicitly identified as Spot data.
+    Order execution is not implemented.
     """
 
-    SPOT_BASE_URL = "https://api.lbkex.com"
-
+    SPOT_BASE_URL = "https://api.lbank.info"
     SPOT_KLINE_ENDPOINT = "/v2/kline.do"
 
     LBANK_ENDPOINTS = {
@@ -59,9 +55,13 @@ class PerpetualDataClient:
         )
 
         self._session = requests.Session()
-        self._session.headers.update(
-            {"User-Agent": "PerpetualSMCScanner/3.0"}
-        )
+        self._session.headers.update({
+            "User-Agent": "PerpetualSMCScanner/3.1"
+        })
+
+    # =========================================================
+    # BASIC HELPERS
+    # =========================================================
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
@@ -136,7 +136,7 @@ class PerpetualDataClient:
                     )
 
         raise ExchangeDataError(
-            f"LBank HTTP request failed: {last_error}"
+            f"HTTP request failed: {last_error}"
         )
 
     @staticmethod
@@ -156,27 +156,31 @@ class PerpetualDataClient:
 
     @staticmethod
     def _lbank_unwrap(data: Any) -> Any:
-        if isinstance(data, dict):
-            error_code = data.get("error_code")
+        if not isinstance(data, dict):
+            return data
 
-            if error_code not in (None, 0, "0"):
-                raise ExchangeDataError(
-                    f"LBank API error: {error_code} - "
-                    f"{data.get('msg', '')}"
-                )
+        error_code = data.get("error_code")
 
-            if data.get("success") is False:
-                raise ExchangeDataError(
-                    f"LBank request failed: {data.get('msg', '')}"
-                )
+        if error_code not in (None, 0, "0"):
+            raise ExchangeDataError(
+                f"LBank API error: {error_code} - "
+                f"{data.get('msg', data.get('message', ''))}"
+            )
 
-            if str(data.get("result", "")).lower() == "false":
-                raise ExchangeDataError(
-                    f"LBank request failed: {data.get('msg', '')}"
-                )
+        if data.get("success") is False:
+            raise ExchangeDataError(
+                f"LBank request failed: "
+                f"{data.get('msg', data.get('message', ''))}"
+            )
 
-            if "data" in data:
-                return data["data"]
+        if str(data.get("result", "")).lower() == "false":
+            raise ExchangeDataError(
+                f"LBank request failed: "
+                f"{data.get('msg', data.get('message', ''))}"
+            )
+
+        if "data" in data:
+            return data["data"]
 
         return data
 
@@ -185,6 +189,7 @@ class PerpetualDataClient:
         rows: Any,
         target_symbol: str,
     ) -> Optional[Dict[str, Any]]:
+
         if isinstance(rows, dict):
             rows = (
                 rows.get("list")
@@ -213,9 +218,9 @@ class PerpetualDataClient:
 
         return None
 
-    # ---------------------------------------------------------
+    # =========================================================
     # CANDLE VALIDATION
-    # ---------------------------------------------------------
+    # =========================================================
 
     @staticmethod
     def validate_and_filter_candles(
@@ -225,6 +230,7 @@ class PerpetualDataClient:
         min_required: int,
         max_gap_count: int = 0,
     ) -> Tuple[List[Candle], List[str]]:
+
         issues: List[str] = []
 
         if timeframe not in TIMEFRAME_MS:
@@ -327,6 +333,7 @@ class PerpetualDataClient:
 
             if delta > tf_ms:
                 gaps += 1
+
             elif delta < tf_ms:
                 issues.append(
                     f"{timeframe}: irregular candle timestamps"
@@ -346,9 +353,9 @@ class PerpetualDataClient:
 
         return deduped, issues
 
-    # ---------------------------------------------------------
+    # =========================================================
     # LBANK SPOT CANDLES
-    # ---------------------------------------------------------
+    # =========================================================
 
     def _parse_spot_candle(
         self,
@@ -356,10 +363,10 @@ class PerpetualDataClient:
         timeframe: str,
     ) -> Optional[Candle]:
         """
-        LBank Spot Kline commonly returns array rows:
-        [timestamp, volume, close, high, low, open]
+        LBank Spot array:
+        [timestamp, open, high, low, close, volume]
 
-        Also accepts dictionary rows when returned by the API.
+        Also accepts dictionary rows.
         """
 
         try:
@@ -381,18 +388,17 @@ class PerpetualDataClient:
                     return None
 
                 timestamp = row[0]
-                volume = row[1]
-                close = row[2]
-                high = row[3]
-                low = row[4]
-                open_price = row[5]
+                open_price = row[1]
+                high = row[2]
+                low = row[3]
+                close = row[4]
+                volume = row[5]
 
             else:
                 return None
 
             timestamp = int(float(timestamp))
 
-            # LBank Spot Kline timestamps may be seconds or ms.
             if timestamp < 10_000_000_000:
                 timestamp *= 1000
 
@@ -401,6 +407,18 @@ class PerpetualDataClient:
             low = float(low)
             close = float(close)
             volume = float(volume)
+
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    open_price,
+                    high,
+                    low,
+                    close,
+                    volume,
+                )
+            ):
+                return None
 
             tf_ms = TIMEFRAME_MS[timeframe]
             close_time = timestamp + tf_ms - 1
@@ -423,6 +441,7 @@ class PerpetualDataClient:
             ValueError,
             IndexError,
             OverflowError,
+            KeyError,
         ):
             return None
 
@@ -431,13 +450,18 @@ class PerpetualDataClient:
         symbol: str,
         timeframes: List[str],
     ) -> Tuple[Dict[str, List[Candle]], List[str]]:
+
         result: Dict[str, List[Candle]] = {}
         issues: List[str] = []
 
         spot_symbol = f"{symbol.lower()}_usdt"
 
-        candle_limit = int(
-            getattr(self.config, "candle_limit", 300)
+        candle_limit = min(
+            max(
+                int(getattr(self.config, "candle_limit", 300)),
+                220,
+            ),
+            2000,
         )
 
         min_required = max(
@@ -467,16 +491,32 @@ class PerpetualDataClient:
                     f"Unsupported LBank Spot timeframe: {timeframe}"
                 )
 
-            response = self._http_get(
-                self.SPOT_BASE_URL + self.SPOT_KLINE_ENDPOINT,
-                {
-                    "symbol": spot_symbol,
-                    "size": candle_limit,
-                    "type": interval,
-                },
-            )
+            tf_ms = TIMEFRAME_MS[timeframe]
 
-            rows = self._lbank_unwrap(response)
+            start_time_seconds = (
+                self._clock_ms_fn() - candle_limit * tf_ms
+            ) // 1000
+
+            params = {
+                "symbol": spot_symbol,
+                "size": candle_limit,
+                "type": interval,
+                "time": start_time_seconds,
+            }
+
+            try:
+                response = self._http_get(
+                    self.SPOT_BASE_URL + self.SPOT_KLINE_ENDPOINT,
+                    params,
+                )
+
+                rows = self._lbank_unwrap(response)
+
+            except Exception as exc:
+                raise ExchangeDataError(
+                    f"LBank SPOT Kline failed "
+                    f"({spot_symbol}, {timeframe}): {exc}"
+                ) from exc
 
             if isinstance(rows, dict):
                 rows = (
@@ -521,22 +561,19 @@ class PerpetualDataClient:
             issues.extend(candle_issues)
 
         if issues:
-            raise ExchangeDataError(
-                "; ".join(issues)
-            )
+            raise ExchangeDataError("; ".join(issues))
 
         return result, issues
 
-    # ---------------------------------------------------------
-    # LBANK PERPETUAL MARKET CONTEXT
-    # ---------------------------------------------------------
+    # =========================================================
+    # LBANK PERPETUAL HELPERS
+    # =========================================================
 
     @staticmethod
     def _book_price(level: Any) -> Optional[float]:
         if isinstance(level, dict):
             return PerpetualDataClient._number(
-                level.get("price")
-                or level.get("p")
+                level.get("price", level.get("p"))
             )
 
         if isinstance(level, (list, tuple)) and level:
@@ -544,10 +581,29 @@ class PerpetualDataClient:
 
         return None
 
+    def _perpetual_get(
+        self,
+        base_url: str,
+        endpoint_name: str,
+        params: Dict[str, Any],
+    ) -> Any:
+        try:
+            response = self._http_get(
+                base_url + self.LBANK_ENDPOINTS[endpoint_name],
+                params,
+            )
+            return self._lbank_unwrap(response)
+
+        except Exception as exc:
+            raise ExchangeDataError(
+                f"LBank PERPETUAL {endpoint_name} endpoint failed: {exc}"
+            ) from exc
+
     def _fetch_lbank_context(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
+
         base_url = getattr(
             self.config,
             "lbank_base_url",
@@ -565,13 +621,10 @@ class PerpetualDataClient:
                 "LBank product group is not configured."
             )
 
-        instrument_response = self._http_get(
-            base_url + self.LBANK_ENDPOINTS["instruments"],
+        instruments = self._perpetual_get(
+            base_url,
+            "instruments",
             {"productGroup": product_group},
-        )
-
-        instruments = self._lbank_unwrap(
-            instrument_response
         )
 
         instrument = self._find_lbank_symbol(
@@ -581,19 +634,20 @@ class PerpetualDataClient:
 
         if instrument is None:
             raise ExchangeDataError(
-                f"LBank Perpetual contract not found: "
-                f"{symbol}USDT"
+                f"LBank Perpetual contract not found: {symbol}USDT"
             )
 
         lbank_symbol = instrument.get("symbol")
 
-        market_response = self._http_get(
-            base_url + self.LBANK_ENDPOINTS["market_data"],
-            {"productGroup": product_group},
-        )
+        if not lbank_symbol:
+            raise ExchangeDataError(
+                "LBank Perpetual instrument has no symbol."
+            )
 
-        market_rows = self._lbank_unwrap(
-            market_response
+        market_rows = self._perpetual_get(
+            base_url,
+            "market_data",
+            {"productGroup": product_group},
         )
 
         market_item = self._find_lbank_symbol(
@@ -608,15 +662,14 @@ class PerpetualDataClient:
 
         market_time = self._clock_ms_fn()
 
-        book_response = self._http_get(
-            base_url + self.LBANK_ENDPOINTS["orderbook"],
+        book = self._perpetual_get(
+            base_url,
+            "orderbook",
             {
                 "depth": 5,
                 "symbol": lbank_symbol,
             },
         )
-
-        book = self._lbank_unwrap(book_response)
 
         if isinstance(book, dict) and "data" in book:
             book = book["data"]
@@ -688,21 +741,22 @@ class PerpetualDataClient:
             "product_group": product_group,
         }
 
+    # =========================================================
+    # BUILD AND VALIDATE PERPETUAL CONTEXT
+    # =========================================================
+
     def _build_context(
         self,
         symbol: str,
         data: Dict[str, Any],
     ) -> MarketDerivativeContext:
-        now_ms = self._clock_ms_fn()
 
+        now_ms = self._clock_ms_fn()
         turnover = data.get("turnover")
 
-        # LBank turnover unit must be verified before treating it
-        # as USDT quote volume. Do not silently label it as USDT.
+        # Turnover unit is not assumed to be USDT.
         quote_volume = (
-            turnover
-            if turnover is not None
-            else 0.0
+            turnover if turnover is not None else 0.0
         )
 
         ctx = MarketDerivativeContext(
@@ -725,17 +779,19 @@ class PerpetualDataClient:
             context_exchange_source="lbank_perpetual",
         )
 
-        # Retain a warning if the turnover unit has not been verified.
-        if turnover is None:
-            ctx.warnings.append(
-                "LBank Perpetual turnover unavailable; "
-                "24h quote volume is not verified."
-            )
-        else:
-            ctx.warnings.append(
-                "LBank turnover received; quote-volume unit "
-                "must be verified before using it as USDT volume."
-            )
+        warning = (
+            "LBank turnover unavailable; quote-volume unit "
+            "is not verified."
+            if turnover is None
+            else
+            "LBank turnover received; its quote-volume unit "
+            "must be verified before treating it as USDT volume."
+        )
+
+        if hasattr(ctx, "warnings"):
+            if ctx.warnings is None:
+                ctx.warnings = []
+            ctx.warnings.append(warning)
 
         return ctx
 
@@ -743,6 +799,7 @@ class PerpetualDataClient:
         self,
         ctx: MarketDerivativeContext,
     ) -> None:
+
         if not ctx.is_real_perpetual:
             raise ExchangeDataError(
                 "Perpetual market context validation failed."
@@ -760,6 +817,7 @@ class PerpetualDataClient:
             ctx.best_bid is None
             or ctx.best_ask is None
             or ctx.best_bid <= 0
+            or ctx.best_ask <= 0
             or ctx.best_ask < ctx.best_bid
         ):
             raise ExchangeDataError(
@@ -830,9 +888,9 @@ class PerpetualDataClient:
                 "LBank funding rate exceeds configured limit."
             )
 
-    # ---------------------------------------------------------
+    # =========================================================
     # MAIN FETCH
-    # ---------------------------------------------------------
+    # =========================================================
 
     def fetch_symbol_data(
         self,
@@ -843,6 +901,7 @@ class PerpetualDataClient:
         Dict[str, List[Candle]],
         List[str],
     ]:
+
         symbol = symbol.upper().strip()
 
         if symbol not in self.config.watchlist:
@@ -868,7 +927,7 @@ class PerpetualDataClient:
             ]
 
         try:
-            # 1. Fetch LBank Spot candles.
+            # 1. Spot candles
             candles, candle_issues = (
                 self._fetch_lbank_spot_candles(
                     symbol,
@@ -876,7 +935,7 @@ class PerpetualDataClient:
                 )
             )
 
-            # 2. Fetch LBank Perpetual context.
+            # 2. Perpetual context
             derivative_data = self._fetch_lbank_context(
                 symbol
             )
@@ -889,8 +948,8 @@ class PerpetualDataClient:
             self._validate_context(ctx)
 
             logger.info(
-                "%s loaded: candles=LBank Spot, "
-                "derivatives=LBank Perpetual",
+                "%s loaded successfully: "
+                "candles=LBank Spot, derivatives=LBank Perpetual",
                 symbol,
             )
 
@@ -901,7 +960,7 @@ class PerpetualDataClient:
                 f"{symbol}: LBank data unavailable: {exc}"
             )
 
-            logger.error(error)
+            logger.error(error, exc_info=True)
 
             return None, {}, [error]
 
