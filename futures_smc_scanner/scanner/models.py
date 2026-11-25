@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +37,16 @@ class MarketDerivativeContext:
     funding_fetched_at_ms: Optional[int] = None
     orderbook_fetched_at_ms: Optional[int] = None
     ticker_fetched_at_ms: Optional[int] = None
+
+    # Source tracking for supplemental derivatives data
+    candle_exchange_source: Optional[str] = None
+    context_exchange_source: Optional[str] = None
+    lbank_mark_price: Optional[float] = None
+    lbank_funding_rate: Optional[float] = None
+    lbank_best_bid: Optional[float] = None
+    lbank_best_ask: Optional[float] = None
+    lbank_quote_volume_24h: Optional[float] = None
+    lbank_fetched_at_ms: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -101,10 +110,16 @@ class CoinScanResult:
     data_sufficient: bool = True
     analysis_status: str = "AVAILABLE"
 
+    # Data provenance
+    candle_exchange_source: Optional[str] = None
+    context_exchange_source: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "symbol": self.symbol,
             "exchange_source": self.exchange_source,
+            "candle_exchange_source": self.candle_exchange_source,
+            "context_exchange_source": self.context_exchange_source,
             "market_tradeable": self.market_tradeable,
             "data_valid": self.data_valid,
             "data_sufficient": self.data_sufficient,
