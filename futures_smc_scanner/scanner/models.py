@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
@@ -20,7 +21,7 @@ class Candle:
 @dataclass
 class MarketDerivativeContext:
     symbol: str
-    exchange_source: str  # "binance_usds_m_perpetual" or "bybit_usdt_linear_perpetual"
+    exchange_source: str
     mark_price: float
     index_price: Optional[float]
     funding_rate: Optional[float]
@@ -32,14 +33,20 @@ class MarketDerivativeContext:
     is_real_perpetual: bool = True
     warnings: List[str] = field(default_factory=list)
 
+    # Independent data timestamps
+    price_fetched_at_ms: Optional[int] = None
+    funding_fetched_at_ms: Optional[int] = None
+    orderbook_fetched_at_ms: Optional[int] = None
+    ticker_fetched_at_ms: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
 class DirectionSetup:
-    direction: str  # "LONG" or "SHORT"
-    status: str  # "SIGNAL" or "NO TRADE"
+    direction: str
+    status: str
     entry_low: Optional[float]
     entry_high: Optional[float]
     entry_reference: Optional[float]
@@ -51,11 +58,26 @@ class DirectionSetup:
     suggested_risk_pct: float
     suggested_risk_usdt: float
     suggested_position_size_base: Optional[float]
-    confluence_score: float  # 0 to 100
+    confluence_score: float
     rationale: List[str]
     activation_conditions: List[str]
     invalidation_conditions: List[str]
     no_trade_reasons: List[str] = field(default_factory=list)
+
+    # Setup lifecycle
+    created_at_ms: Optional[int] = None
+    expires_at_ms: Optional[int] = None
+    last_validated_at_ms: Optional[int] = None
+    setup_invalidated: bool = False
+
+    # SMC metadata
+    structure_state: Optional[str] = None
+    liquidity_sweep_type: Optional[str] = None
+    order_block_low: Optional[float] = None
+    order_block_high: Optional[float] = None
+    fvg_low: Optional[float] = None
+    fvg_high: Optional[float] = None
+    market_zone: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -67,13 +89,17 @@ class CoinScanResult:
     exchange_source: str
     market_tradeable: bool
     data_valid: bool
-    timeframe_bias: Dict[str, str]  # e.g. {"4h": "BULLISH", "1h": "BULLISH", "15m": "BEARISH"}
-    mtf_alignment: str  # "ALIGNED_BULLISH", "ALIGNED_BEARISH", "MIXED", "UNAVAILABLE"
+    timeframe_bias: Dict[str, str]
+    mtf_alignment: str
     funding_rate: Optional[float]
     spread_pct: Optional[float]
     long_setup: DirectionSetup
     short_setup: DirectionSetup
     data_issues: List[str] = field(default_factory=list)
+
+    # Separate data quality states
+    data_sufficient: bool = True
+    analysis_status: str = "AVAILABLE"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -81,6 +107,8 @@ class CoinScanResult:
             "exchange_source": self.exchange_source,
             "market_tradeable": self.market_tradeable,
             "data_valid": self.data_valid,
+            "data_sufficient": self.data_sufficient,
+            "analysis_status": self.analysis_status,
             "timeframe_bias": self.timeframe_bias,
             "mtf_alignment": self.mtf_alignment,
             "funding_rate": self.funding_rate,
@@ -123,5 +151,5 @@ class ScanReport:
                 "active_short_signals": self.active_short_signals,
                 "system_errors": self.system_errors,
             },
-            "coins": [c.to_dict() for c in self.coins],
+            "coins": [coin.to_dict() for coin in self.coins],
         }
