@@ -129,13 +129,13 @@ def analyze(symbol, asset, snap, book, contract, t):
         entry = sl = tp1 = tp2 = trigger = rr = None
         if range_ok and px:
             tk = n(contract.get("priceTick"))
-            if side == "LONG" and px < hi:
-                trigger, sl = tick_round(hi*1.0005, tk), tick_round(mid, tk)
+            if side == "LONG" and px < hi and px < mid:
+                trigger, sl = tick_round(hi*1.001, tk), tick_round(mid, tk)
                 entry = trigger
                 risk = entry-sl
                 if risk > 0: tp1, tp2 = entry+1.5*risk, entry+2*risk
-            elif side == "SHORT" and px > lo:
-                trigger, sl = tick_round(lo*0.9995, tk), tick_round(mid, tk)
+            elif side == "SHORT" and px > lo and px > mid:
+                trigger, sl = tick_round(lo*0.999, tk), tick_round(mid, tk)
                 entry = trigger
                 risk = sl-entry
                 if risk > 0: tp1, tp2 = entry-1.5*risk, entry-2*risk
@@ -164,8 +164,9 @@ def analyze(symbol, asset, snap, book, contract, t):
             "side": side, "score": score, "status": status, "components": parts,
             "sampled_returns_pct": {"24h_from_open": r24},
             "conditional_plan": {
-                "entry_trigger": trigger, "entry_reference": entry, "stop_loss": sl,
+                "entry": entry, "entry_trigger": trigger, "stop_loss": sl,
                 "take_profit_1": tp1, "take_profit_2": tp2, "rr_tp1": rr,
+                "activation": "ورود فقط بعد از عبور قیمت از Entry Trigger و تثبیت؛ قبل از آن ورود ممنوع",
                 "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
                 "level_type": "lbank_24h_market_range_not_candle_structure"
             },
@@ -219,27 +220,40 @@ def main():
         f"Watchlist assets: {len(WATCHLIST)} ({', '.join(WATCHLIST)})",
         f"Markets analyzed: {len(results)}",
         "A - confirmed signals: 0 (DISABLED: no verified Futures candles)",
-        f"B - conditional watch candidates: {len(b)}",
-        f"INSUFFICIENT_DATA - waiting for data: {len(ins)}",
-        f"C - rejected by filters: {len(rej)}", "",
-        "IMPORTANT:",
-        "- No OHLCV candles are received or fabricated.",
-        "- EMA, RSI, MACD, BOS, OB, FVG and Fibonacci are not calculated.",
-        "- B uses LBank 24h high/low, current snapshot and order-book data only.",
-        "- 24h range levels are not candle support/resistance and B is not an order.",
-        "- Do not place an order from this report alone; leverage and sizing are disabled.", "",
-        "TOP CONDITIONAL CANDIDATES:"
+        f"B - conditional setups: {len(b)}",
+        f"INSUFFICIENT_DATA: {len(ins)}",
+        f"C - rejected: {len(rej)}", "",
+        "IMPORTANT: These are conditional breakout plans, NOT market orders.",
+        "No verified Futures OHLCV candles; EMA/RSI/MACD/structure indicators are unavailable.",
+        "Entry is valid ONLY after the stated trigger is crossed and price holds beyond it.",
+        "If price reaches SL before entry triggers, CANCEL the setup.",
+        "Levels are derived from LBank 24h range snapshots, not candle support/resistance.",
+        "Leverage and position sizing are disabled. Never use high leverage.", "",
+        "CONDITIONAL TRADE PLANS (all prices are exact scanner references):"
     ]
-    for x in sorted(b, key=lambda z:z["score"], reverse=True)[:10]:
+    for x in sorted(b, key=lambda z:z["score"], reverse=True):
         p=x["analysis"]["conditional_plan"]
-        report.append(f"- {x['symbol']} {x['side']} score={x['score']} price={x['price']} trigger={p['entry_trigger']} SL={p['stop_loss']} TP1={p['take_profit_1']} TP2={p['take_profit_2']} RR={p['rr_tp1']}")
-    if not b: report.append("- No B candidate passed all freshness, liquidity and score filters.")
-    report += ["", "INSUFFICIENT DATA (first 20):"]
-    for x in ins[:20]:
+        report += [
+            "",
+            f"{x['symbol']} | {x['side']} | Score {x['score']}/100 | {x['status']}",
+            f"Current price : {x['price']}",
+            f"ENTRY         : {p.get('entry')}",
+            f"TRIGGER       : {p.get('entry_trigger')}",
+            f"STOP LOSS     : {p.get('stop_loss')}",
+            f"TAKE PROFIT 1 : {p.get('take_profit_1')}",
+            f"TAKE PROFIT 2 : {p.get('take_profit_2')}",
+            f"Risk/Reward   : {p.get('rr_tp1')} (to TP1)",
+            f"ACTIVATION    : {p.get('activation')}",
+            "CANCEL RULE   : If SL is hit before entry activation, cancel; do not chase price."
+        ]
+    if not b:
+        report.append("- No setup passed all current data and liquidity filters.")
+    report += ["", "INSUFFICIENT DATA:"]
+    for x in ins:
         report.append(f"- {x['symbol']}: {'; '.join(x.get('analysis',{}).get('reasons',[]))}")
     if not ins: report.append("- None")
     counts=Counter(r for x in rej for r in x.get("analysis",{}).get("reasons",[]))
-    report += ["", "TOP REJECTION REASONS:"]
+    report += ["", "REJECTION REASONS:"]
     report += [f"- {k}: {v}" for k,v in counts.most_common(10)] or ["- None"]
 
     obj={"scanner":"LBank Futures Smart Scanner - 20 asset watchlist",
@@ -256,7 +270,7 @@ def main():
     plans=[{"symbol":x["symbol"],"status":x["status"],"side":x["side"],"score":x["score"],
             "plan":x.get("analysis",{}).get("conditional_plan",{})} for x in b]
     with open("plans_state.json","w",encoding="utf-8") as f: json.dump({"generated_at":t.isoformat(),"plans":plans},f,ensure_ascii=False,indent=2)
-    fields=["timestamp","symbol","status","side","score","price","entry_trigger","stop_loss","take_profit_1","take_profit_2","rr_tp1","reason"]
+    fields=["timestamp","symbol","status","side","score","price","entry","entry_trigger","stop_loss","take_profit_1","take_profit_2","rr_tp1","reason"]
     exists=os.path.exists("signals_log.csv")
     with open("signals_log.csv","a",newline="",encoding="utf-8") as f:
         w=csv.DictWriter(f,fieldnames=fields)
@@ -265,7 +279,7 @@ def main():
             p=x.get("analysis",{}).get("conditional_plan",{})
             w.writerow({"timestamp":t.isoformat(),"symbol":x["symbol"],"status":x["status"],
                 "side":x.get("side"),"score":x.get("score"),"price":x.get("price"),
-                "entry_trigger":p.get("entry_trigger"),"stop_loss":p.get("stop_loss"),
+                "entry":p.get("entry"),"entry_trigger":p.get("entry_trigger"),"stop_loss":p.get("stop_loss"),
                 "take_profit_1":p.get("take_profit_1"),"take_profit_2":p.get("take_profit_2"),
                 "rr_tp1":p.get("rr_tp1"),"reason":" | ".join(x.get("analysis",{}).get("reasons",[]))})
     print(json.dumps(obj["summary"],ensure_ascii=False))
