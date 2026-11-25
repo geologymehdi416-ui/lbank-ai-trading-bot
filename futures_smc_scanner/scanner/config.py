@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 import os
 from typing import Tuple
@@ -19,32 +20,51 @@ TIMEFRAME_MS = {
 }
 
 
-def _env_float(name: str, default: float, minimum: float,
-               maximum: float) -> float:
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
+
     try:
         value = float(raw)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return default
+
     if not minimum <= value <= maximum:
         return default
+
     return value
 
 
-def _env_int(name: str, default: int, minimum: int,
-             maximum: int) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
+
     try:
         value = int(raw)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return default
+
     if not minimum <= value <= maximum:
         return default
+
     return value
+
+
+def _env_string(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    return value or default
 
 
 @dataclass(frozen=True)
@@ -52,9 +72,16 @@ class ScannerConfig:
     watchlist: Tuple[str, ...] = WATCHLIST_20
     timeframes: Tuple[str, ...] = SUPPORTED_TIMEFRAMES
 
+    # Binance USD-M Futures
     binance_base_url: str = "https://fapi.binance.com"
-    # Official Bybit mainnet alternate REST endpoint.
+
+    # Bybit USDT Linear Perpetual
     bybit_base_url: str = "https://api.bytick.com"
+
+    # LBank Contract / Perpetual API
+    # This is NOT the LBank Spot API.
+    lbank_base_url: str = "https://lbkperp.lbank.com"
+    lbank_product_group: str = "SwapU"
 
     request_timeout: float = 10.0
     max_retries: int = 3
@@ -72,7 +99,7 @@ class ScannerConfig:
 
     account_equity_usdt: float = 10000.0
 
-    # Analysis only: order execution is permanently disabled.
+    # Analysis only. Order execution is permanently disabled.
     live_trading_enabled: bool = False
 
     max_spread_pct: float = 0.15
@@ -93,9 +120,13 @@ class ScannerConfig:
     output_dir: str = "output"
 
     @classmethod
-    def from_env(cls, output_dir: str | None = None) -> "ScannerConfig":
+    def from_env(
+        cls,
+        output_dir: str | None = None,
+    ) -> "ScannerConfig":
 
         raw_tfs = os.getenv("SCAN_TIMEFRAMES", "15m,1h,4h")
+
         parsed_tfs = tuple(
             tf.strip()
             for tf in raw_tfs.split(",")
@@ -112,81 +143,155 @@ class ScannerConfig:
         live_trading_enabled = False
 
         equity = _env_float(
-            "ACCOUNT_EQUITY_USDT", 10000.0, 1.0, 1000000000.0
+            "ACCOUNT_EQUITY_USDT",
+            10000.0,
+            1.0,
+            1000000000.0,
         )
 
         risk = _env_float(
-            "RISK_PER_TRADE_PCT", 0.5, 0.01, 0.5
+            "RISK_PER_TRADE_PCT",
+            0.5,
+            0.01,
+            0.5,
         )
 
         max_spread = _env_float(
-            "MAX_SPREAD_PCT", 0.15, 0.001, 2.0
+            "MAX_SPREAD_PCT",
+            0.15,
+            0.001,
+            2.0,
         )
 
         max_funding = _env_float(
-            "MAX_ABS_FUNDING_RATE", 0.0015, 0.0001, 0.05
+            "MAX_ABS_FUNDING_RATE",
+            0.0015,
+            0.0001,
+            0.05,
         )
 
         min_volume = _env_float(
             "MIN_24H_QUOTE_VOLUME_USDT",
-            5000000.0, 0.0, 1000000000000.0
+            5000000.0,
+            0.0,
+            1000000000000.0,
         )
 
         min_candles = _env_int(
-            "MIN_CANDLES_REQUIRED", 210, 210, 1000
+            "MIN_CANDLES_REQUIRED",
+            210,
+            210,
+            1000,
         )
 
         candle_limit = _env_int(
-            "CANDLE_LIMIT", 260, min_candles, 1500
+            "CANDLE_LIMIT",
+            260,
+            min_candles,
+            1500,
         )
 
         timeout = _env_float(
-            "REQUEST_TIMEOUT", 10.0, 2.0, 60.0
+            "REQUEST_TIMEOUT",
+            10.0,
+            2.0,
+            60.0,
         )
 
         retries = _env_int(
-            "MAX_RETRIES", 3, 1, 10
+            "MAX_RETRIES",
+            3,
+            1,
+            10,
         )
 
         retry_backoff = _env_float(
-            "RETRY_BACKOFF_BASE", 1.0, 0.1, 10.0
+            "RETRY_BACKOFF_BASE",
+            1.0,
+            0.1,
+            10.0,
         )
 
         return cls(
             watchlist=watchlist,
             timeframes=parsed_tfs,
+
+            binance_base_url=_env_string(
+                "BINANCE_BASE_URL",
+                "https://fapi.binance.com",
+            ).rstrip("/"),
+
+            bybit_base_url=_env_string(
+                "BYBIT_BASE_URL",
+                "https://api.bytick.com",
+            ).rstrip("/"),
+
+            lbank_base_url=_env_string(
+                "LBANK_BASE_URL",
+                "https://lbkperp.lbank.com",
+            ).rstrip("/"),
+
+            lbank_product_group=_env_string(
+                "LBANK_PRODUCT_GROUP",
+                "SwapU",
+            ),
+
             candle_limit=candle_limit,
             min_candles_required=min_candles,
+
             request_timeout=timeout,
             max_retries=retries,
             retry_backoff_base=retry_backoff,
+
             risk_per_trade_pct=risk,
             account_equity_usdt=equity,
             live_trading_enabled=live_trading_enabled,
+
             max_spread_pct=max_spread,
             max_abs_funding_rate=max_funding,
             min_24h_quote_volume_usdt=min_volume,
+
             telegram_bot_token=os.getenv(
-                "TELEGRAM_BOT_TOKEN", ""
+                "TELEGRAM_BOT_TOKEN",
+                "",
             ).strip(),
+
             telegram_chat_id=os.getenv(
-                "TELEGRAM_CHAT_ID", ""
+                "TELEGRAM_CHAT_ID",
+                "",
             ).strip(),
+
             output_dir=(
                 output_dir
                 or os.getenv("OUTPUT_DIR", "output").strip()
                 or "output"
             ),
+
             max_market_data_age_ms=_env_int(
-                "MAX_MARKET_DATA_AGE_MS", 15000, 1000, 300000
+                "MAX_MARKET_DATA_AGE_MS",
+                15000,
+                1000,
+                300000,
             ),
+
             max_orderbook_age_ms=_env_int(
-                "MAX_ORDERBOOK_AGE_MS", 5000, 500, 60000
+                "MAX_ORDERBOOK_AGE_MS",
+                5000,
+                500,
+                60000,
             ),
+
             max_candle_gap_count=_env_int(
-                "MAX_CANDLE_GAP_COUNT", 0, 0, 100
+                "MAX_CANDLE_GAP_COUNT",
+                0,
+                0,
+                100,
             ),
+
             setup_validity_minutes=_env_int(
-                "SETUP_VALIDITY_MINUTES", 60, 5, 1440
+                "SETUP_VALIDITY_MINUTES",
+                60,
+                5,
+                1440,
             ),
         )
