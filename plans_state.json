@@ -1,20 +1,6 @@
 {
-  "generated_at": "2026-11-25T09:34:39.724051+00:00",
+  "generated_at": "2026-11-25T09:38:27.990928+00:00",
   "plans": [
-    {
-      "symbol": "BTCUSDT",
-      "bias": "SHORT_BIAS",
-      "bias_score": -65,
-      "plan": {
-        "entry": 58541.700000000004,
-        "stop_loss": 59115.9,
-        "take_profit_1": 57680.4,
-        "take_profit_2": 57393.3,
-        "rr_tp1": 1.5,
-        "rr_tp2": 2.0,
-        "basis": "24h range breakout reference; not candle structure"
-      }
-    },
     {
       "symbol": "ETHUSDT",
       "bias": "SHORT_BIAS",
@@ -44,20 +30,6 @@
       }
     },
     {
-      "symbol": "XRPUSDT",
-      "bias": "SHORT_BIAS",
-      "bias_score": -40,
-      "plan": {
-        "entry": 0.9081,
-        "stop_loss": 0.9162,
-        "take_profit_1": 0.896,
-        "take_profit_2": 0.8919,
-        "rr_tp1": 1.5,
-        "rr_tp2": 2.0,
-        "basis": "24h range breakout reference; not candle structure"
-      }
-    },
-    {
       "symbol": "DOGEUSDT",
       "bias": "SHORT_BIAS",
       "bias_score": -40,
@@ -74,7 +46,7 @@
     {
       "symbol": "ADAUSDT",
       "bias": "SHORT_BIAS",
-      "bias_score": -65,
+      "bias_score": -40,
       "plan": {
         "entry": 0.14070000000000002,
         "stop_loss": 0.1424,
@@ -88,7 +60,7 @@
     {
       "symbol": "AVAXUSDT",
       "bias": "SHORT_BIAS",
-      "bias_score": -40,
+      "bias_score": -65,
       "plan": {
         "entry": 6.415,
         "stop_loss": 6.5040000000000004,
@@ -102,26 +74,40 @@
     {
       "symbol": "LINKUSDT",
       "bias": "SHORT_BIAS",
-      "bias_score": -65,
+      "bias_score": -40,
       "plan": {
-        "entry": 8.622,
-        "stop_loss": 8.738,
-        "take_profit_1": 8.448,
-        "take_profit_2": 8.39,
+        "entry": 8.621,
+        "stop_loss": 8.737,
+        "take_profit_1": 8.447000000000001,
+        "take_profit_2": 8.389,
         "rr_tp1": 1.5,
         "rr_tp2": 2.0,
         "basis": "24h range breakout reference; not candle structure"
       }
     },
     {
-      "symbol": "SUIUSDT",
+      "symbol": "HYPEUSDT",
+      "bias": "SHORT_BIAS",
+      "bias_score": -65,
+      "plan": {
+        "entry": 57.982,
+        "stop_loss": 59.388,
+        "take_profit_1": 55.873000000000005,
+        "take_profit_2": 55.17,
+        "rr_tp1": 1.5,
+        "rr_tp2": 2.0,
+        "basis": "24h range breakout reference; not candle structure"
+      }
+    },
+    {
+      "symbol": "AAVEUSDT",
       "bias": "SHORT_BIAS",
       "bias_score": -40,
       "plan": {
-        "entry": 0.634,
-        "stop_loss": 0.6418,
-        "take_profit_1": 0.6223000000000001,
-        "take_profit_2": 0.6184000000000001,
+        "entry": 91.67,
+        "stop_loss": 92.79,
+        "take_profit_1": 89.99,
+        "take_profit_2": 89.43,
         "rr_tp1": 1.5,
         "rr_tp2": 2.0,
         "basis": "24h range breakout reference; not candle structure"
@@ -130,26 +116,12 @@
     {
       "symbol": "UNIUSDT",
       "bias": "SHORT_BIAS",
-      "bias_score": -40,
+      "bias_score": -65,
       "plan": {
         "entry": 4.495,
         "stop_loss": 4.573,
         "take_profit_1": 4.378,
         "take_profit_2": 4.339,
-        "rr_tp1": 1.5,
-        "rr_tp2": 2.0,
-        "basis": "24h range breakout reference; not candle structure"
-      }
-    },
-    {
-      "symbol": "ICPUSDT",
-      "bias": "SHORT_BIAS",
-      "bias_score": -40,
-      "plan": {
-        "entry": 1.942,
-        "stop_loss": 1.98,
-        "take_profit_1": 1.885,
-        "take_profit_2": 1.866,
         "rr_tp1": 1.5,
         "rr_tp2": 2.0,
         "basis": "24h range breakout reference; not candle structure"
@@ -172,26 +144,12 @@
     {
       "symbol": "PYTHUSDT",
       "bias": "SHORT_BIAS",
-      "bias_score": -65,
-      "plan": {
-        "entry": 0.04744,
-        "stop_loss": 0.048310000000000006,
-        "take_profit_1": 0.046130000000000004,
-        "take_profit_2": 0.045700000000000005,
-        "rr_tp1": 1.5,
-        "rr_tp2": 2.0,
-        "basis": "24h range breakout reference; not candle structure"
-      }
-    },
-    {
-      "symbol": "JUPUSDT",
-      "bias": "SHORT_BIAS",
       "bias_score": -40,
       "plan": {
-        "entry": 0.2141,
-        "stop_loss": 0.2199,
-        "take_profit_1": 0.2054,
-        "take_profit_2": 0.2025,
+        "entry": 0.04744,
+        "stop_loss": 0.048290000000000007,
+        "take_profit_1": 0.04616000000000001,
+        "take_profit_2": 0.04574,
         "rr_tp1": 1.5,
         "rr_tp2": 2.0,
         "basis": "24h range breakout reference; not candle structure"
