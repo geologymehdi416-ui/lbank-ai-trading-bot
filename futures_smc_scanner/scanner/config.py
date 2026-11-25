@@ -1,7 +1,6 @@
-
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
-from typing import List, Tuple
+from typing import Tuple
 
 
 WATCHLIST_20: Tuple[str, ...] = (
@@ -54,7 +53,8 @@ class ScannerConfig:
     timeframes: Tuple[str, ...] = SUPPORTED_TIMEFRAMES
 
     binance_base_url: str = "https://fapi.binance.com"
-    bybit_base_url: str = "https://api.bybit.com"
+    # Official Bybit mainnet alternate REST endpoint.
+    bybit_base_url: str = "https://api.bytick.com"
 
     request_timeout: float = 10.0
     max_retries: int = 3
