@@ -1,6 +1,12 @@
+"""Conservative multi-timeframe SMC analysis for USDT perpetual futures.
+
+Analysis only. This module never submits orders and never calculates executable
+position size. It expects closed candles supplied by the data client.
+"""
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
+import math
+
 import pandas as pd
 
 from .config import ScannerConfig
@@ -12,12 +18,12 @@ from .models import Candle, CoinScanResult, DirectionSetup, MarketDerivativeCont
 class SwingPoint:
     index: int
     price: float
-    kind: str  # "HIGH" or "LOW"
+    kind: str
 
 
 @dataclass
 class OrderBlock:
-    direction: str  # "BULLISH" or "BEARISH"
+    direction: str
     low: float
     high: float
     index: int
@@ -25,204 +31,273 @@ class OrderBlock:
 
 @dataclass
 class FairValueGap:
-    direction: str  # "BULLISH" or "BEARISH"
+    direction: str
     low: float
     high: float
     index: int
 
 
-def detect_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> List[SwingPoint]:
-    swings: List[SwingPoint] = []
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    n = len(df)
-    if n < left + right + 1:
-        return swings
-
-    for i in range(left, n - right):
-        win_h = highs[i - left : i + right + 1]
-        if highs[i] == np.max(win_h) and np.sum(win_h == highs[i]) == 1:
-            swings.append(SwingPoint(index=i, price=float(highs[i]), kind="HIGH"))
-        win_l = lows[i - left : i + right + 1]
-        if lows[i] == np.min(win_l) and np.sum(win_l == lows[i]) == 1:
-            swings.append(SwingPoint(index=i, price=float(lows[i]), kind="LOW"))
-
-    swings.sort(key=lambda s: s.index)
-    return swings
+def _finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
-def detect_structure_bos_choch(df: pd.DataFrame, swings: List[SwingPoint]) -> Tuple[str, List[str]]:
-    """Determines trend bias ('BULLISH', 'BEARISH', 'RANGE') and structural events (BOS / CHoCH)."""
+def _snapshot_value(snapshot: dict, *names: str, default=None):
+    """Accept the current indicator names and legacy aliases."""
+    for name in names:
+        if name in snapshot and snapshot[name] is not None:
+            return snapshot[name]
+    return default
+
+
+def detect_swings(
+    df: pd.DataFrame, left: int = 3, right: int = 3
+) -> List[SwingPoint]:
+    """Pivot is returned only after its right-hand confirmation bars exist."""
+    result: List[SwingPoint] = []
+    if df is None or len(df) < left + right + 1:
+        return result
+
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+
+    for i in range(left, len(df) - right):
+        high_window = highs[i-left:i+right+1]
+        low_window = lows[i-left:i+right+1]
+        if highs[i] == high_window.max() and (high_window == highs[i]).sum() == 1:
+            result.append(SwingPoint(i, float(highs[i]), "HIGH"))
+        if lows[i] == low_window.min() and (low_window == lows[i]).sum() == 1:
+            result.append(SwingPoint(i, float(lows[i]), "LOW"))
+
+    return sorted(result, key=lambda x: x.index)
+
+
+def detect_structure_bos_choch(
+    df: pd.DataFrame, swings: List[SwingPoint]
+) -> Tuple[str, List[str]]:
+    """Determine swing structure and detect a close crossing the latest level."""
+    if df is None or len(df) < 3:
+        return "RANGE", ["Insufficient candles"]
+
+    last_i = len(df) - 1
+    # A swing needs three right-side bars to be confirmed with default settings.
+    confirmed = [s for s in swings if s.index + 3 <= last_i]
+    highs = [s for s in confirmed if s.kind == "HIGH"]
+    lows = [s for s in confirmed if s.kind == "LOW"]
+    if len(highs) < 2 or len(lows) < 2:
+        return "RANGE", ["Insufficient confirmed swing points"]
+
+    prev_close = float(df["close"].iloc[-2])
+    close = float(df["close"].iloc[-1])
+    ph, lh = highs[-2].price, highs[-1].price
+    pl, ll = lows[-2].price, lows[-1].price
+    bull_structure = lh > ph and ll > pl
+    bear_structure = lh < ph and ll < pl
+
+    bull_break = prev_close <= lh < close
+    bear_break = prev_close >= ll > close
     events: List[str] = []
-    swing_highs = [s for s in swings if s.kind == "HIGH"]
-    swing_lows = [s for s in swings if s.kind == "LOW"]
 
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "RANGE", ["Insufficient swing points for structural confirmation"]
+    if bull_break:
+        events.append("CHoCH Bullish" if bear_structure else "BOS Bullish")
+    if bear_break:
+        events.append("CHoCH Bearish" if bull_structure else "BOS Bearish")
 
-    last_close = float(df["close"].iloc[-1])
-    prev_sh = swing_highs[-2].price
-    last_sh = swing_highs[-1].price
-    prev_sl = swing_lows[-2].price
-    last_sl = swing_lows[-1].price
-
-    bull_structure = last_sh > prev_sh and last_sl > prev_sl
-    bear_structure = last_sh < prev_sh and last_sl < prev_sl
-
-    if last_close > last_sh:
-        if bear_structure:
-            events.append(f"CHoCH Bullish above {last_sh:.6g}")
-        else:
-            events.append(f"BOS Bullish above {last_sh:.6g}")
-    if last_close < last_sl:
-        if bull_structure:
-            events.append(f"CHoCH Bearish below {last_sl:.6g}")
-        else:
-            events.append(f"BOS Bearish below {last_sl:.6g}")
-
-    if bull_structure or (any("Bullish" in e for e in events) and not any("Bearish" in e for e in events)):
-        return "BULLISH", events or ["Higher Highs & Higher Lows structure"]
-    if bear_structure or (any("Bearish" in e for e in events) and not any("Bullish" in e for e in events)):
-        return "BEARISH", events or ["Lower Highs & Lower Lows structure"]
-    return "RANGE", events or ["Mixed swing highs/lows (consolidation)"]
+    if bull_break and not bear_break:
+        return "BULLISH", events
+    if bear_break and not bull_break:
+        return "BEARISH", events
+    if bull_structure and not bear_structure:
+        return "BULLISH", ["Higher Highs and Higher Lows"]
+    if bear_structure and not bull_structure:
+        return "BEARISH", ["Lower Highs and Lower Lows"]
+    return "RANGE", events or ["Mixed or ranging structure"]
 
 
-def detect_liquidity_sweeps(df: pd.DataFrame, swings: List[SwingPoint], lookback_recent: int = 8) -> List[str]:
-    """Detects wick sweeps beyond recent swing highs (sell-side liquidity above highs) or swing lows (buy-side below lows) that close back inside."""
+def detect_liquidity_sweeps(
+    df: pd.DataFrame,
+    swings: List[SwingPoint],
+    lookback_recent: int = 8,
+    left: int = 3,
+    right: int = 3,
+) -> List[str]:
+    """A sweep must pierce a previously confirmed pivot and close back inside."""
     sweeps: List[str] = []
-    n = len(df)
-    if n < 3:
+    if df is None or len(df) < 3:
         return sweeps
 
-    start_idx = max(1, n - lookback_recent)
-    swing_highs = [s for s in swings if s.kind == "HIGH"]
-    swing_lows = [s for s in swings if s.kind == "LOW"]
+    start = max(1, len(df) - lookback_recent)
+    for i in range(start, len(df)):
+        high = float(df["high"].iloc[i])
+        low = float(df["low"].iloc[i])
+        close = float(df["close"].iloc[i])
+        prior = [s for s in swings if s.index + right < i]
 
-    for i in range(start_idx, n):
-        h_i = float(df["high"].iloc[i])
-        l_i = float(df["low"].iloc[i])
-        c_i = float(df["close"].iloc[i])
-
-        for sh in swing_highs[-4:]:
-            if sh.index < i and h_i > sh.price and c_i < sh.price:
-                sweeps.append(f"Buyside Liquidity Sweep above {sh.price:.6g} at bar {i}")
+        for swing in [s for s in prior if s.kind == "HIGH"][-4:]:
+            if high > swing.price and close < swing.price:
+                sweeps.append(f"Buyside Sweep at {swing.price:.8g} bar {i}")
                 break
 
-        for sl in swing_lows[-4:]:
-            if sl.index < i and l_i < sl.price and c_i > sl.price:
-                sweeps.append(f"Sellside Liquidity Sweep below {sl.price:.6g} at bar {i}")
+        for swing in [s for s in prior if s.kind == "LOW"][-4:]:
+            if low < swing.price and close > swing.price:
+                sweeps.append(f"Sellside Sweep at {swing.price:.8g} bar {i}")
                 break
 
     return sweeps
 
 
-def detect_order_blocks_and_fvgs(df: pd.DataFrame) -> Tuple[List[OrderBlock], List[FairValueGap]]:
+def detect_order_blocks_and_fvgs(
+    df: pd.DataFrame,
+    atr_value: Optional[float] = None,
+) -> Tuple[List[OrderBlock], List[FairValueGap]]:
+    """Detect simple displacement OBs and three-candle FVGs.
+
+    These are candidate zones, not proof of institutional orders. Mitigation is
+    checked against subsequent candles before a zone is returned.
+    """
     obs: List[OrderBlock] = []
     fvgs: List[FairValueGap] = []
-    n = len(df)
-    if n < 5:
+    if df is None or len(df) < 10:
         return obs, fvgs
 
-    # Fair Value Gaps (3-candle imbalance)
-    for i in range(1, n - 1):
-        h_prev = float(df["high"].iloc[i - 1])
-        l_prev = float(df["low"].iloc[i - 1])
-        h_next = float(df["high"].iloc[i + 1])
-        l_next = float(df["low"].iloc[i + 1])
+    bodies = (df["close"] - df["open"]).abs()
+    avg_body = float(bodies.iloc[-50:].mean())
+    if not _finite(avg_body) or avg_body <= 0:
+        return obs, fvgs
+    min_gap = max(avg_body * 0.15, (float(atr_value) * 0.05 if _finite(atr_value) else 0.0))
 
-        if l_next > h_prev:
-            fvgs.append(FairValueGap(direction="BULLISH", low=h_prev, high=l_next, index=i))
-        elif h_next < l_prev:
-            fvgs.append(FairValueGap(direction="BEARISH", low=h_next, high=l_prev, index=i))
+    for i in range(1, len(df) - 1):
+        prev_high = float(df["high"].iloc[i - 1])
+        prev_low = float(df["low"].iloc[i - 1])
+        next_high = float(df["high"].iloc[i + 1])
+        next_low = float(df["low"].iloc[i + 1])
 
-    # Order Blocks (last opposite candle before impulsive displacement)
-    body = (df["close"] - df["open"]).abs()
-    avg_body = float(body.iloc[max(0, n - 50) : n].mean()) if n > 1 else 0.0
-    impulse_thresh = max(avg_body * 1.6, 1e-12)
+        if next_low - prev_high >= min_gap:
+            low, high = prev_high, next_low
+            # A bullish FVG is mitigated if a later low has fully traversed it.
+            later_lows = df["low"].iloc[i + 2:]
+            if len(later_lows) == 0 or float(later_lows.min()) > low:
+                fvgs.append(FairValueGap("BULLISH", low, high, i))
+        elif prev_low - next_high >= min_gap:
+            low, high = next_high, prev_low
+            later_highs = df["high"].iloc[i + 2:]
+            if len(later_highs) == 0 or float(later_highs.max()) < high:
+                fvgs.append(FairValueGap("BEARISH", low, high, i))
 
-    for i in range(1, n - 1):
-        o_i = float(df["open"].iloc[i])
-        c_i = float(df["close"].iloc[i])
-        l_i = float(df["low"].iloc[i])
-        h_i = float(df["high"].iloc[i])
+    displacement_threshold = avg_body * 1.5
+    for i in range(1, len(df) - 1):
+        o, c = float(df["open"].iloc[i]), float(df["close"].iloc[i])
+        no, nc = float(df["open"].iloc[i + 1]), float(df["close"].iloc[i + 1])
+        if abs(nc - no) < displacement_threshold:
+            continue
 
-        c_next = float(df["close"].iloc[i + 1])
-        o_next = float(df["open"].iloc[i + 1])
-        imp_next = abs(c_next - o_next)
+        if c < o and nc > no:
+            low, high, direction = float(df["low"].iloc[i]), float(df["high"].iloc[i]), "BULLISH"
+            subsequent = df.iloc[i + 2:]
+            mitigated = len(subsequent) > 0 and float(subsequent["low"].min()) <= low
+        elif c > o and nc < no:
+            low, high, direction = float(df["low"].iloc[i]), float(df["high"].iloc[i]), "BEARISH"
+            subsequent = df.iloc[i + 2:]
+            mitigated = len(subsequent) > 0 and float(subsequent["high"].max()) >= high
+        else:
+            continue
 
-        if c_i < o_i and c_next > o_next and imp_next >= impulse_thresh:
-            obs.append(OrderBlock(direction="BULLISH", low=l_i, high=h_i, index=i))
-        elif c_i > o_i and c_next < o_next and imp_next >= impulse_thresh:
-            obs.append(OrderBlock(direction="BEARISH", low=l_i, high=h_i, index=i))
+        if not mitigated:
+            obs.append(OrderBlock(direction, low, high, i))
 
-    return obs[-6:], fvgs[-6:]
+    return obs[-10:], fvgs[-10:]
 
 
 def compute_premium_discount_and_fibs(
     df: pd.DataFrame,
     swings: List[SwingPoint],
     lookback: int = 80,
-) -> Dict[str, float]:
-    recent = df.iloc[-lookback:] if len(df) >= lookback else df
+) -> Dict[str, Any]:
+    if df is None or len(df) < 10:
+        raise ValueError("Insufficient candles for dealing range")
+
+    recent = df.iloc[-lookback:]
     range_high = float(recent["high"].max())
     range_low = float(recent["low"].min())
-    if range_high <= range_low:
-        range_high = range_low * 1.001 + 1e-8
+    if not _finite(range_high) or not _finite(range_low) or range_high <= range_low:
+        raise ValueError("Invalid dealing range")
 
-    eq_050 = range_low + 0.5 * (range_high - range_low)
-    current_price = float(df["close"].iloc[-1])
-    zone = "DISCOUNT" if current_price < eq_050 else ("PREMIUM" if current_price > eq_050 else "EQUILIBRIUM")
+    equilibrium = (range_high + range_low) / 2.0
+    price = float(df["close"].iloc[-1])
+    zone = "DISCOUNT" if price < equilibrium else "PREMIUM" if price > equilibrium else "EQUILIBRIUM"
 
-    # Identify swing leg for Fibonacci retracement (0.5, 0.618, 0.705, 0.786) and extensions (1.272, 1.618)
-    swing_highs = [s for s in swings if s.kind == "HIGH"]
-    swing_lows = [s for s in swings if s.kind == "LOW"]
+    confirmed = [s for s in swings if s.index + 3 < len(df)]
+    highs = [s for s in confirmed if s.kind == "HIGH"]
+    lows = [s for s in confirmed if s.kind == "LOW"]
+    if not highs or not lows:
+        raise ValueError("Insufficient confirmed Fibonacci swings")
 
-    leg_high = swing_highs[-1].price if swing_highs else range_high
-    leg_low = swing_lows[-1].price if swing_lows else range_low
+    high_point, low_point = highs[-1], lows[-1]
+    if low_point.index < high_point.index:
+        leg_low, leg_high, leg_direction = low_point.price, high_point.price, "BULLISH"
+    elif high_point.index < low_point.index:
+        leg_low, leg_high, leg_direction = low_point.price, high_point.price, "BEARISH"
+    else:
+        raise ValueError("Invalid Fibonacci swing sequence")
 
-    # Bullish leg: low -> high (retracements pull back down from leg_high toward leg_low)
-    # Bearish leg: high -> low (retracements pull back up from leg_low toward leg_high)
-    diff = max(abs(leg_high - leg_low), 1e-9)
+    diff = leg_high - leg_low
+    if diff <= 0:
+        raise ValueError("Invalid Fibonacci range")
 
-    bull_fib_050 = leg_high - 0.50 * diff
-    bull_fib_0618 = leg_high - 0.618 * diff
-    bull_fib_0705 = leg_high - 0.705 * diff
-    bull_fib_0786 = leg_high - 0.786 * diff
-    bull_ext_1272 = leg_low + 1.272 * diff
-    bull_ext_1618 = leg_low + 1.618 * diff
-
-    bear_fib_050 = leg_low + 0.50 * diff
-    bear_fib_0618 = leg_low + 0.618 * diff
-    bear_fib_0705 = leg_low + 0.705 * diff
-    bear_fib_0786 = leg_low + 0.786 * diff
-    bear_ext_1272 = leg_high - 1.272 * diff
-    bear_ext_1618 = leg_high - 1.618 * diff
-
-    return {
+    result: Dict[str, Any] = {
         "range_high": range_high,
         "range_low": range_low,
-        "eq_050": eq_050,
+        "eq_050": equilibrium,
         "zone": zone,
         "leg_high": leg_high,
         "leg_low": leg_low,
-        "bull_fib_050": bull_fib_050,
-        "bull_fib_0618": bull_fib_0618,
-        "bull_fib_0705": bull_fib_0705,
-        "bull_fib_0786": bull_fib_0786,
-        "bull_ext_1272": bull_ext_1272,
-        "bull_ext_1618": bull_ext_1618,
-        "bear_fib_050": bear_fib_050,
-        "bear_fib_0618": bear_fib_0618,
-        "bear_fib_0705": bear_fib_0705,
-        "bear_fib_0786": bear_fib_0786,
-        "bear_ext_1272": bear_ext_1272,
-        "bear_ext_1618": bear_ext_1618,
+        "leg_direction": leg_direction,
     }
+    for name, ratio in (("050", .5), ("0618", .618), ("0705", .705), ("0786", .786)):
+        result[f"bull_fib_{name}"] = leg_high - ratio * diff
+        result[f"bear_fib_{name}"] = leg_low + ratio * diff
+
+    result["bull_ext_1272"] = leg_low + 1.272 * diff
+    result["bull_ext_1618"] = leg_low + 1.618 * diff
+    result["bear_ext_1272"] = leg_high - 1.272 * diff
+    result["bear_ext_1618"] = leg_high - 1.618 * diff
+    return result
+
+
+def _empty_setup(
+    direction: str,
+    config: ScannerConfig,
+    reasons: List[str],
+    status: str = "INSUFFICIENT_DATA",
+) -> DirectionSetup:
+    risk_usdt = round(config.account_equity_usdt * config.risk_per_trade_pct / 100.0, 4)
+    return DirectionSetup(
+        direction=direction,
+        status=status,
+        entry_low=None,
+        entry_high=None,
+        entry_reference=None,
+        stop_loss=None,
+        target_1=None,
+        target_2=None,
+        rr_tp1=None,
+        rr_tp2=None,
+        suggested_risk_pct=config.risk_per_trade_pct,
+        suggested_risk_usdt=risk_usdt,
+        suggested_position_size_base=None,
+        confluence_score=0.0,
+        rationale=[],
+        activation_conditions=[],
+        invalidation_conditions=[],
+        no_trade_reasons=reasons,
+    )
 
 
 def _evaluate_direction(
     direction: str,
-    ctx: MarketDerivativeContext,
+    ctx: Optional[MarketDerivativeContext],
     tf_snapshots: Dict[str, dict],
     tf_smc: Dict[str, dict],
     mtf_bias: Dict[str, str],
@@ -230,232 +305,215 @@ def _evaluate_direction(
     market_block_reasons: List[str],
     config: ScannerConfig,
 ) -> DirectionSetup:
-    risk_usdt = round(config.account_equity_usdt * (config.risk_per_trade_pct / 100.0), 4)
-    no_trade_reasons: List[str] = list(market_block_reasons)
+    required = ("4h", "1h", "15m")
+    if ctx is None:
+        return _empty_setup(direction, config, ["Perpetual market context unavailable"])
+    if any(tf not in tf_snapshots or tf not in tf_smc for tf in required):
+        return _empty_setup(direction, config, ["Required 4h, 1h and 15m analysis unavailable"])
+
+    bullish = direction == "LONG"
+    expected = "BULLISH" if bullish else "BEARISH"
+    reasons = list(dict.fromkeys(market_block_reasons))
     rationale: List[str] = []
-
-    exec_tf = "15m" if "15m" in tf_snapshots else list(tf_snapshots.keys())[0]
-    snap = tf_snapshots.get(exec_tf)
-    smc = tf_smc.get(exec_tf)
-
-    if snap is None or smc is None:
-        no_trade_reasons.append("Insufficient indicator or SMC data on execution timeframe")
-        return DirectionSetup(
-            direction=direction,
-            status="NO TRADE",
-            entry_low=None,
-            entry_high=None,
-            entry_reference=None,
-            stop_loss=None,
-            target_1=None,
-            target_2=None,
-            rr_tp1=None,
-            rr_tp2=None,
-            suggested_risk_pct=config.risk_per_trade_pct,
-            suggested_risk_usdt=risk_usdt,
-            suggested_position_size_base=None,
-            confluence_score=0.0,
-            rationale=[],
-            activation_conditions=[],
-            invalidation_conditions=[],
-            no_trade_reasons=no_trade_reasons,
-        )
-
     score = 0.0
-    price = snap["close"]
-    atr_val = max(snap["atr"], price * 1e-5)
 
-    # 1. Multi-timeframe alignment & structure (max 30 pts)
-    higher_tfs = [tf for tf in ["4h", "1h"] if tf in mtf_bias]
-    aligned_htf = sum(1 for tf in higher_tfs if (tf_bias := mtf_bias[tf]) == ("BULLISH" if direction == "LONG" else "BEARISH"))
-    exec_bias = mtf_bias.get(exec_tf, "RANGE")
-
-    if aligned_htf == len(higher_tfs) and len(higher_tfs) > 0:
-        score += 20.0
-        rationale.append(f"هم‌جهتی کامل تایم‌فریم‌های بالاتر ({', '.join(higher_tfs)}) در جهت {direction}")
-    elif aligned_htf >= 1:
-        score += 10.0
-        rationale.append(f"هم‌جهتی جزئی تایم‌فریم بالاتر ({aligned_htf}/{len(higher_tfs)}) در جهت {direction}")
+    if mtf_bias.get("4h") == expected and mtf_bias.get("1h") == expected:
+        score += 20
+        rationale.append("4h and 1h structure aligned")
     else:
-        no_trade_reasons.append(f"عدم هم‌جهتی ساختار تایم‌فریم‌های بالاتر با {direction}")
+        reasons.append("4h and 1h structure are not aligned with this direction")
 
-    if exec_bias == ("BULLISH" if direction == "LONG" else "BEARISH"):
-        score += 10.0
-        rationale.append(f"ساختار {exec_tf} تاییدکننده {direction} ({', '.join(smc['events'])})")
+    if mtf_bias.get("15m") == expected:
+        score += 10
+        rationale.append("15m structure aligned")
     else:
-        no_trade_reasons.append(f"ساختار {exec_tf} ({exec_bias}) با {direction} همسو نیست")
+        reasons.append("15m structure does not confirm this direction")
 
-    # 2. Liquidity Sweep + OB/FVG + Premium/Discount + Fibs (max 35 pts)
+    snap = tf_snapshots["15m"]
+    smc = tf_smc["15m"]
+    price = float(snap["close"])
+    atr_value = float(_snapshot_value(snap, "atr14", "atr", default=0.0))
+    rsi_value = float(_snapshot_value(snap, "rsi14", "rsi", default=50.0))
+    ema20 = float(snap["ema20"])
+    ema50 = float(snap["ema50"])
+    ema200 = float(snap["ema200"])
+    macd = float(snap["macd"])
+    macd_signal = float(snap["macd_signal"])
+    macd_hist = float(snap["macd_hist"])
+    prev_hist = float(snap["prev_macd_hist"])
+    vol_ratio = float(snap["vol_ratio"])
+
+    if not all(_finite(x) for x in (price, atr_value, rsi_value, ema20, ema50, ema200, macd, macd_signal, macd_hist, prev_hist, vol_ratio)) or price <= 0 or atr_value <= 0:
+        return _empty_setup(direction, config, ["Invalid or incomplete indicator values"])
+
+    sweep_ok = any(("Sellside Sweep" in s) if bullish else ("Buyside Sweep" in s) for s in smc["sweeps"])
+    if sweep_ok:
+        score += 12
+        rationale.append("Recent liquidity sweep detected")
+    else:
+        reasons.append("No directionally valid recent liquidity sweep")
+
+    # Select the nearest zone below price for LONG or above price for SHORT.
+    zones = []
+    for ob in smc["obs"]:
+        if ob.direction == ("BULLISH" if bullish else "BEARISH"):
+            if bullish and ob.high < price and price - ob.high <= 2.5 * atr_value:
+                zones.append((price - ob.high, ob.low, ob.high, "ORDER BLOCK"))
+            elif not bullish and ob.low > price and ob.low - price <= 2.5 * atr_value:
+                zones.append((ob.low - price, ob.low, ob.high, "ORDER BLOCK"))
+
+    for fvg in smc["fvgs"]:
+        if fvg.direction == ("BULLISH" if bullish else "BEARISH"):
+            if bullish and fvg.high < price and price - fvg.high <= 2.5 * atr_value:
+                zones.append((price - fvg.high, fvg.low, fvg.high, "FVG"))
+            elif not bullish and fvg.low > price and fvg.low - price <= 2.5 * atr_value:
+                zones.append((fvg.low - price, fvg.low, fvg.high, "FVG"))
+
+    if not zones:
+        return _empty_setup(direction, config, reasons + ["No nearby unmitigated directional OB/FVG"], "NO_TRADE")
+
+    zones.sort(key=lambda x: x[0])
+    _, entry_low, entry_high, zone_type = zones[0]
+    if entry_low <= 0 or entry_high <= entry_low:
+        return _empty_setup(direction, config, ["Invalid entry zone"], "NO_TRADE")
+    score += 10
+    rationale.append(f"Nearest candidate zone: {zone_type}")
+
     fibs = smc["fibs"]
-    sweeps = smc["sweeps"]
-    obs = smc["obs"]
-    fvgs = smc["fvgs"]
-
-    if direction == "LONG":
-        has_sweep = any("Sellside" in s for s in sweeps)
-        matching_obs = [o for o in obs if o.direction == "BULLISH" and o.high <= price * 1.03]
-        matching_fvgs = [f for f in fvgs if f.direction == "BULLISH" and f.high <= price * 1.03]
-        in_discount = fibs["zone"] in ("DISCOUNT", "EQUILIBRIUM")
-        fib_levels = [fibs["bull_fib_050"], fibs["bull_fib_0618"], fibs["bull_fib_0705"], fibs["bull_fib_0786"]]
-        fib_low = min(fib_levels)
-        fib_high = max(fib_levels)
-        tp1_raw = fibs["bull_ext_1272"]
-        tp2_raw = fibs["bull_ext_1618"]
+    zone_ok = fibs["zone"] == ("DISCOUNT" if bullish else "PREMIUM")
+    if zone_ok:
+        score += 8
+        rationale.append("Price in preferred Premium/Discount half")
     else:
-        has_sweep = any("Buyside" in s for s in sweeps)
-        matching_obs = [o for o in obs if o.direction == "BEARISH" and o.low >= price * 0.97]
-        matching_fvgs = [f for f in fvgs if f.direction == "BEARISH" and f.low >= price * 0.97]
-        in_discount = fibs["zone"] in ("PREMIUM", "EQUILIBRIUM")
-        fib_levels = [fibs["bear_fib_050"], fibs["bear_fib_0618"], fibs["bear_fib_0705"], fibs["bear_fib_0786"]]
-        fib_low = min(fib_levels)
-        fib_high = max(fib_levels)
-        tp1_raw = fibs["bear_ext_1272"]
-        tp2_raw = fibs["bear_ext_1618"]
+        reasons.append("Price is not in preferred Premium/Discount zone")
 
-    if has_sweep:
-        score += 10.0
-        rationale.append("ثبت Liquidity Sweep معتبر در جهت عکس حرکت اصلاحی")
-    else:
-        no_trade_reasons.append("Liquidity Sweep تاییدکننده در ساختار اخیر مشاهده نشد")
-
-    if matching_obs or matching_fvgs:
-        score += 10.0
-        rationale.append(f"وجود زون معتبر SMC (OB: {len(matching_obs)}, FVG: {len(matching_fvgs)})")
-    else:
-        no_trade_reasons.append("عدم وجود Order Block یا Fair Value Gap هم‌جهت در محدوده منطقی")
-
-    if in_discount:
-        score += 8.0
-        rationale.append(f"موقعیت قیمتی در محدوده {fibs['zone']} نسبت به تعادل ۰.۵")
-    else:
-        no_trade_reasons.append(f"قیمت در محدوده نامناسب ({fibs['zone']}) برای {direction} قرار دارد")
-
-    # Check proximity to Fib retracement cluster (0.5 - 0.786)
-    cluster_min = min(fib_low, price * (1 - 0.015))
-    cluster_max = max(fib_high, price * (1 + 0.015))
-    near_fib = (fib_low * 0.985 <= price <= fib_high * 1.015)
-    if near_fib:
-        score += 7.0
-        rationale.append("قرارگیری در محدوده بازگشتی فیبوناچی (0.5 تا 0.786)")
-
-    # 3. Indicators Confluence: EMA20/50/200, RSI, MACD, ATR, Volume (max 35 pts)
-    ema_aligned = (
-        (snap["ema20"] > snap["ema50"] > snap["ema200"] and price > snap["ema20"])
-        if direction == "LONG"
-        else (snap["ema20"] < snap["ema50"] < snap["ema200"] and price < snap["ema20"])
+    ema_ok = (
+        ema20 > ema50 > ema200 and price > ema20
+        if bullish else ema20 < ema50 < ema200 and price < ema20
     )
-    if ema_aligned:
-        score += 12.0
-        rationale.append("هم‌راستایی کامل میانگین‌های متحرک EMA20 > EMA50 > EMA200" if direction == "LONG" else "هم‌راستایی نزولی EMA20 < EMA50 < EMA200")
+    if ema_ok:
+        score += 10
+        rationale.append("EMA20/50/200 alignment confirmed")
     else:
-        no_trade_reasons.append("هم‌راستایی کامل EMA20/EMA50/EMA200 برقرار نیست")
+        reasons.append("EMA alignment not confirmed")
 
-    rsi_ok = (45.0 <= snap["rsi"] <= 72.0) if direction == "LONG" else (28.0 <= snap["rsi"] <= 55.0)
+    rsi_ok = 45 <= rsi_value <= 70 if bullish else 30 <= rsi_value <= 55
     if rsi_ok:
-        score += 8.0
-        rationale.append(f"وضعیت RSI ({snap['rsi']:.1f}) در محدوده مومنتوم سالم")
+        score += 7
+        rationale.append(f"RSI momentum acceptable ({rsi_value:.1f})")
     else:
-        no_trade_reasons.append(f"RSI ({snap['rsi']:.1f}) خارج از بازه بهینه ورود است")
+        reasons.append(f"RSI outside preferred range ({rsi_value:.1f})")
 
-    macd_ok = (snap["macd"] > snap["macd_signal"] and snap["macd_hist"] >= snap["prev_macd_hist"]) if direction == "LONG" else (
-        snap["macd"] < snap["macd_signal"] and snap["macd_hist"] <= snap["prev_macd_hist"]
+    macd_ok = (
+        macd > macd_signal and macd_hist >= prev_hist
+        if bullish else macd < macd_signal and macd_hist <= prev_hist
     )
     if macd_ok:
-        score += 8.0
-        rationale.append("مومنتوم MACD و هیستوگرام هم‌جهت با سناریو")
+        score += 7
+        rationale.append("MACD momentum confirms direction")
     else:
-        no_trade_reasons.append("مومنتوم MACD هم‌جهت نیست")
+        reasons.append("MACD confirmation missing")
 
-    vol_ok = snap["vol_ratio"] >= 1.0
-    if vol_ok:
-        score += 7.0
-        rationale.append(f"حجم معاملات ({snap['vol_ratio']:.2f}x میانگین ۲۰ کندل) تاییدکننده است")
+    if vol_ratio >= 1.0:
+        score += 6
+        rationale.append(f"Volume {vol_ratio:.2f}x 20-candle average")
     else:
-        no_trade_reasons.append(f"حجم معاملات پایین‌تر از میانگین است ({snap['vol_ratio']:.2f}x)")
+        reasons.append(f"Volume below average ({vol_ratio:.2f}x)")
 
-    confluence_score = round(min(100.0, max(0.0, score)), 1)
+    entry_reference = (entry_low + entry_high) / 2.0
 
-    # Construct concrete entry zone, SL, TP1 (1.272), TP2 (1.618) and R:R
-    if direction == "LONG":
-        zone_candidates = [price * 0.997, fib_low, fib_high]
-        if matching_obs:
-            zone_candidates.extend([matching_obs[-1].low, matching_obs[-1].high])
-        entry_low = round(min(zone_candidates), 8)
-        entry_high = round(max(min(zone_candidates) * 1.003, min(price, max(zone_candidates))), 8)
-        if entry_high < entry_low:
-            entry_low, entry_high = entry_high, entry_low
-        entry_ref = round((entry_low + entry_high) / 2.0, 8)
-        sl_candidate = min(entry_low - 1.2 * atr_val, fibs["leg_low"] - 0.3 * atr_val)
-        stop_loss = round(max(sl_candidate, entry_ref * 0.85), 8)
-        risk_dist = max(entry_ref - stop_loss, entry_ref * 0.002)
-        target_1 = round(max(tp1_raw, entry_ref + config.min_rr_tp1 * risk_dist), 8)
-        target_2 = round(max(tp2_raw, target_1 + 0.8 * risk_dist, entry_ref + config.min_rr_tp2 * risk_dist), 8)
+    if bullish:
+        stop_loss = min(entry_low - .25 * atr_value, float(fibs["leg_low"]) - .2 * atr_value)
+        if stop_loss <= 0 or stop_loss >= entry_reference:
+            return _empty_setup(direction, config, ["Invalid LONG structural stop"], "NO_TRADE")
+        risk_distance = entry_reference - stop_loss
+        raw_targets = [float(fibs["bull_ext_1272"]), float(fibs["bull_ext_1618"])]
+        raw_targets += [s.price for s in smc["swings"] if s.kind == "HIGH" and s.price > entry_reference]
+        targets = sorted(set(t for t in raw_targets if _finite(t) and t > entry_reference))
     else:
-        zone_candidates = [price * 1.003, fib_low, fib_high]
-        if matching_obs:
-            zone_candidates.extend([matching_obs[-1].low, matching_obs[-1].high])
-        entry_low = round(min(zone_candidates), 8)
-        entry_high = round(max(zone_candidates), 8)
-        entry_ref = round((entry_low + entry_high) / 2.0, 8)
-        sl_candidate = max(entry_high + 1.2 * atr_val, fibs["leg_high"] + 0.3 * atr_val)
-        stop_loss = round(min(sl_candidate, entry_ref * 1.15), 8)
-        risk_dist = max(stop_loss - entry_ref, entry_ref * 0.002)
-        target_1 = round(min(tp1_raw, entry_ref - config.min_rr_tp1 * risk_dist), 8)
-        target_2 = round(min(tp2_raw, target_1 - 0.8 * risk_dist, entry_ref - config.min_rr_tp2 * risk_dist), 8)
+        stop_loss = max(entry_high + .25 * atr_value, float(fibs["leg_high"]) + .2 * atr_value)
+        if stop_loss <= entry_reference:
+            return _empty_setup(direction, config, ["Invalid SHORT structural stop"], "NO_TRADE")
+        risk_distance = stop_loss - entry_reference
+        raw_targets = [float(fibs["bear_ext_1272"]), float(fibs["bear_ext_1618"])]
+        raw_targets += [s.price for s in smc["swings"] if s.kind == "LOW" and 0 < s.price < entry_reference]
+        targets = sorted(set(t for t in raw_targets if _finite(t) and 0 < t < entry_reference), reverse=True)
 
-    rr_tp1 = round(abs(target_1 - entry_ref) / risk_dist, 2) if risk_dist > 0 else 0.0
-    rr_tp2 = round(abs(target_2 - entry_ref) / risk_dist, 2) if risk_dist > 0 else 0.0
-    pos_size_base = round(risk_usdt / risk_dist, 6) if risk_dist > 0 else None
+    if risk_distance <= 0:
+        return _empty_setup(direction, config, ["Invalid risk distance"], "NO_TRADE")
 
-    rr_ok = rr_tp1 >= config.min_rr_tp1 and rr_tp2 >= config.min_rr_tp2
-    if not rr_ok:
-        no_trade_reasons.append(f"نسبت ریسک به ریوارد (R:R TP1={rr_tp1}, TP2={rr_tp2}) کمتر از حداقل مجاز است")
+    min_tp1 = config.min_rr_tp1 * risk_distance
+    min_tp2 = config.min_rr_tp2 * risk_distance
+    if bullish:
+        targets = [t for t in targets if t - entry_reference >= min_tp1]
+    else:
+        targets = [t for t in targets if entry_reference - t >= min_tp1]
 
-    if confluence_score < config.min_confluence_score:
-        no_trade_reasons.append(f"امتیاز همگرایی ({confluence_score}) کمتر از حد آستانه ({config.min_confluence_score}) است")
+    if len(targets) < 2:
+        return _empty_setup(direction, config, reasons + ["Two valid structural targets are unavailable"], "NO_TRADE")
 
-    status = "SIGNAL" if (market_tradeable and rr_ok and confluence_score >= config.min_confluence_score and not no_trade_reasons) else "NO TRADE"
-    if status == "NO TRADE" and not no_trade_reasons:
-        no_trade_reasons.append("شرایط ترکیبی معامله به حد نصاب نرسیده است")
+    target_1, target_2 = targets[0], targets[1]
+    rr1 = abs(target_1 - entry_reference) / risk_distance
+    rr2 = abs(target_2 - entry_reference) / risk_distance
+    if rr1 < config.min_rr_tp1 or rr2 < config.min_rr_tp2:
+        reasons.append("Risk/reward below configured minimum")
 
-    if direction == "LONG":
-        activation_conds = [
-            f"ورود قیمت به محدوده [{entry_low}, {entry_high}] و بسته شدن کندل تایید صعودی در {exec_tf}",
-            "حفظ حمایت ساختاری و عدم شکست پرقدرت کف محدوده ورود",
+    # A setup must still be waiting for its entry retracement.
+    if bullish and price <= entry_high:
+        reasons.append("Price is already at or inside the LONG entry zone; wait for a fresh setup")
+    if not bullish and price >= entry_low:
+        reasons.append("Price is already at or inside the SHORT entry zone; wait for a fresh setup")
+
+    score = round(min(100.0, max(0.0, score)), 1)
+    if score < config.min_confluence_score:
+        reasons.append(f"Confluence {score} below threshold {config.min_confluence_score}")
+    if not market_tradeable:
+        reasons.extend(market_block_reasons)
+
+    reasons = list(dict.fromkeys(reasons))
+    status = "CONDITIONAL" if market_tradeable and not reasons else "NO_TRADE"
+
+    if bullish:
+        activation = [
+            f"Price retraces into [{entry_low:.8g}, {entry_high:.8g}]",
+            "A bullish 15m confirmation candle closes",
+            "Revalidate spread, funding and market data before considering entry",
         ]
-        invalidation_conds = [
-            f"بسته شدن کندل {exec_tf} زیر حد ضرر ({stop_loss}) یا شکست ساختار صعودی (CHoCH نزولی)",
-            "افزایش غیرعادی Spread یا Funding Rate شدید منفی/مثبت در لحظه ورود",
+        invalidation = [
+            f"Price reaches stop level {stop_loss:.8g} before entry",
+            "A bearish 15m CHoCH invalidates the setup",
         ]
     else:
-        activation_conds = [
-            f"ورود قیمت به محدوده [{entry_low}, {entry_high}] و بسته شدن کندل تایید نزولی در {exec_tf}",
-            "حفظ مقاومت ساختاری و عدم عبور پایدار بالای سقف محدوده ورود",
+        activation = [
+            f"Price retraces into [{entry_low:.8g}, {entry_high:.8g}]",
+            "A bearish 15m confirmation candle closes",
+            "Revalidate spread, funding and market data before considering entry",
         ]
-        invalidation_conds = [
-            f"بسته شدن کندل {exec_tf} بالای حد ضرر ({stop_loss}) یا شکست ساختار نزولی (CHoCH صعودی)",
-            "افزایش غیرعادی Spread یا Funding Rate شدید در لحظه ورود",
+        invalidation = [
+            f"Price reaches stop level {stop_loss:.8g} before entry",
+            "A bullish 15m CHoCH invalidates the setup",
         ]
 
+    risk_usdt = round(config.account_equity_usdt * config.risk_per_trade_pct / 100.0, 4)
     return DirectionSetup(
         direction=direction,
         status=status,
-        entry_low=entry_low,
-        entry_high=entry_high,
-        entry_reference=entry_ref,
-        stop_loss=stop_loss,
-        target_1=target_1,
-        target_2=target_2,
-        rr_tp1=rr_tp1,
-        rr_tp2=rr_tp2,
+        entry_low=round(entry_low, 10),
+        entry_high=round(entry_high, 10),
+        entry_reference=round(entry_reference, 10),
+        stop_loss=round(stop_loss, 10),
+        target_1=round(target_1, 10),
+        target_2=round(target_2, 10),
+        rr_tp1=round(rr1, 2),
+        rr_tp2=round(rr2, 2),
         suggested_risk_pct=config.risk_per_trade_pct,
         suggested_risk_usdt=risk_usdt,
-        suggested_position_size_base=pos_size_base,
-        confluence_score=confluence_score,
+        suggested_position_size_base=None,
+        confluence_score=score,
         rationale=rationale,
-        activation_conditions=activation_conds,
-        invalidation_conditions=invalidation_conds,
-        no_trade_reasons=no_trade_reasons if status == "NO TRADE" else [],
+        activation_conditions=activation,
+        invalidation_conditions=invalidation,
+        no_trade_reasons=reasons,
     )
 
 
@@ -469,107 +527,129 @@ def analyze_symbol(
     tf_bias: Dict[str, str] = {}
     tf_snapshots: Dict[str, dict] = {}
     tf_smc: Dict[str, dict] = {}
-    market_block_reasons: List[str] = []
-
-    data_valid = ctx is not None and ctx.is_real_perpetual and len(data_issues) == 0
-
-    for tf in config.timeframes:
-        c_list = tf_candles.get(tf, [])
-        if len(c_list) < config.min_candles_required:
-            tf_bias[tf] = "UNAVAILABLE"
-            continue
-        df = candles_to_df(c_list)
-        snap = compute_indicator_snapshot(c_list)
-        swings = detect_swings(df, left=3, right=3)
-        bias, events = detect_structure_bos_choch(df, swings)
-        sweeps = detect_liquidity_sweeps(df, swings)
-        obs, fvgs = detect_order_blocks_and_fvgs(df)
-        fibs = compute_premium_discount_and_fibs(df, swings)
-
-        tf_bias[tf] = bias
-        if snap is not None:
-            tf_snapshots[tf] = snap
-        tf_smc[tf] = {
-            "swings": swings,
-            "events": events,
-            "sweeps": sweeps,
-            "obs": obs,
-            "fvgs": fvgs,
-            "fibs": fibs,
-        }
-
-    if not tf_snapshots:
-        data_valid = False
-        market_block_reasons.append("داده کندل کافی برای تحلیل در تایم‌فریم‌ها موجود نیست")
-
-    funding_rate = ctx.funding_rate if ctx else None
-    spread_pct = ctx.spread_pct if ctx else None
+    market_reasons = list(data_issues or [])
+    required_tfs = ("15m", "1h", "4h")
 
     if ctx is None:
-        market_block_reasons.append("عدم دریافت اطلاعات قرارداد دائمی از صرافی")
+        market_reasons.append("Perpetual market context unavailable")
+    elif not getattr(ctx, "is_real_perpetual", False):
+        market_reasons.append("Instrument is not verified as a real perpetual contract")
     else:
-        if spread_pct is not None and spread_pct > config.max_spread_pct:
-            market_block_reasons.append(f"اسپرد سفارش‌نامه بالا ({spread_pct:.4f}% > {config.max_spread_pct}%) - بازار غیرقابل معامله")
-        if funding_rate is not None and abs(funding_rate) > config.max_abs_funding_rate:
-            market_block_reasons.append(f"نرخ فاندینگ افراطی ({funding_rate:.6f}) - ریسک لیکوییدیتی بالا")
-        if ctx.quote_volume_24h is not None and ctx.quote_volume_24h < config.min_24h_quote_volume_usdt:
-            market_block_reasons.append(f"حجم معاملات ۲۴ ساعته پایین ({ctx.quote_volume_24h:.0f} USDT)")
-        if not data_valid:
-            market_block_reasons.append("تشخیص داده ناقص یا عدم تایید کامل کندل‌ها")
+        spread = getattr(ctx, "spread_pct", None)
+        funding = getattr(ctx, "funding_rate", None)
+        quote_volume = getattr(ctx, "quote_volume_24h", None)
 
-    # MTF alignment summary
-    biases_set = {v for v in tf_bias.values() if v in ("BULLISH", "BEARISH")}
+        if spread is None or not _finite(spread):
+            market_reasons.append("Order-book spread unavailable")
+        elif float(spread) > config.max_spread_pct:
+            market_reasons.append(f"Spread too high: {float(spread):.5f}%")
+
+        if funding is not None and _finite(funding) and abs(float(funding)) > config.max_abs_funding_rate:
+            market_reasons.append(f"Funding rate extreme: {float(funding):.6f}")
+
+        if quote_volume is None or not _finite(quote_volume):
+            market_reasons.append("24h quote volume unavailable")
+        elif float(quote_volume) < config.min_24h_quote_volume_usdt:
+            market_reasons.append("24h quote volume below configured minimum")
+
+        # Reject stale context if timestamp fields are available.
+        now_ms = __import__("time").time_ns() // 1_000_000
+        price_ts = getattr(ctx, "price_fetched_at_ms", None) or getattr(ctx, "fetched_at_ms", None)
+        book_ts = getattr(ctx, "orderbook_fetched_at_ms", None)
+        if price_ts is None or now_ms - int(price_ts) > config.max_market_data_age_ms or now_ms < int(price_ts):
+            market_reasons.append("Market price data missing, stale or future-dated")
+        if book_ts is None or now_ms - int(book_ts) > config.max_orderbook_age_ms or now_ms < int(book_ts):
+            market_reasons.append("Order-book data missing, stale or future-dated")
+
+    for tf in required_tfs:
+        candles = tf_candles.get(tf, [])
+        minimum = max(int(config.min_candles_required), 220)
+        if len(candles) < minimum:
+            tf_bias[tf] = "UNAVAILABLE"
+            continue
+
+        try:
+            df = candles_to_df(candles)
+            if df is None or len(df) < 220:
+                tf_bias[tf] = "UNAVAILABLE"
+                continue
+
+            snapshot = compute_indicator_snapshot(df)
+            if snapshot is None:
+                tf_bias[tf] = "UNAVAILABLE"
+                continue
+
+            # Normalize aliases from the current indicators implementation.
+            if "atr14" not in snapshot and "atr" in snapshot:
+                snapshot["atr14"] = snapshot["atr"]
+            if "rsi14" not in snapshot and "rsi" in snapshot:
+                snapshot["rsi14"] = snapshot["rsi"]
+
+            swings = detect_swings(df)
+            bias, events = detect_structure_bos_choch(df, swings)
+            sweeps = detect_liquidity_sweeps(df, swings)
+            atr_value = _snapshot_value(snapshot, "atr14", "atr", default=None)
+            obs, fvgs = detect_order_blocks_and_fvgs(df, atr_value)
+
+            fibs = compute_premium_discount_and_fibs(df, swings)
+
+            tf_bias[tf] = bias
+            tf_snapshots[tf] = snapshot
+            tf_smc[tf] = {
+                "swings": swings,
+                "events": events,
+                "sweeps": sweeps,
+                "obs": obs,
+                "fvgs": fvgs,
+                "fibs": fibs,
+            }
+        except (KeyError, TypeError, ValueError, IndexError, ArithmeticError) as exc:
+            tf_bias[tf] = "UNAVAILABLE"
+            market_reasons.append(f"{tf} analysis failed: {type(exc).__name__}")
+
+    missing = [tf for tf in required_tfs if tf not in tf_snapshots]
+    if missing:
+        market_reasons.append("Insufficient valid candle/indicator data: " + ", ".join(missing))
+
+    if ctx is None or missing:
+        market_tradeable = False
+    else:
+        market_tradeable = len(market_reasons) == 0
+
     if tf_bias.get("4h") == "BULLISH" and tf_bias.get("1h") == "BULLISH":
         mtf_alignment = "ALIGNED_BULLISH"
     elif tf_bias.get("4h") == "BEARISH" and tf_bias.get("1h") == "BEARISH":
         mtf_alignment = "ALIGNED_BEARISH"
-    elif not biases_set:
+    elif not any(v in ("BULLISH", "BEARISH") for v in tf_bias.values()):
         mtf_alignment = "UNAVAILABLE"
     else:
         mtf_alignment = "MIXED"
 
-    market_tradeable = data_valid and len(market_block_reasons) == 0
-
     long_setup = _evaluate_direction(
-        direction="LONG",
-        ctx=ctx if ctx else MarketDerivativeContext(
-            symbol=symbol, exchange_source="none", mark_price=0.0, index_price=None,
-            funding_rate=None, best_bid=None, best_ask=None, spread_pct=None,
-            quote_volume_24h=None, fetched_at_ms=0, is_real_perpetual=False
-        ),
-        tf_snapshots=tf_snapshots,
-        tf_smc=tf_smc,
-        mtf_bias=tf_bias,
-        market_tradeable=market_tradeable,
-        market_block_reasons=market_block_reasons,
-        config=config,
+        "LONG", ctx, tf_snapshots, tf_smc, tf_bias,
+        market_tradeable, market_reasons, config
+    )
+    short_setup = _evaluate_direction(
+        "SHORT", ctx, tf_snapshots, tf_smc, tf_bias,
+        market_tradeable, market_reasons, config
     )
 
-    short_setup = _evaluate_direction(
-        direction="SHORT",
-        ctx=ctx if ctx else MarketDerivativeContext(
-            symbol=symbol, exchange_source="none", mark_price=0.0, index_price=None,
-            funding_rate=None, best_bid=None, best_ask=None, spread_pct=None,
-            quote_volume_24h=None, fetched_at_ms=0, is_real_perpetual=False
-        ),
-        tf_snapshots=tf_snapshots,
-        tf_smc=tf_smc,
-        mtf_bias=tf_bias,
-        market_tradeable=market_tradeable,
-        market_block_reasons=market_block_reasons,
-        config=config,
-    )
+    data_sufficient = ctx is not None and not missing
+    data_valid = data_sufficient and not (data_issues or [])
+    analysis_status = "AVAILABLE" if data_sufficient else "INSUFFICIENT_DATA"
 
     return CoinScanResult(
         symbol=symbol,
-        exchange_source=ctx.exchange_source if ctx else "none",
+        exchange_source=ctx.exchange_source if ctx is not None else "none",
         market_tradeable=market_tradeable,
         data_valid=data_valid,
         timeframe_bias=tf_bias,
         mtf_alignment=mtf_alignment,
-        funding_rate=funding_rate,
-        spread_pct=spread_pct,
+        funding_rate=getattr(ctx, "funding_rate", None) if ctx is not None else None,
+        spread_pct=getattr(ctx, "spread_pct", None) if ctx is not None else None,
         long_setup=long_setup,
         short_setup=short_setup,
-        data_issues=data_issues,
+        data_issues=list(data_issues or []),
+        data_sufficient=data_sufficient,
+        analysis_status=analysis_status,
     )
