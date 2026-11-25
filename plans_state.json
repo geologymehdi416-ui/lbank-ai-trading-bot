@@ -1,5 +1,245 @@
 {
-  "generated_at": "2026-11-25T08:54:41.148609+00:00",
-  "source": "LBank Futures snapshots",
-  "plans": []
+  "generated_at": "2026-11-25T09:00:31.309985+00:00",
+  "plans": [
+    {
+      "symbol": "BTCUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 58571.0,
+        "entry_reference": 58571.0,
+        "stop_loss": 59631.5,
+        "take_profit_1": 56980.25,
+        "take_profit_2": 56450.0,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "ETHUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 1631.41,
+        "entry_reference": 1631.41,
+        "stop_loss": 1669.8,
+        "take_profit_1": 1573.8250000000003,
+        "take_profit_2": 1554.6300000000003,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "SOLUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 67.64,
+        "entry_reference": 67.64,
+        "stop_loss": 69.38,
+        "take_profit_1": 65.03,
+        "take_profit_2": 64.16000000000001,
+        "rr_tp1": 1.500000000000004,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "XRPUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 0.9085000000000001,
+        "entry_reference": 0.9085000000000001,
+        "stop_loss": 0.9234,
+        "take_profit_1": 0.8861500000000002,
+        "take_profit_2": 0.8787000000000003,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "BNBUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 537.45,
+        "entry_reference": 537.45,
+        "stop_loss": 546.15,
+        "take_profit_1": 524.4000000000001,
+        "take_profit_2": 520.0500000000002,
+        "rr_tp1": 1.5000000000000064,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "AVAXUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 6.418,
+        "entry_reference": 6.418,
+        "stop_loss": 6.588,
+        "take_profit_1": 6.163,
+        "take_profit_2": 6.078,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "LINKUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 8.655,
+        "entry_reference": 8.655,
+        "stop_loss": 8.859,
+        "take_profit_1": 8.348999999999998,
+        "take_profit_2": 8.246999999999998,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "LTCUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 39.89,
+        "entry_reference": 39.89,
+        "stop_loss": 40.69,
+        "take_profit_1": 38.690000000000005,
+        "take_profit_2": 38.290000000000006,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 58.089,
+        "entry_reference": 58.089,
+        "stop_loss": 60.884,
+        "take_profit_1": 53.896499999999996,
+        "take_profit_2": 52.498999999999995,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "AAVEUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 91.83,
+        "entry_reference": 91.83,
+        "stop_loss": 93.88,
+        "take_profit_1": 88.755,
+        "take_profit_2": 87.73,
+        "rr_tp1": 1.5000000000000036,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "UNIUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 4.5120000000000005,
+        "entry_reference": 4.5120000000000005,
+        "stop_loss": 4.654,
+        "take_profit_1": 4.299000000000001,
+        "take_profit_2": 4.2280000000000015,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "NEARUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 2.79,
+        "entry_reference": 2.79,
+        "stop_loss": 2.888,
+        "take_profit_1": 2.6430000000000002,
+        "take_profit_2": 2.5940000000000003,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "ONDOUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 0.2687,
+        "entry_reference": 0.2687,
+        "stop_loss": 0.2768,
+        "take_profit_1": 0.25655,
+        "take_profit_2": 0.2525,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "PYTHUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 70,
+      "plan": {
+        "entry_trigger": 0.047470000000000005,
+        "entry_reference": 0.047470000000000005,
+        "stop_loss": 0.049260000000000005,
+        "take_profit_1": 0.044785000000000005,
+        "take_profit_2": 0.043890000000000005,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    },
+    {
+      "symbol": "JUPUSDT",
+      "status": "B_CONDITIONAL",
+      "side": "SHORT",
+      "score": 100,
+      "plan": {
+        "entry_trigger": 0.2149,
+        "entry_reference": 0.2149,
+        "stop_loss": 0.22640000000000002,
+        "take_profit_1": 0.19765,
+        "take_profit_2": 0.1919,
+        "rr_tp1": 1.5,
+        "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
+        "level_type": "lbank_24h_market_range_not_candle_structure"
+      }
+    }
+  ]
 }
