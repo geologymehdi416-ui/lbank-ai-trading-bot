@@ -1,500 +1,361 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""LBank Futures snapshot-only scanner. No candles, no orders, no other exchanges."""
-import csv, json, math, os, re
-from collections import defaultdict, Counter
-from datetime import datetime, timezone
+"""
+LBank USDT-M Futures SMC/Liquidity/Fibonacci scanner.
+Consumes ONLY verified LBank Futures OHLCV candles from data/candles.jsonl.
+No Spot fallback, no synthetic candles, no order placement.
 
-D = "data"
+Accepted JSONL candle schema (one candle per line):
+{
+  "source":"lbank_futures_contract_api",
+  "symbol":"BTCUSDT",
+  "timeframe":"15m",
+  "timestamp":"2026-11-25T09:15:00Z",  # candle OPEN time
+  "open":59000, "high":59200, "low":58800, "close":59100, "volume":123.4,
+  "closed":true
+}
+The collector must only write closed, genuine Futures candles. The scanner rejects
+unknown sources, malformed candles, duplicates, stale series and incomplete history.
+"""
+import csv, json, math, os
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
 WATCHLIST = [x.strip().upper() for x in os.getenv(
     "LBANK_WATCHLIST",
     "BTC,ETH,SOL,XRP,BNB,DOGE,ADA,AVAX,LINK,LTC,HYPE,SUI,AAVE,UNI,NEAR,ICP,RENDER,ONDO,PYTH,JUP"
 ).split(",") if x.strip()][:20]
 QUOTE = os.getenv("LBANK_QUOTE_CURRENCY", "USDT").upper()
-MAX_SNAPSHOT_AGE = float(os.getenv("MAX_SNAPSHOT_AGE_MIN", "15"))
-MAX_BOOK_AGE = float(os.getenv("MAX_BOOK_AGE_MIN", "15"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
-MIN_DEPTH = float(os.getenv("MIN_DEPTH_QUOTE", "1000"))
-MIN_SCORE = int(os.getenv("MIN_SCORE_B", "60"))
+CANDLE_FILE = Path(os.getenv("LBANK_CANDLE_FILE", "data/candles.jsonl"))
+CONTRACT_FILE = Path("data/contracts.json")
+OUT = Path("report.txt")
+MIN_CANDLES = {"15m": 120, "1h": 100, "4h": 80}
+TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400}
+MAX_STALE_MIN = float(os.getenv("MAX_CANDLE_STALE_MIN", "35"))
+RISK_REWARD_MIN = float(os.getenv("MIN_RR", "1.8"))
+RISK_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.5"))
 
-def now():
-    return datetime.now(timezone.utc)
-
-def dt(v):
+def num(x):
     try:
-        x = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
-        return x.replace(tzinfo=timezone.utc) if x.tzinfo is None else x.astimezone(timezone.utc)
+        v=float(x)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+def parse_dt(x):
+    try:
+        d=datetime.fromisoformat(str(x).replace("Z","+00:00"))
+        return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
     except Exception:
         return None
 
-def n(v):
-    try:
-        x = float(v)
-        return x if math.isfinite(x) else None
-    except Exception:
-        return None
-
-def norm(v):
-    return re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
-
-def base(row):
-    b = str(row.get("baseCurrency") or "").upper().strip()
-    if b:
-        return b
-    s, q = norm(row.get("symbol")), norm(QUOTE)
-    return s[:-len(q)] if q and s.endswith(q) else s
-
-def read_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f: return json.load(f)
-    except Exception:
-        return default
+def fmt(x, digits=8):
+    if x is None: return "دریافت نشده"
+    if isinstance(x, float): return f"{x:.{digits}f}".rstrip("0").rstrip(".")
+    return str(x)
 
 def read_jsonl(path):
-    out = []
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    x = json.loads(line)
-                    if isinstance(x, dict): out.append(x)
-                except Exception: pass
-    except Exception: pass
-    return out
+    rows=[]
+    if not path.exists(): return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            x=json.loads(line)
+            if isinstance(x,dict): rows.append(x)
+        except Exception: pass
+    return rows
 
-def latest(rows):
-    out = {}
-    for x in rows:
-        s, t = norm(x.get("symbol")), dt(x.get("timestamp"))
-        if s and t and (s not in out or t > dt(out[s].get("timestamp"))):
-            out[s] = x
-    return out
+def norm_symbol(s):
+    return "".join(c for c in str(s or "").upper() if c.isalnum())
 
-def age(x, t):
-    z = dt(x.get("timestamp")) if x else None
-    return (t-z).total_seconds()/60 if z else None
+def load_candles():
+    grouped=defaultdict(dict)
+    rejected=defaultdict(int)
+    for r in read_jsonl(CANDLE_FILE):
+        sym=norm_symbol(r.get("symbol"))
+        tf=str(r.get("timeframe") or r.get("interval") or "")
+        src=str(r.get("source") or "").lower()
+        ts=parse_dt(r.get("timestamp") or r.get("openTime"))
+        vals=[num(r.get(k)) for k in ("open","high","low","close","volume")]
+        if not sym or tf not in TF_SECONDS or src not in {
+            "lbank_futures_contract_api","lbank_futures_trade_stream","lbank_futures_verified"
+        } or ts is None or any(v is None for v in vals):
+            rejected["invalid_or_unverified"]+=1; continue
+        o,h,l,c,v=vals
+        if min(o,h,l,c)<=0 or v<0 or h<max(o,c,l) or l>min(o,c,h):
+            rejected["invalid_ohlcv"]+=1; continue
+        if r.get("closed") is not True:
+            rejected["not_closed"]+=1; continue
+        key=int(ts.timestamp())
+        grouped[(sym,tf)][key]={"timestamp":ts,"open":o,"high":h,"low":l,"close":c,"volume":v}
+    result={}
+    for key, items in grouped.items():
+        arr=[items[k] for k in sorted(items)]
+        # Deduplicate by open timestamp and reject non-contiguous gaps from indicator windows.
+        result[key]=arr
+    return result,dict(rejected)
 
-def tick_round(v, tick):
-    return round(v/tick)*tick if tick and tick > 0 else v
+def ema(values, period):
+    if len(values)<period: return None
+    alpha=2/(period+1)
+    v=sum(values[:period])/period
+    for x in values[period:]: v=alpha*x+(1-alpha)*v
+    return v
 
-def analyze(symbol, asset, snap, book, contract, t):
-    reasons = []
-    if not snap:
-        return {"symbol": symbol, "base_asset": asset, "status": "INSUFFICIENT_DATA",
-                "side": None, "score": 0, "price": None,
-                "analysis": {"reasons": ["برای این نماد snapshot قیمت دریافت نشده"], "conditional_plan": {}}}
-    px = n(snap.get("lastPrice"))
-    sa, ba = age(snap, t), age(book, t)
-    if px is None or px <= 0 or sa is None or sa < -1 or sa > MAX_SNAPSHOT_AGE:
-        reasons.append("snapshot قیمت نامعتبر یا قدیمی است")
-    if not book or ba is None or ba < -1 or ba > MAX_BOOK_AGE:
-        reasons.append("دفتر سفارش موجود نیست یا قدیمی است")
+def rsi(values, period=14):
+    if len(values)<=period: return None
+    gains=[]; losses=[]
+    for a,b in zip(values[-period-1:-1],values[-period:]):
+        d=b-a; gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains)/period; al=sum(losses)/period
+    if al==0: return 100.0
+    return 100-100/(1+ag/al)
 
-    bid, ask = n((book or {}).get("bestBid")), n((book or {}).get("bestAsk"))
-    spread = n((book or {}).get("spreadPct"))
-    bd = n((book or {}).get("bidDepthQuote")) or 0
-    ad = n((book or {}).get("askDepthQuote")) or 0
-    depth = bd + ad
-    valid_book = bool(bid and ask and bid > 0 and ask > bid and spread is not None)
-    imb = (bd-ad)/depth if depth > 0 else None
-    if not valid_book:
-        reasons.append("ساختار Bid/Ask یا spread دفتر سفارش نامعتبر است")
+def macd(values):
+    if len(values)<35: return None,None,None
+    # Build EMA series for stable MACD and signal values.
+    def series(period):
+        alpha=2/(period+1); out=[None]*(period-1)
+        v=sum(values[:period])/period; out.append(v)
+        for x in values[period:]:
+            v=alpha*x+(1-alpha)*v; out.append(v)
+        return out
+    a,b=series(12),series(26)
+    line=[x-y for x,y in zip(a,b) if x is not None and y is not None]
+    sig=ema(line,9)
+    return line[-1],sig,(line[-1]-sig if sig is not None else None)
 
-    hi, lo = n(snap.get("highPrice24h")), n(snap.get("lowPrice24h"))
-    range_ok = bool(hi and lo and hi > lo > 0)
-    if not range_ok:
-        reasons.append("High/Low معتبر ۲۴ساعته در snapshot موجود نیست")
+def atr(candles, period=14):
+    if len(candles)<period+1: return None
+    trs=[]
+    for p,c in zip(candles[-period-1:-1],candles[-period:]):
+        trs.append(max(c["high"]-c["low"],abs(c["high"]-p["close"]),abs(c["low"]-p["close"])))
+    return sum(trs)/len(trs)
 
-    r24 = None
-    op = n(snap.get("openPrice24h"))
-    if px and op and op > 0: r24 = (px/op-1)*100
+def pivots(candles, left=3, right=3):
+    highs=[]; lows=[]
+    for i in range(left,len(candles)-right):
+        c=candles[i]
+        if c["high"]>=max(x["high"] for x in candles[i-left:i+right+1]):
+            highs.append((i,c["high"]))
+        if c["low"]<=min(x["low"] for x in candles[i-left:i+right+1]):
+            lows.append((i,c["low"]))
+    return highs,lows
 
-    candidates = []
-    for side in ("LONG", "SHORT"):
-        sign = 1 if side == "LONG" else -1
-        score, parts = 0, {}
-        def award(k, ok, pts):
-            nonlocal score
-            parts[k] = {"passed": bool(ok), "points": pts if ok else 0}
-            if ok: score += pts
+def structure(candles):
+    hs,ls=pivots(candles)
+    if len(hs)<2 or len(ls)<2: return {"trend":"نامشخص","bos":"نامشخص","swing_highs":hs,"swing_lows":ls}
+    hh=hs[-1][1]>hs[-2][1]; hl=ls[-1][1]>ls[-2][1]
+    lh=hs[-1][1]<hs[-2][1]; ll=ls[-1][1]<ls[-2][1]
+    trend="صعودی" if hh and hl else "نزولی" if lh and ll else "رنج/ترکیبی"
+    last=candles[-1]["close"]
+    bos="شکست صعودی" if last>hs[-1][1] else "شکست نزولی" if last<ls[-1][1] else "بدون شکست تأییدشده"
+    prev_trend="صعودی" if hs[-2][1]>hs[-3][1] and ls[-2][1]>ls[-3][1] else "نزولی" if hs[-2][1]<hs[-3][1] and ls[-2][1]<ls[-3][1] else "رنج/ترکیبی"
+    choch=("تغییر شخصیت صعودی" if prev_trend=="نزولی" and last>hs[-1][1] else
+           "تغییر شخصیت نزولی" if prev_trend=="صعودی" and last<ls[-1][1] else "تغییر شخصیت تأییدنشده")
+    return {"trend":trend,"bos":bos,"choch":choch,"swing_highs":hs,"swing_lows":ls}
 
-        mid = (hi+lo)/2 if range_ok else None
-        award("24h_momentum", r24 is not None and sign*r24 > 0, 25)
-        award("24h_range_position", range_ok and px is not None and
-              ((side == "LONG" and px >= mid) or (side == "SHORT" and px <= mid)), 20)
-        award("orderbook_imbalance", imb is not None and sign*imb >= 0.08, 30)
-        award("spread", valid_book and spread <= MAX_SPREAD, 15)
-        award("depth", depth >= MIN_DEPTH, 10)
+def liquidity_sweep(candles):
+    hs,ls=pivots(candles)
+    if len(hs)<1 or len(ls)<1: return None
+    last=candles[-1]; prev=candles[-2]
+    sh=hs[-1][1]; sl=ls[-1][1]
+    # Sweep requires wick through a confirmed swing and close back inside.
+    if last["high"]>sh and last["close"]<sh and last["close"]<last["open"]:
+        return {"side":"SHORT","level":sh,"kind":"جمع‌آوری نقدینگی بالای سقف و بازگشت زیر آن"}
+    if last["low"]<sl and last["close"]>sl and last["close"]>last["open"]:
+        return {"side":"LONG","level":sl,"kind":"جمع‌آوری نقدینگی زیر کف و بازگشت بالای آن"}
+    # Last closed candle only; no retrospective signal.
+    return None
 
-        entry = sl = tp1 = tp2 = trigger = rr = None
-        if range_ok and px:
-            tk = n(contract.get("priceTick"))
-            if side == "LONG" and px < hi and px < mid:
-                trigger, sl = tick_round(hi*1.001, tk), tick_round(mid, tk)
-                entry = trigger
-                risk = entry-sl
-                if risk > 0: tp1, tp2 = entry+1.5*risk, entry+2*risk
-            elif side == "SHORT" and px > lo and px > mid:
-                trigger, sl = tick_round(lo*0.999, tk), tick_round(mid, tk)
-                entry = trigger
-                risk = sl-entry
-                if risk > 0: tp1, tp2 = entry-1.5*risk, entry-2*risk
-            if entry is not None and tp1 is not None:
-                rr = abs(tp1-entry)/abs(entry-sl)
-            else:
-                entry = sl = tp1 = tp2 = trigger = None
+def latest_fvg(c):
+    found=[]
+    for i in range(max(2,len(c)-40),len(c)):
+        a,b=c[i-2],c[i]
+        if b["low"]>a["high"]:
+            found.append({"side":"LONG","low":a["high"],"high":b["low"],"index":i})
+        if b["high"]<a["low"]:
+            found.append({"side":"SHORT","low":b["high"],"high":a["low"],"index":i})
+    return found[-1] if found else None
 
-        hard_ok = (not reasons and valid_book and spread <= MAX_SPREAD and depth >= MIN_DEPTH
-                   and entry is not None and rr is not None and rr >= 1.5)
-        if reasons:
-            status, why = "INSUFFICIENT_DATA", list(dict.fromkeys(reasons))
-        elif not valid_book or spread > MAX_SPREAD or depth < MIN_DEPTH:
-            status, why = "C_NO_TRADE", []
-            if not valid_book: why.append("دفتر سفارش نامعتبر")
-            if spread > MAX_SPREAD: why.append("اسپرد بیش از حد مجاز")
-            if depth < MIN_DEPTH: why.append("عمق دفتر سفارش کمتر از حداقل است")
-        elif not hard_ok:
-            status, why = "C_NO_TRADE", ["سطح شکست معتبر یا نسبت ریسک به بازده مناسب وجود ندارد"]
-        elif score < MIN_SCORE:
-            status, why = "C_NO_TRADE", [f"امتیاز {score} کمتر از آستانه {MIN_SCORE} است"]
-        else:
-            status, why = "B_CONDITIONAL", []
+def fib_levels(c, side):
+    hs,ls=pivots(c)
+    if not hs or not ls: return None
+    hi=hs[-1][1]; lo=ls[-1][1]
+    if hi<=lo: return None
+    span=hi-lo
+    if side=="LONG":
+        return {k:hi-span*k for k in (0.5,0.618,0.705,0.786)}
+    return {k:lo+span*k for k in (0.5,0.618,0.705,0.786)}
 
-        candidates.append({
-            "side": side, "score": score, "status": status, "components": parts,
-            "sampled_returns_pct": {"24h_from_open": r24},
-            "conditional_plan": {
-                "entry": entry, "entry_trigger": trigger, "stop_loss": sl,
-                "take_profit_1": tp1, "take_profit_2": tp2, "rr_tp1": rr,
-                "activation": "ورود فقط بعد از عبور قیمت از Entry Trigger و تثبیت؛ قبل از آن ورود ممنوع",
-                "trigger_rule": "فقط پس از شکست و تثبیت بیرون سقف/کف ۲۴ساعته؛ سطح از market snapshot است نه کندل",
-                "level_type": "lbank_24h_market_range_not_candle_structure"
-            },
-            "reasons": why
-        })
+def indicators(c):
+    closes=[x["close"] for x in c]; vols=[x["volume"] for x in c]
+    m,s,h=macd(closes)
+    vmean=sum(vols[-20:])/20 if len(vols)>=20 else None
+    return {"ema20":ema(closes,20),"ema50":ema(closes,50),"ema200":ema(closes,200),
+            "rsi14":rsi(closes),"macd":m,"macd_signal":s,"macd_hist":h,
+            "volume_ratio":(vols[-1]/vmean if vmean and vmean>0 else None),"atr14":atr(c)}
 
-    # Directional market bias from live LBank Futures snapshots and order book.
-    # This is a market-context signal, not a candle-based technical signal.
-    range_pos = ((px - lo) / (hi - lo)) if (px is not None and range_ok) else None
-    funding = n(snap.get("prePositionFeeRate"))
-    bias_score = 0
-    bias_factors = {}
+def equal_liquidity(c, tolerance=0.0015):
+    hs,ls=pivots(c)
+    eqh= eql=None
+    if len(hs)>=2:
+        a,b=hs[-2][1],hs[-1][1]
+        if abs(a-b)/max(a,b)<=tolerance: eqh=(a+b)/2
+    if len(ls)>=2:
+        a,b=ls[-2][1],ls[-1][1]
+        if abs(a-b)/max(a,b)<=tolerance: eql=(a+b)/2
+    return {"equal_highs_liquidity":eqh,"equal_lows_liquidity":eql}
 
-    def bias_add(name, value, points):
-        nonlocal bias_score
-        bias_factors[name] = {"value": value, "points": points}
-        bias_score += points
+def order_block(c, side, lookback=30):
+    # Last opposite candle before a displacement candle that closes beyond a recent swing.
+    hs,ls=pivots(c)
+    if len(c)<10: return None
+    start=max(1,len(c)-lookback)
+    for i in range(len(c)-2,start-1,-1):
+        cur=c[i]
+        prior_high=max(x["high"] for x in c[max(0,i-5):i])
+        prior_low=min(x["low"] for x in c[max(0,i-5):i])
+        displacement=(cur["close"]>prior_high and cur["close"]>cur["open"]) if side=="LONG" else (cur["close"]<prior_low and cur["close"]<cur["open"])
+        if not displacement: continue
+        for j in range(i-1,max(start-1,i-6),-1):
+            x=c[j]
+            opposite=(x["close"]<x["open"]) if side=="LONG" else (x["close"]>x["open"])
+            if opposite:
+                return {"low":x["low"],"high":x["high"],"index":j}
+    return None
 
-    if r24 is not None and abs(r24) >= 0.15:
-        bias_add("24h_momentum_pct", r24, 30 if r24 > 0 else -30)
-    else:
-        bias_add("24h_momentum_pct", r24, 0)
+def analyze_tf(c):
+    st=structure(c); ind=indicators(c); sweep=liquidity_sweep(c); fvg=latest_fvg(c)
+    eq=equal_liquidity(c)
+    return {"structure":st,"indicators":ind,"sweep":sweep,"fvg":fvg,
+            "equal_liquidity":eq,"bullish_order_block":order_block(c,"LONG"),
+            "bearish_order_block":order_block(c,"SHORT")}
 
-    if range_pos is not None:
-        if range_pos >= 0.65:
-            bias_add("24h_range_position", round(range_pos, 4), 20)
-        elif range_pos <= 0.35:
-            bias_add("24h_range_position", round(range_pos, 4), -20)
-        else:
-            bias_add("24h_range_position", round(range_pos, 4), 0)
-    else:
-        bias_add("24h_range_position", None, 0)
+def make_plan(side,c,analysis,htf):
+    price=c[-1]["close"]; a=analysis["indicators"]; st=analysis["structure"]
+    fib=fib_levels(c,side); sweep=analysis["sweep"]; fvg=analysis["fvg"]
+    if not fib or not sweep or sweep["side"]!=side: return None
+    # Require higher-timeframe context to agree or at least not strongly oppose.
+    if side=="LONG" and htf["structure"]["trend"]=="نزولی": return None
+    if side=="SHORT" and htf["structure"]["trend"]=="صعودی": return None
+    # Require an actual 15m structure break in the trade direction.
+    if side=="LONG" and st["bos"]!="شکست صعودی": return None
+    if side=="SHORT" and st["bos"]!="شکست نزولی": return None
+    # Entry zone must be near 0.618-0.705 retracement, optionally overlapping FVG.
+    zlo,zhi=sorted((fib[0.618],fib[0.705]))
+    entry=(zlo+zhi)/2
+    if abs(price-entry)>max(a["atr14"]*1.5 if a["atr14"] else 0, price*0.012): return None
+    if fvg and fvg["side"]==side:
+        overlap=max(zlo,fvg["low"])<=min(zhi,fvg["high"])
+    else: overlap=False
+    # At least one momentum confirmation, not all indicators as hard veto.
+    r=a["rsi14"]; mh=a["macd_hist"]; vr=a["volume_ratio"]
+    momentum=(r is not None and ((side=="LONG" and 45<=r<=70) or (side=="SHORT" and 30<=r<=55)))
+    macd_ok=mh is not None and ((side=="LONG" and mh>0) or (side=="SHORT" and mh<0))
+    volume_ok=vr is not None and vr>=1.15
+    if not (momentum or macd_ok or volume_ok or overlap): return None
+    atrv=a["atr14"] or price*0.005
+    stop=min(sweep["level"],price-0.8*atrv) if side=="LONG" else max(sweep["level"],price+0.8*atrv)
+    risk=price-stop if side=="LONG" else stop-price
+    if risk<=0: return None
+    t1=price+1.8*risk if side=="LONG" else price-1.8*risk
+    t2=price+2.5*risk if side=="LONG" else price-2.5*risk
+    rr=abs(t1-price)/risk
+    if rr<RISK_REWARD_MIN: return None
+    return {"side":side,"entry_zone":[zlo,zhi],"entry_reference":entry,"stop_loss":stop,
+            "take_profit_1":t1,"take_profit_2":t2,"rr_tp1":rr,
+            "liquidity_sweep":sweep["kind"],"fib_618":fib[0.618],"fib_705":fib[0.705],
+            "fvg_overlap":overlap,"volume_confirmed":volume_ok,
+            "activation":"فقط پس از بازگشت به ناحیه ورود و تأیید کندل بسته‌شده؛ سفارش بازار بدون تأیید ممنوع"}
 
-    if imb is not None and abs(imb) >= 0.08:
-        bias_add("orderbook_imbalance", round(imb, 4), 25 if imb > 0 else -25)
-    else:
-        bias_add("orderbook_imbalance", imb, 0)
-
-    # Funding is a small contrarian context factor, never a standalone signal.
-    if funding is not None and abs(funding) >= 0.0001:
-        bias_add("funding_rate", funding, -5 if funding > 0 else 5)
-    else:
-        bias_add("funding_rate", funding, 0)
-
-    # A directional plan must never be produced from stale/invalid snapshot or book data.
-    liquid_ok = bool(not reasons and valid_book and spread is not None
-                     and spread <= MAX_SPREAD and depth >= MIN_DEPTH)
-    bias_add("liquidity_filter", liquid_ok, 10 if liquid_ok else 0)
-
-    bias_score = max(-100, min(100, bias_score))
-    bias = "LONG_BIAS" if bias_score >= 25 else ("SHORT_BIAS" if bias_score <= -25 else "NEUTRAL")
-    if any("snapshot قیمت نامعتبر یا قدیمی است" in r for r in reasons):
-        bias, bias_score = "INSUFFICIENT_DATA", 0
-
-    watch_plan = None
-    watch_status = "NO_TRADE"
-    if bias in ("LONG_BIAS", "SHORT_BIAS") and range_ok and px and liquid_ok:
-        tk = n(contract.get("priceTick"))
-        span = hi - lo
-        if bias == "LONG_BIAS":
-            e = tick_round(hi * 1.001, tk)
-            s = tick_round(hi - 0.25 * span, tk)
-            if px < e and px > s and e > s:
-                risk = e - s
-                watch_plan = {
-                    "entry": e, "stop_loss": s,
-                    "take_profit_1": tick_round(e + 1.5 * risk, tk),
-                    "take_profit_2": tick_round(e + 2.0 * risk, tk),
-                    "rr_tp1": 1.5, "rr_tp2": 2.0,
-                    "basis": "24h range breakout reference; not candle structure"
-                }
-                watch_status = "WATCH_LONG"
-            else:
-                watch_status = "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID"
-        else:
-            e = tick_round(lo * 0.999, tk)
-            s = tick_round(lo + 0.25 * span, tk)
-            if px > e and px < s and s > e:
-                risk = s - e
-                watch_plan = {
-                    "entry": e, "stop_loss": s,
-                    "take_profit_1": tick_round(e - 1.5 * risk, tk),
-                    "take_profit_2": tick_round(e - 2.0 * risk, tk),
-                    "rr_tp1": 1.5, "rr_tp2": 2.0,
-                    "basis": "24h range breakout reference; not candle structure"
-                }
-                watch_status = "WATCH_SHORT"
-            else:
-                watch_status = "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID"
-
-    best = max(candidates, key=lambda x: (x["status"] == "B_CONDITIONAL", x["score"]))
-    other = next(x for x in candidates if x["side"] != best["side"])
-    return {
-        "symbol": symbol, "base_asset": asset, "status": best["status"],
-        "side": best["side"], "score": best["score"], "price": px,
-        "snapshot_age_minutes": sa, "orderbook_age_minutes": ba,
-        "market_context": {"returns_pct": {"24h": r24},
-            "range_position_24h": range_pos, "funding_rate": funding,
-            "orderbook": {"best_bid": bid, "best_ask": ask, "spread_pct": spread,
-                "bid_depth_quote": bd, "ask_depth_quote": ad, "total_depth_quote": depth,
-                "depth_imbalance": imb}},
-        "directional_analysis": {
-            "bias": bias, "bias_score": bias_score, "factors": bias_factors,
-            "watch_status": watch_status, "conditional_plan": watch_plan,
-            "note": "Bias uses live 24h Futures snapshot, funding and order book only; no EMA/RSI/MACD or candle structure."
-        },
-        "analysis": best, "alternate_side": other, "updated_at": t.isoformat(),
-        "contract": {"priceTick": contract.get("priceTick"),
-            "volumeMultiple": contract.get("volumeMultiple")}
-    }
+def analyze_asset(asset, candles):
+    symbol=asset+QUOTE
+    data={tf:candles.get((norm_symbol(symbol),tf),[]) for tf in ("15m","1h","4h")}
+    issues=[]
+    for tf,arr in data.items():
+        if len(arr)<MIN_CANDLES[tf]: issues.append(f"تعداد کندل {tf} ناکافی است ({len(arr)}/{MIN_CANDLES[tf]})")
+        if arr:
+            age=(datetime.now(timezone.utc)-arr[-1]["timestamp"]).total_seconds()/60
+            if age>MAX_STALE_MIN: issues.append(f"کندل {tf} قدیمی است ({age:.1f} دقیقه)")
+            if len(arr)>2:
+                gaps=sum(1 for a,b in zip(arr[-100:-1],arr[-99:]) if (b["timestamp"]-a["timestamp"]).total_seconds()>TF_SECONDS[tf]*1.5)
+                if gaps: issues.append(f"در سری {tf} شکاف زمانی وجود دارد")
+    if issues:
+        return {"symbol":symbol,"status":"داده ناکافی","issues":issues}
+    a15=analyze_tf(data["15m"]); a1=analyze_tf(data["1h"]); a4=analyze_tf(data["4h"])
+    long=make_plan("LONG",data["15m"],a15,a4)
+    short=make_plan("SHORT",data["15m"],a15,a4)
+    if long and not short: status="سناریوی خرید مشروط"
+    elif short and not long: status="سناریوی فروش مشروط"
+    elif long and short: status="سیگنال متعارض؛ ورود نکن"
+    else: status="ورود نکن؛ شروط نقدینگی/ساختار/فیبو کامل نیست"
+    def tf_summary(x):
+        i=x["indicators"]
+        return {"روند":x["structure"]["trend"],"ساختار":x["structure"]["bos"],
+                "CHoCH":x["structure"].get("choch","نامشخص"),
+                "نقدینگی سقف/کف برابر":x["equal_liquidity"],
+                "Order Block صعودی":x["bullish_order_block"],
+                "Order Block نزولی":x["bearish_order_block"],
+                "EMA20":i["ema20"],"EMA50":i["ema50"],"EMA200":i["ema200"],
+                "RSI14":i["rsi14"],"MACD":i["macd"],"MACD_signal":i["macd_signal"],
+                "MACD_hist":i["macd_hist"],"نسبت حجم به میانگین":i["volume_ratio"],
+                "ATR14":i["atr14"],"شکار نقدینگی":x["sweep"],"آخرین FVG":x["fvg"]}
+    return {"symbol":symbol,"status":status,"price":data["15m"][-1]["close"],
+            "analysis":{"4h":tf_summary(a4),"1h":tf_summary(a1),"15m":tf_summary(a15)},
+            "long_plan":long,"short_plan":short}
 
 def main():
-    t = now()
-    prices, books = read_jsonl(f"{D}/prices.jsonl"), read_jsonl(f"{D}/orderbooks.jsonl")
-    cp = read_json(f"{D}/contracts.json", {})
-    contracts_raw = cp.get("contracts", []) if isinstance(cp, dict) else []
-    snaps, bookmap = latest(prices), latest(books)
-    contracts = {norm(c.get("symbol")): c for c in contracts_raw if isinstance(c, dict) and c.get("symbol")}
-    results, missing = [], []
-    for asset in WATCHLIST:
-        matches = [(s,c) for s,c in contracts.items()
-                   if base(c) == asset and str(c.get("clearCurrency") or QUOTE).upper() == QUOTE]
-        if not matches:
-            missing.append(asset)
-            results.append({"symbol": asset+QUOTE, "base_asset": asset, "status": "INSUFFICIENT_DATA",
-                "side": None, "score": 0, "price": None,
-                "analysis": {"reasons": ["قرارداد USDT این دارایی در فهرست قراردادهای دریافتی نیست"], "conditional_plan": {}}})
-            continue
-        for sym, c in matches:
-            snap = snaps.get(sym)
-            results.append(analyze(str((snap or {}).get("symbol") or c.get("symbol") or sym),
-                                   asset, snap, bookmap.get(sym), c, t))
-
-    b = [x for x in results if x["status"] == "B_CONDITIONAL"]
-    ins = [x for x in results if x["status"] == "INSUFFICIENT_DATA"]
-    rej = [x for x in results if x["status"] == "C_NO_TRADE"]
-    watch = [x for x in results
-             if x.get("directional_analysis", {}).get("conditional_plan")]
-    long_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "LONG_BIAS")
-    short_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "SHORT_BIAS")
-    neutral_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "NEUTRAL")
-
-    def fmt(v, digits=8):
-        if v is None:
-            return "دریافت نشده"
-        if isinstance(v, bool):
-            return "بله" if v else "خیر"
-        if isinstance(v, (int, float)):
-            return f"{v:.{digits}f}".rstrip("0").rstrip(".")
-        return str(v)
-
-    def bias_fa(value):
-        return {
-            "LONG_BIAS": "تمایل صعودی",
-            "SHORT_BIAS": "تمایل نزولی",
-            "NEUTRAL": "خنثی / بدون برتری مشخص",
-        }.get(value, "داده ناکافی")
-
-    def watch_fa(value):
-        return {
-            "WATCH_LONG": "سناریوی خرید مشروط",
-            "WATCH_SHORT": "سناریوی فروش مشروط",
-            "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID": "سطح ورود رد شده یا نامعتبر است",
-            "NO_TRADE": "فعلاً معامله نکن",
-        }.get(value, "فعلاً معامله نکن")
-
-    def explain_bias(x):
-        d = x.get("directional_analysis", {})
-        f = d.get("factors", {})
-        bits = []
-        mom = f.get("24h_momentum_pct", {}).get("value")
-        pos = f.get("24h_range_position", {}).get("value")
-        imb = f.get("orderbook_imbalance", {}).get("value")
-        if mom is not None:
-            bits.append(f"تغییر ۲۴ساعته {fmt(mom, 3)}٪")
-        if pos is not None:
-            bits.append(f"موقعیت در دامنه ۲۴ساعته {fmt(pos*100, 1)}٪")
-        if imb is not None:
-            bits.append(f"عدم‌تعادل دفتر سفارش {fmt(imb, 3)}")
-        if not bits:
-            return "داده کافی برای توضیح جهت بازار وجود ندارد."
-        return "؛ ".join(bits) + "."
-
-    report = [
-        "اسکنر هوشمند قراردادهای آتی LBank - فهرست ۲۰ دارایی",
-        f"زمان تولید گزارش: {t.isoformat()}",
-        "منبع داده: فقط API عمومی قراردادهای آتی LBank",
-        "",
-        f"تعداد دارایی‌های فهرست: {len(WATCHLIST)} ({'، '.join(WATCHLIST)})",
-        f"تعداد بازارهای بررسی‌شده: {len(results)}",
-        "سیگنال تکنیکال قطعی: ۰ (تا زمان دسترسی به کندل معتبر Futures غیرفعال)",
-        f"سناریوهای ورود مشروط قابل‌تحت‌نظر: {len(watch)}",
-        f"داده ناکافی یا قدیمی: {len(ins)}",
-        f"بازارهای بدون ستاپ معاملاتی: {len(rej)}",
-        "",
-        "خلاصه جهت بازار:",
-        f"تمایل صعودی: {long_bias} | تمایل نزولی: {short_bias} | خنثی: {neutral_bias}",
-        "",
-        "محدودیت تحلیل:",
-        "این نسخه از قیمت لحظه‌ای، تغییرات و دامنه ۲۴ساعته، Funding در صورت دریافت، و دفتر سفارش Futures استفاده می‌کند.",
-        "به علت نبود کندل تأییدشده Futures، EMA، RSI، MACD، حجم کندلی و ساختار بازار محاسبه نمی‌شوند.",
-        "امتیاز جهت بازار احتمال موفقیت معامله نیست و به‌تنهایی مجوز ورود محسوب نمی‌شود.",
-        "قیمت‌های ورود و حدضرر این نسخه سناریوهای شکست دامنه ۲۴ساعته‌اند، نه حمایت و مقاومت کندلی.",
-        "هیچ سفارش خودکاری ثبت نمی‌شود؛ اهرم و اندازه موقعیت باید جداگانه و با مدیریت ریسک تعیین شوند.",
-        "",
-        "سناریوهای ورود مشروط:"
-    ]
-
-    if not watch:
-        report.append("در حال حاضر هیچ سناریوی ورود مشروطی از فیلترها عبور نکرده است.")
-    for x in sorted(watch, key=lambda z: abs(z.get("directional_analysis", {}).get("bias_score", 0)), reverse=True):
-        d = x.get("directional_analysis", {})
-        p = d.get("conditional_plan") or {}
-        side = "خرید (LONG)" if d.get("bias") == "LONG_BIAS" else "فروش (SHORT)"
-        report += [
-            "",
-            f"{x['symbol']} | سناریوی {side}",
-            f"قیمت فعلی: {fmt(x.get('price'))}",
-            f"نقطه ورود مشروط: {fmt(p.get('entry'))}",
-            f"حد ضرر: {fmt(p.get('stop_loss'))}",
-            f"هدف اول: {fmt(p.get('take_profit_1'))}",
-            f"هدف دوم: {fmt(p.get('take_profit_2'))}",
-            f"نسبت سود به زیان تا هدف اول: {fmt(p.get('rr_tp1'), 2)}",
-            "شرط فعال‌سازی: قیمت باید از سطح ورود عبور کند و بیرون دامنه ۲۴ساعته تثبیت شود؛ صرف لمس قیمت کافی نیست.",
-            "ابطال سناریو: اگر پیش از فعال‌شدن ورود، قیمت به حد ضرر برسد یا داده‌ها کهنه شوند، سناریو باطل است.",
-            "تذکر: این سطوح از دامنه ۲۴ساعته استخراج شده‌اند و باید پیش از معامله با نمودار زنده بررسی شوند."
-        ]
-
-    report += [
-        "",
-        "تحلیل تک‌تک دارایی‌ها:"
-    ]
+    candles,rejected=load_candles()
+    contracts= json.loads(CONTRACT_FILE.read_text(encoding="utf-8")) if CONTRACT_FILE.exists() else {}
+    contract_map={norm_symbol(x.get("symbol")):x for x in contracts.get("contracts",[]) if isinstance(x,dict)}
+    results=[analyze_asset(a,candles) for a in WATCHLIST]
+    valid=sum(1 for x in results if x["status"] not in ("داده ناکافی",))
+    longs=sum(1 for x in results if x.get("long_plan"))
+    shorts=sum(1 for x in results if x.get("short_plan"))
+    lines=["اسکنر نقدینگی، اسمارت‌مانی و فیبوناچی — قراردادهای آتی LBank",
+           f"زمان گزارش: {datetime.now(timezone.utc).isoformat()}",
+           "منبع: فقط کندل‌های بسته‌شده و تأییدشده Futures؛ بدون Spot و بدون داده ساختگی",
+           f"دارایی‌ها: {len(WATCHLIST)} | دارای داده کافی: {valid} | داده ناکافی: {len(WATCHLIST)-valid}",
+           f"سناریوی خرید: {longs} | سناریوی فروش: {shorts}",
+           f"ردیف‌های کندل نامعتبر/تأییدنشده: {sum(rejected.values())}",
+           "روش: شکار نقدینگی ← تغییر ساختار ← FVG/Order Block و فیبوناچی ← تأیید اندیکاتورها",
+           "توجه: سیگنال‌ها مشروط‌اند؛ هیچ سفارشی ثبت نمی‌شود. ریسک پیشنهادی هر معامله حداکثر ۰٫۵٪ سرمایه.",
+           ""]
     for x in results:
-        d = x.get("directional_analysis", {})
-        mc = x.get("market_context", {})
-        ob = mc.get("orderbook", {})
-        p = d.get("conditional_plan") or {}
-        ret = mc.get("returns_pct", {}).get("24h")
-        pos = mc.get("range_position_24h")
-        hi = n((snaps.get(norm(x["symbol"])) or {}).get("highPrice24h"))
-        lo = n((snaps.get(norm(x["symbol"])) or {}).get("lowPrice24h"))
-        report += [
-            "",
-            f"━━ {x['symbol']} ━━",
-            f"جهت احتمالی: {bias_fa(d.get('bias'))}",
-            f"امتیاز جهت بازار: {fmt(d.get('bias_score', 0), 0)} (مقیاس ۱۰۰- تا ۱۰۰+؛ احتمال موفقیت نیست)",
-            f"وضعیت معامله: {watch_fa(d.get('watch_status'))}",
-            f"قیمت فعلی: {fmt(x.get('price'))}",
-            f"تغییر ۲۴ساعته: {fmt(ret, 3)}٪",
-            f"جایگاه قیمت در دامنه ۲۴ساعته: {fmt(pos*100 if pos is not None else None, 1)}٪",
-            f"بیشترین قیمت ۲۴ساعته: {fmt(hi)} | کمترین قیمت ۲۴ساعته: {fmt(lo)}",
-            f"نرخ Funding: {fmt(mc.get('funding_rate'), 8)}",
-            f"عدم‌تعادل دفتر سفارش: {fmt(ob.get('depth_imbalance'), 4)}",
-            f"فاصله خرید و فروش (Spread): {fmt(ob.get('spread_pct'), 5)}٪",
-            f"عمق کل دفتر سفارش: {fmt(ob.get('total_depth_quote'), 2)} تتر",
-            f"سن داده قیمت: {fmt(x.get('snapshot_age_minutes'), 1)} دقیقه | سن دفتر سفارش: {fmt(x.get('orderbook_age_minutes'), 1)} دقیقه",
-            f"دلیل جهت‌گیری: {explain_bias(x)}",
-        ]
-        if p:
-            report += [
-                f"ورود مشروط: {fmt(p.get('entry'))}",
-                f"حد ضرر: {fmt(p.get('stop_loss'))}",
-                f"هدف اول: {fmt(p.get('take_profit_1'))} | هدف دوم: {fmt(p.get('take_profit_2'))}",
-                "اقدام: فقط پس از شکست و تثبیت؛ در غیر این صورت ورود نکن."
-            ]
-        else:
-            why = x.get("analysis", {}).get("reasons", [])
-            if why:
-                report.append("علت عدم ارائه ورود: " + "؛ ".join(why))
-            elif d.get("watch_status") == "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID":
-                report.append("علت عدم ارائه ورود: قیمت در موقعیت مناسبی نسبت به ورود یا حد ضرر نیست؛ تعقیب قیمت ممنوع.")
-            else:
-                report.append("اقدام: ورود نکن؛ فعلاً ستاپ معتبر با قیمت ورود و حد ضرر قابل دفاع وجود ندارد.")
+        lines += ["",f"━━━━━━━━ {x['symbol']} ━━━━━━━━",f"وضعیت: {x['status']}"]
+        if x["status"]=="داده ناکافی":
+            lines += ["علت: "+"؛ ".join(x["issues"])]
+            continue
+        lines += [f"قیمت مرجع: {fmt(x['price'])}"]
+        for tf,label in (("4h","۴ ساعته"),("1h","۱ ساعته"),("15m","۱۵ دقیقه")):
+            z=x["analysis"][tf]
+            lines += [f"روند {label}: {z['روند']} | ساختار: {z['ساختار']}",
+                      f"EMA20/50/200: {fmt(z['EMA20'])} / {fmt(z['EMA50'])} / {fmt(z['EMA200'])}",
+                      f"RSI: {fmt(z['RSI14'],2)} | MACD: {fmt(z['MACD'],6)} | هیستوگرام: {fmt(z['MACD_hist'],6)}",
+                      f"نسبت حجم به میانگین ۲۰ کندل: {fmt(z['نسبت حجم به میانگین'],2)} | ATR: {fmt(z['ATR14'])}",
+                      f"شکار نقدینگی: {z['شکار نقدینگی']['kind'] if z['شکار نقدینگی'] else 'مشاهده نشد'}",
+                      f"FVG: {json.dumps(z['آخرین FVG'],ensure_ascii=False) if z['آخرین FVG'] else 'مشاهده نشد'}"]
+        for key,label in (("long_plan","سناریوی خرید"),("short_plan","سناریوی فروش")):
+            p=x.get(key)
+            if p:
+                lines += [f"{label}: فعال‌سازی مشروط",
+                          f"ناحیه ورود: {fmt(p['entry_zone'][0])} تا {fmt(p['entry_zone'][1])}",
+                          f"ورود مرجع: {fmt(p['entry_reference'])} | حد ضرر: {fmt(p['stop_loss'])}",
+                          f"هدف اول: {fmt(p['take_profit_1'])} | هدف دوم: {fmt(p['take_profit_2'])} | RR هدف اول: {fmt(p['rr_tp1'],2)}",
+                          f"دلیل: {p['liquidity_sweep']}؛ فیبوناچی ۰٫۶۱۸ تا ۰٫۷۰۵؛ هم‌پوشانی FVG: {'بله' if p['fvg_overlap'] else 'خیر'}",
+                          f"شرط فعال‌سازی: {p['activation']}"]
+        if not x.get("long_plan") and not x.get("short_plan"):
+            lines.append("نتیجه: ورود نکن؛ شکار نقدینگی و تغییر ساختار هم‌جهت با تایم‌فریم بالاتر تأیید نشده است.")
+    lines += ["","مدیریت ریسک: ریسک هر معامله حداکثر ۰٫۵٪ سرمایه؛ اهرم بالا استفاده نشود.",
+              "محدودیت: این موتور فقط زمانی تحلیل می‌دهد که data/candles.jsonl شامل کندل واقعی بسته‌شده Futures باشد."]
+    OUT.write_text("\n".join(lines)+"\n",encoding="utf-8")
+    payload={"generated_at":datetime.now(timezone.utc).isoformat(),"source":"verified LBank Futures OHLCV only",
+             "mode":"analysis_only_no_orders","summary":{"assets":len(results),"data_sufficient":valid,
+             "insufficient_data":len(WATCHLIST)-valid,"long_setups":longs,"short_setups":shorts},
+             "rejected_candles":rejected,"results":results}
+    Path("signals_futures_lbank.json").write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    print("\n".join(lines))
 
-    report += [
-        "",
-        "دارایی‌های دارای داده ناکافی:"
-    ]
-    for x in ins:
-        why = x.get("analysis", {}).get("reasons", [])
-        report.append(f"- {x['symbol']}: {'؛ '.join(why) if why else 'داده کافی نیست'}")
-    if not ins:
-        report.append("- هیچ‌کدام")
-
-    counts = Counter(r for x in rej for r in x.get("analysis", {}).get("reasons", []))
-    report += ["", "دلایل رد ستاپ‌ها:"]
-    report += [f"- {k}: {v} مورد" for k, v in counts.most_common(15)] or ["- موردی ثبت نشده"]
-
-    report += [
-        "",
-        "یادآوری مدیریت ریسک:",
-        "ریسک هر معامله را حداکثر ۰٫۵٪ تا ۱٪ سرمایه نگه دار؛ مجموع ریسک معاملات باز را محدود کن.",
-        "اهرم بالا می‌تواند باعث لیکویید شدن سریع شود. بدون تعیین اندازه موقعیت بر اساس فاصله حد ضرر وارد نشو."
-    ]
-
-    obj={"scanner":"LBank Futures Smart Scanner - 20 asset watchlist",
-         "generated_at":t.isoformat(),"source":"LBank Contract Futures public REST API",
-         "mode":"ANALYSIS_ONLY_NO_ORDERS","candles_available":False,
-         "confirmed_signals_enabled":False,"leverage_enabled":False,
-         "watchlist":WATCHLIST,"missing_watchlist_assets":missing,
-         "summary":{"markets_analyzed":len(results),"confirmed_technical_signals":0,
-             "conditional_watch_setups":len(watch),"insufficient_data":len(ins),"no_trade":len(rej),
-             "long_bias":long_bias,"short_bias":short_bias,"neutral_bias":neutral_bias},
-         "results":results,
-         "disclaimer":"تحلیل مشروط مبتنی بر داده Snapshot و دفتر سفارش Futures؛ نه تحلیل کندلی قطعی و نه توصیه تضمینی. هیچ سفارشی ثبت نمی‌شود."}
-    with open("signals_futures_lbank.json","w",encoding="utf-8") as f: json.dump(obj,f,ensure_ascii=False,indent=2)
-    with open("report.txt","w",encoding="utf-8") as f: f.write("\n".join(report)+"\n")
-    plans=[{"symbol":x["symbol"],
-            "bias":x.get("directional_analysis",{}).get("bias"),
-            "bias_score":x.get("directional_analysis",{}).get("bias_score"),
-            "plan":x.get("directional_analysis",{}).get("conditional_plan",{})}
-           for x in watch]
-    with open("plans_state.json","w",encoding="utf-8") as f: json.dump({"generated_at":t.isoformat(),"plans":plans},f,ensure_ascii=False,indent=2)
-    fields=["timestamp","symbol","status","side","score","price","entry","entry_trigger","stop_loss","take_profit_1","take_profit_2","rr_tp1","reason"]
-    exists=os.path.exists("signals_log.csv")
-    with open("signals_log.csv","a",newline="",encoding="utf-8") as f:
-        w=csv.DictWriter(f,fieldnames=fields)
-        if not exists: w.writeheader()
-        for x in results:
-            p=x.get("directional_analysis",{}).get("conditional_plan") or x.get("analysis",{}).get("conditional_plan",{})
-            w.writerow({"timestamp":t.isoformat(),"symbol":x["symbol"],"status":x["status"],
-                "side":x.get("directional_analysis",{}).get("bias") or x.get("side"),
-                "score":x.get("directional_analysis",{}).get("bias_score",x.get("score")),"price":x.get("price"),
-                "entry":p.get("entry"),"entry_trigger":p.get("entry_trigger"),"stop_loss":p.get("stop_loss"),
-                "take_profit_1":p.get("take_profit_1"),"take_profit_2":p.get("take_profit_2"),
-                "rr_tp1":p.get("rr_tp1"),"reason":" | ".join(x.get("analysis",{}).get("reasons",[]))})
-    print("خلاصه اسکن:", json.dumps(obj["summary"],ensure_ascii=False))
-    print("\n".join(report))
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
