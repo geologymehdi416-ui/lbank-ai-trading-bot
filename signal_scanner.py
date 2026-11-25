@@ -173,6 +173,86 @@ def analyze(symbol, asset, snap, book, contract, t):
             "reasons": why
         })
 
+    # Directional market bias from live LBank Futures snapshots and order book.
+    # This is a market-context signal, not a candle-based technical signal.
+    range_pos = ((px - lo) / (hi - lo)) if (px is not None and range_ok) else None
+    funding = n(snap.get("prePositionFeeRate"))
+    bias_score = 0
+    bias_factors = {}
+
+    def bias_add(name, value, points):
+        nonlocal bias_score
+        bias_factors[name] = {"value": value, "points": points}
+        bias_score += points
+
+    if r24 is not None and abs(r24) >= 0.15:
+        bias_add("24h_momentum_pct", r24, 30 if r24 > 0 else -30)
+    else:
+        bias_add("24h_momentum_pct", r24, 0)
+
+    if range_pos is not None:
+        if range_pos >= 0.65:
+            bias_add("24h_range_position", round(range_pos, 4), 20)
+        elif range_pos <= 0.35:
+            bias_add("24h_range_position", round(range_pos, 4), -20)
+        else:
+            bias_add("24h_range_position", round(range_pos, 4), 0)
+    else:
+        bias_add("24h_range_position", None, 0)
+
+    if imb is not None and abs(imb) >= 0.08:
+        bias_add("orderbook_imbalance", round(imb, 4), 25 if imb > 0 else -25)
+    else:
+        bias_add("orderbook_imbalance", imb, 0)
+
+    # Funding is a small contrarian context factor, never a standalone signal.
+    if funding is not None and abs(funding) >= 0.0001:
+        bias_add("funding_rate", funding, -5 if funding > 0 else 5)
+    else:
+        bias_add("funding_rate", funding, 0)
+
+    liquid_ok = bool(valid_book and spread is not None and spread <= MAX_SPREAD and depth >= MIN_DEPTH)
+    bias_add("liquidity_filter", liquid_ok, 10 if liquid_ok else 0)
+
+    bias_score = max(-100, min(100, bias_score))
+    bias = "LONG_BIAS" if bias_score >= 25 else ("SHORT_BIAS" if bias_score <= -25 else "NEUTRAL")
+
+    watch_plan = None
+    watch_status = "NO_TRADE"
+    if bias in ("LONG_BIAS", "SHORT_BIAS") and range_ok and px and liquid_ok:
+        tk = n(contract.get("priceTick"))
+        span = hi - lo
+        if bias == "LONG_BIAS":
+            e = tick_round(hi * 1.001, tk)
+            s = tick_round(hi - 0.25 * span, tk)
+            if px < e and e > s:
+                risk = e - s
+                watch_plan = {
+                    "entry": e, "stop_loss": s,
+                    "take_profit_1": tick_round(e + 1.5 * risk, tk),
+                    "take_profit_2": tick_round(e + 2.0 * risk, tk),
+                    "rr_tp1": 1.5, "rr_tp2": 2.0,
+                    "basis": "24h range breakout reference; not candle structure"
+                }
+                watch_status = "WATCH_LONG"
+            else:
+                watch_status = "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID"
+        else:
+            e = tick_round(lo * 0.999, tk)
+            s = tick_round(lo + 0.25 * span, tk)
+            if px > e and s > e:
+                risk = s - e
+                watch_plan = {
+                    "entry": e, "stop_loss": s,
+                    "take_profit_1": tick_round(e - 1.5 * risk, tk),
+                    "take_profit_2": tick_round(e - 2.0 * risk, tk),
+                    "rr_tp1": 1.5, "rr_tp2": 2.0,
+                    "basis": "24h range breakout reference; not candle structure"
+                }
+                watch_status = "WATCH_SHORT"
+            else:
+                watch_status = "BREAKOUT_ALREADY_TRIGGERED_OR_INVALID"
+
     best = max(candidates, key=lambda x: (x["status"] == "B_CONDITIONAL", x["score"]))
     other = next(x for x in candidates if x["side"] != best["side"])
     return {
@@ -180,9 +260,15 @@ def analyze(symbol, asset, snap, book, contract, t):
         "side": best["side"], "score": best["score"], "price": px,
         "snapshot_age_minutes": sa, "orderbook_age_minutes": ba,
         "market_context": {"returns_pct": {"24h": r24},
+            "range_position_24h": range_pos, "funding_rate": funding,
             "orderbook": {"best_bid": bid, "best_ask": ask, "spread_pct": spread,
                 "bid_depth_quote": bd, "ask_depth_quote": ad, "total_depth_quote": depth,
                 "depth_imbalance": imb}},
+        "directional_analysis": {
+            "bias": bias, "bias_score": bias_score, "factors": bias_factors,
+            "watch_status": watch_status, "conditional_plan": watch_plan,
+            "note": "Bias uses live 24h Futures snapshot, funding and order book only; no EMA/RSI/MACD or candle structure."
+        },
         "analysis": best, "alternate_side": other, "updated_at": t.isoformat(),
         "contract": {"priceTick": contract.get("priceTick"),
             "volumeMultiple": contract.get("volumeMultiple")}
@@ -248,6 +334,37 @@ def main():
         ]
     if not b:
         report.append("- No setup passed all current data and liquidity filters.")
+    # Always print a useful market read for every asset, even when no trade setup passes.
+    long_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "LONG_BIAS")
+    short_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "SHORT_BIAS")
+    neutral_bias = sum(1 for x in results if x.get("directional_analysis", {}).get("bias") == "NEUTRAL")
+    report += [
+        "", "MARKET ANALYSIS - ALL WATCHLIST ASSETS",
+        f"Directional bias: LONG {long_bias} | SHORT {short_bias} | NEUTRAL {neutral_bias}",
+        "Bias is based only on LBank Futures 24h price snapshot, funding and order-book data.",
+        "It is NOT a confirmed technical signal; no candle-based EMA/RSI/MACD is claimed."
+    ]
+    for x in results:
+        d = x.get("directional_analysis", {})
+        mc = x.get("market_context", {})
+        ob = mc.get("orderbook", {})
+        plan = d.get("conditional_plan") or {}
+        report += [
+            "",
+            f"{x['symbol']} | {d.get('bias', 'NO_DATA')} | Bias score: {d.get('bias_score', 0)} | {d.get('watch_status', x.get('status'))}",
+            f"Current price: {x.get('price')}",
+            f"24h change: {mc.get('returns_pct', {}).get('24h')}% | 24h range position: {mc.get('range_position_24h')}",
+            f"Funding rate: {mc.get('funding_rate')} | Orderbook imbalance: {ob.get('depth_imbalance')} | Spread: {ob.get('spread_pct')}%",
+        ]
+        if plan:
+            report += [
+                f"CONDITIONAL ENTRY: {plan.get('entry')}",
+                f"STOP LOSS: {plan.get('stop_loss')}",
+                f"TP1: {plan.get('take_profit_1')} | TP2: {plan.get('take_profit_2')}",
+                f"RR: {plan.get('rr_tp1')} / {plan.get('rr_tp2')} | Basis: 24h range breakout"
+            ]
+        else:
+            report.append("Trade levels: NONE - wait for a valid setup; do not enter at market.")
     report += ["", "INSUFFICIENT DATA:"]
     for x in ins:
         report.append(f"- {x['symbol']}: {'; '.join(x.get('analysis',{}).get('reasons',[]))}")
@@ -262,7 +379,10 @@ def main():
          "confirmed_signals_enabled":False,"leverage_enabled":False,
          "watchlist":WATCHLIST,"missing_watchlist_assets":missing,
          "summary":{"markets_analyzed":len(results),"A_confirmed":0,
-             "B_conditional":len(b),"insufficient_data":len(ins),"C_no_trade":len(rej)},
+             "B_conditional":len(b),"insufficient_data":len(ins),"C_no_trade":len(rej),
+             "long_bias":sum(1 for x in results if x.get("directional_analysis",{}).get("bias")=="LONG_BIAS"),
+             "short_bias":sum(1 for x in results if x.get("directional_analysis",{}).get("bias")=="SHORT_BIAS"),
+             "neutral_bias":sum(1 for x in results if x.get("directional_analysis",{}).get("bias")=="NEUTRAL")},
          "results":results,
          "disclaimer":"Snapshot-only conditional research. Not candle-based support/resistance. No order execution."}
     with open("signals_futures_lbank.json","w",encoding="utf-8") as f: json.dump(obj,f,ensure_ascii=False,indent=2)
