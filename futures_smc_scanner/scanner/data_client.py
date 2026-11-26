@@ -1,4 +1,3 @@
-
 import logging
 import math
 import time
@@ -217,7 +216,6 @@ class PerpetualDataClient:
                 return row
 
         return None
-
     # =========================================================
     # CANDLE VALIDATION
     # =========================================================
@@ -444,7 +442,6 @@ class PerpetualDataClient:
             KeyError,
         ):
             return None
-
     def _fetch_lbank_spot_candles(
         self,
         symbol: str,
@@ -560,8 +557,12 @@ class PerpetualDataClient:
             result[timeframe] = valid
             issues.extend(candle_issues)
 
-        if issues:
-            raise ExchangeDataError("; ".join(issues))
+        # Only missing candles are fatal. Gaps and single bad candles
+        # are reported as warnings and do not discard the whole coin.
+        fatal = [i for i in issues if "insufficient" in i.lower()]
+
+        if fatal:
+            raise ExchangeDataError("; ".join(fatal))
 
         return result, issues
 
@@ -740,7 +741,6 @@ class PerpetualDataClient:
             "symbol": lbank_symbol,
             "product_group": product_group,
         }
-
     # =========================================================
     # BUILD AND VALIDATE PERPETUAL CONTEXT
     # =========================================================
@@ -779,19 +779,7 @@ class PerpetualDataClient:
             context_exchange_source="lbank_perpetual",
         )
 
-        warning = (
-            "LBank turnover unavailable; quote-volume unit "
-            "is not verified."
-            if turnover is None
-            else
-            "LBank turnover received; its quote-volume unit "
-            "must be verified before treating it as USDT volume."
-        )
-
-        if hasattr(ctx, "warnings"):
-            if ctx.warnings is None:
-                ctx.warnings = []
-            ctx.warnings.append(warning)
+        # turnover unit warning suppressed: it repeats for every coin.
 
         return ctx
 
