@@ -1686,6 +1686,41 @@ def trader_checklist(r: Dict[str, Any]) -> List[str]:
     ]
 
 
+def coin_view_fa(r: Dict[str, Any]) -> str:
+    """One Persian line per coin: which side is better now, why, and the entry if any."""
+    D = r["D"]
+    price = r["price"]
+    arrow = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+    score = 0
+    for tf, w in (("4h", 2), ("1h", 2), ("15m", 1)):
+        t = D[tf]["trend"]
+        score += w if t == "UP" else -w if t == "DOWN" else 0
+    pd_ = premium_discount(D, price)
+    if pd_:
+        score += 1 if pd_["pos"] < 50 else -1 if pd_["pos"] > 50 else 0
+    if score > 0:
+        bias = "لانگ"
+    elif score < 0:
+        bias = "شورت"
+    else:
+        bias = "خنثی"
+    strength = "قوی" if abs(score) >= 3 else "ضعیف" if abs(score) >= 1 else "بدون برتری"
+    side = "LONG" if bias == "لانگ" else "SHORT" if bias == "شورت" else None
+    sweep = "بله" if side and (
+        detect_sweep(D["15m"], side, 24) or detect_sweep(D["5m"], side, 24)) else "خیر"
+    zone = "دیسکانت" if pd_ and pd_["pos"] < 50 else "پریمیوم" if pd_ else "نامشخص"
+    trend = "%s%s%s" % (arrow[D["4h"]["trend"]], arrow[D["1h"]["trend"]], arrow[D["15m"]["trend"]])
+    plan = r.get("fib_plan")
+    if plan and side and plan["side"] == side:
+        entry_txt = "ورود %s (%s)" % (fmt_price(plan["entry"]), plan["status"])
+    elif plan:
+        entry_txt = "نقطه‌ی فیبو مخالف نظر فعلی است (%s)" % plan["side"]
+    else:
+        entry_txt = "نقطه‌ی ورود ندارد"
+    return "<b>%s</b>: نظر <b>%s</b> (%s) | روند 4H/1H/15m: %s | موقعیت: %s | Sweep: %s | %s" % (
+        html.escape(r["symbol"]), bias, strength, trend, zone, sweep, html.escape(entry_txt))
+
+
 def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     """Short Telegram message: only definite signals (limit layout), or one line saying there are none."""
     lines = ["📊 <b>گزارش اسکن</b> — %s" % local_now()]
@@ -1694,6 +1729,13 @@ def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str,
                    and ("منتظر" in r["fib_plan"]["status"] or "در ناحیه" in r["fib_plan"]["status"])]
     rejected = [r for r in results if r not in ready and r not in conditional]
     lines.append("قطعی: %d | شرطی: %d | ردشده: %d" % (len(ready), len(conditional), len(rejected)))
+    lines.append("")
+    lines.append("🧭 <b>نظر تحلیلی هر ارز</b>")
+    for r in results:
+        try:
+            lines.append(coin_view_fa(r))
+        except Exception:
+            lines.append("%s: تحلیل ناکامل" % html.escape(r["symbol"]))
     for r in sorted(conditional, key=lambda x: abs(x["fib_plan"]["dist_pct"]))[:3]:
         p = r["fib_plan"]
         lines.append("")
