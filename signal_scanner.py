@@ -1748,6 +1748,50 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
         html.escape(r["symbol"]), bias, strength, trend, zone, sweep, html.escape(fib_txt), html.escape(entry_txt))
 
 
+CAPITAL_USDT = _env_float("ACCOUNT_EQUITY_USDT", 1000.0)
+CAPITAL_RISK_PCT = _env_float("CAPITAL_RISK_PCT", 1.0)   # risk per trade as % of capital
+
+
+def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
+    """Complete trade card: side, entry, stop, three targets with net RR, and position size."""
+    p = r.get("fib_plan")
+    if not p:
+        return None
+    side = p["side"]
+    price = r["price"]
+    imp = recent_impulse(r["D"]["1h"]) or recent_impulse(r["D"]["4h"])
+    if imp is None:
+        return None
+    A, B = imp["A"], imp["B"]
+    d = imp["diff"]
+    entry, sl = p["entry"], p["sl"]
+    if side == "SHORT":
+        t1, t2, t3 = B, A - 1.272 * d, A - 1.618 * d
+    else:
+        t1, t2, t3 = B, A + 1.272 * d, A + 1.618 * d
+    cost = 2.0 * FEE_PCT
+    risk_pct = abs(sl - entry) / entry * 100.0
+
+    def rr(t: float) -> float:
+        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+
+    risk_usdt = CAPITAL_USDT * CAPITAL_RISK_PCT / 100.0
+    notional = risk_usdt / (risk_pct / 100.0 + cost / 100.0)
+    how = "بازار" if abs(entry - price) / price * 100.0 <= 0.1 else "لیمیت"
+    lines = [
+        "<b>%s %s</b> (ورود %s)" % (html.escape(r["symbol"]), side, how),
+        "ورود: <code>%s</code> | حد ضرر: <code>%s</code> (%.2f%%)" % (
+            fmt_price(entry), fmt_price(sl), risk_pct),
+    ]
+    for i, t in enumerate((t1, t2, t3), start=1):
+        ratio = rr(t)
+        flag = "" if ratio >= 1.0 else " ⚠️ RR کمتر از ۱"
+        lines.append("TP%d: <code>%s</code> | RR خالص %.2f%s" % (i, fmt_price(t), ratio, flag))
+    lines.append("ریسک: %.2f%% سرمایه (%.2f واحد) | حجم پوزیشن: %.2f | اهرم پیشنهادی: %.1fx" % (
+        CAPITAL_RISK_PCT, risk_usdt, notional, min(MAX_LEVERAGE, notional / CAPITAL_USDT)))
+    return lines
+
+
 def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     """Short Telegram message: only definite signals (limit layout), or one line saying there are none."""
     lines = ["📊 <b>گزارش اسکن</b> — %s" % local_now()]
@@ -1756,6 +1800,17 @@ def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str,
                    and ("منتظر" in r["fib_plan"]["status"] or "در ناحیه" in r["fib_plan"]["status"])]
     rejected = [r for r in results if r not in ready and r not in conditional]
     lines.append("قطعی: %d | شرطی: %d | ردشده: %d" % (len(ready), len(conditional), len(rejected)))
+    full_cards = []
+    for r in results:
+        block = full_entry_block_fa(r)
+        if block:
+            full_cards.append(block)
+    if full_cards:
+        lines.append("")
+        lines.append("🎯 <b>نقطه‌ی ورود کامل (با فیبوناچی)</b>")
+        for block in full_cards[:5]:
+            lines.append("")
+            lines.extend(block)
     lines.append("")
     lines.append("🧭 <b>نظر تحلیلی هر ارز</b>")
     for r in results:
@@ -2190,62 +2245,4 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ScanError as e:
             log.error("%s: %s", sym, e)
             errors.append((sym, str(e)))
-        except Exception as e:  # keep the scan alive on unexpected per-symbol bugs
-            log.exception("%s: unexpected error", sym)
-            errors.append((sym, "unexpected error: %s" % e))
-
-    outbox: List[str] = []
-    base_send = (lambda t: print(t) or True) if args.dry_run else send_telegram
-
-    def send(t: str) -> bool:
-        outbox.append(to_plain(t))
-        return base_send(t)
-
-    if not results:
-        send("❗ <b>اسکن ناموفق بود</b>\n" + "\n".join(
-            "%s: %s" % (html.escape(s), html.escape(e[:150])) for s, e in errors))
-        write_report_file(outbox)
-        return 1
-
-    cnt = {"LONG": 0, "SHORT": 0}
-    for r in sorted([x for x in results if x["signal"]], key=lambda x: -x["signal"]["score"]):
-        sd = r["signal"]["side"]
-        if cnt[sd] >= MAX_SAME_DIR:
-            r["watch"] = make_watch(r, r["signal"], "سقف سیگنال هم‌جهت در یک اسکن")
-            r["reason_override"] = "سقف سیگنال هم‌جهت در یک اسکن"
-            r["signal"] = None
-        else:
-            cnt[sd] += 1
-
-    state = load_state()
-    sent = 0
-    for res in results:
-        sig = res["signal"]
-        if not sig:
-            continue
-        key = "%s:%s" % (res["symbol"], sig["side"])
-        if time.time() - state.get(key, 0.0) < COOLDOWN_H * 3600:
-            log.info("%s in cooldown, skipped", key)
-            res["signal"] = None
-            res["reason_override"] = "سیگنال مشابه اخیراً ارسال شده (cooldown)"
-            continue
-        if send(format_signal(res, sig)) or args.dry_run:
-            state[key] = time.time()
-            sent += 1
-    if not args.dry_run:
-        save_state(state)
-        append_scan_log(results)
-    if args.diag or args.dry_run:
-        write_diag(results, args.min_score)
-    write_details(results, errors, sent)
-    log_fib_signals(results)
-    send(format_report(results, errors, sent))
-    write_report_file(outbox)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+        except Exception as e:  # keep the scan alive on unexpected per
