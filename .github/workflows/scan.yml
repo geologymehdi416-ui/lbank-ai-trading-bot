@@ -1,4 +1,3 @@
-
 name: LBank Futures Smart Scanner
 
 on:
@@ -29,6 +28,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -37,6 +38,7 @@ jobs:
 
       - name: Sync with remote
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -45,52 +47,111 @@ jobs:
 
       - name: Collect LBank Futures prices
         run: |
-          python collector.py
+          set -e
+          python -u collector.py
 
       - name: Run smart scanner
+        id: scanner
+        env:
+          REPORT_FILE: report.txt
+        shell: bash
         run: |
-          python signal_scanner.py
+          set -uo pipefail
+
+          echo "Starting signal_scanner.py"
+          echo "Working directory: $(pwd)"
+
+          # Keep the scanner's complete console output for diagnostics.
+          set +e
+          python -u signal_scanner.py 2>&1 | tee scanner_output.log
+          scanner_status=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=${scanner_status}" >> "$GITHUB_OUTPUT"
+          echo "Scanner exit code: ${scanner_status}"
+
+          # The scanner normally writes report.txt itself. If it exits early
+          # before that point, create a diagnostic report so Telegram still
+          # receives the actual failure information rather than failing with
+          # "report.txt was not generated".
+          if [ ! -s report.txt ]; then
+            echo "report.txt is missing or empty; creating diagnostic report."
+            {
+              echo "LBank Smart Scanner - execution report"
+              echo
+              echo "Scanner did not produce its normal report."
+              echo "Exit code: ${scanner_status}"
+              echo
+              echo "Last scanner output:"
+              tail -n 180 scanner_output.log 2>/dev/null || true
+            } > report.txt
+          elif [ "${scanner_status}" -ne 0 ]; then
+            {
+              echo
+              echo
+              echo "WARNING: Scanner exited with code ${scanner_status}."
+              echo "Last scanner output:"
+              tail -n 100 scanner_output.log 2>/dev/null || true
+            } >> report.txt
+          fi
+
+          echo "Generated report:"
+          ls -lh report.txt
+          wc -c report.txt
 
       - name: Send Telegram report
+        if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_FILE: report.txt
         run: |
           python - <<'PY'
           import os
           import random
           import time
-          import requests
           from pathlib import Path
 
-          token = os.environ.get("TELEGRAM_BOT_TOKEN")
-          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+          import requests
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+          report_file = Path(os.environ.get("REPORT_FILE", "report.txt"))
 
           if not token or not chat_id:
-              raise RuntimeError("Telegram secrets are missing")
+              raise RuntimeError(
+                  "Telegram secrets are missing. Add TELEGRAM_BOT_TOKEN "
+                  "and TELEGRAM_CHAT_ID in repository Actions secrets."
+              )
 
-          report_file = Path("report.txt")
-
-          if not report_file.exists():
-              raise RuntimeError("report.txt was not generated")
+          if not report_file.is_file():
+              raise RuntimeError(
+                  f"Report file does not exist: {report_file.resolve()}"
+              )
 
           report = report_file.read_text(encoding="utf-8").strip()
-
           if not report:
-              raise RuntimeError("Telegram report is empty")
+              raise RuntimeError("Telegram report is empty.")
 
+          # Telegram sendMessage limit is 4096 characters. Use a margin
+          # and split even unusually long individual lines safely.
           max_length = 3800
           chunks = []
           current = ""
 
-          for line in report.splitlines():
-              if len(line) > max_length:
-                  raise RuntimeError("A report line exceeds Telegram limit")
+          for original_line in report.splitlines():
+              line = original_line
+              while len(line) > max_length:
+                  if current:
+                      chunks.append(current)
+                      current = ""
+                  chunks.append(line[:max_length])
+                  line = line[max_length:]
 
               candidate = current + "\n" + line if current else line
-
               if len(candidate) > max_length:
-                  chunks.append(current)
+                  if current:
+                      chunks.append(current)
                   current = line
               else:
                   current = candidate
@@ -101,51 +162,99 @@ jobs:
           url = f"https://api.telegram.org/bot{token}/sendMessage"
 
           for index, chunk in enumerate(chunks, start=1):
-              prefix = f"📨 بخش {index}/{len(chunks)}\n\n" if len(chunks) > 1 else ""
-              sent = False
+              prefix = (
+                  f"📨 بخش {index}/{len(chunks)}\n\n"
+                  if len(chunks) > 1 else ""
+              )
+              payload = {
+                  "chat_id": chat_id,
+                  "text": prefix + chunk,
+                  "disable_web_page_preview": True,
+              }
 
+              sent = False
               for attempt in range(1, 6):
                   try:
                       response = requests.post(
                           url,
-                          json={"chat_id": chat_id, "text": prefix + chunk},
-                          timeout=30
+                          json=payload,
+                          timeout=30,
                       )
+
+                      # Telegram may return HTTP 429 with retry_after.
+                      if response.status_code == 429:
+                          try:
+                              retry_after = int(
+                                  response.json().get("parameters", {}).get(
+                                      "retry_after", 5
+                                  )
+                              )
+                          except (ValueError, TypeError):
+                              retry_after = 5
+
+                          if attempt < 5:
+                              print(
+                                  f"Telegram rate limit; waiting "
+                                  f"{retry_after}s (attempt {attempt}/5)"
+                              )
+                              time.sleep(retry_after)
+                              continue
+
                       response.raise_for_status()
                       result = response.json()
+
                       if not result.get("ok"):
-                          raise RuntimeError(f"Telegram error: {result}")
+                          raise RuntimeError(
+                              f"Telegram API rejected message: {result}"
+                          )
+
                       sent = True
                       break
-                  except requests.exceptions.RequestException as e:
-                      print(f"Telegram attempt {attempt}/5 failed: {e}")
-                      time.sleep(3 * attempt + random.random())
+
+                  except (requests.exceptions.RequestException, RuntimeError) as exc:
+                      print(f"Telegram attempt {attempt}/5 failed: {exc}")
+                      if attempt < 5:
+                          time.sleep(3 * attempt + random.random())
 
               if not sent:
-                  raise RuntimeError("Telegram message failed after 5 attempts")
+                  raise RuntimeError(
+                      f"Telegram message {index}/{len(chunks)} failed "
+                      "after 5 attempts."
+                  )
 
-              print(f"Telegram message {index}/{len(chunks)} sent")
+              print(f"Telegram message {index}/{len(chunks)} sent.")
               time.sleep(1)
 
-          print(f"Successfully sent {len(chunks)} messages")
+          print(f"Successfully sent {len(chunks)} Telegram message(s).")
           PY
 
       - name: Commit and push market data
+        if: always()
         run: |
           set -e
 
-          for f in data/prices.jsonl plans_state.json signals_log.csv; do
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Persist only scanner/collector state and logs, not temporary
+          # Telegram reports or diagnostic console output.
+          for f in \
+            data/prices.jsonl \
+            plans_state.json \
+            signals_log.csv \
+            scan_log.csv \
+            signal_state.json; do
             if [ -f "$f" ]; then
               git add "$f"
             fi
           done
 
           if git diff --cached --quiet; then
-            echo "No market data changes"
+            echo "No market data or scanner state changes."
             exit 0
           fi
 
-          git commit -m "Update LBank futures market data and signal state"
+          git commit -m "Update LBank market data and scanner state"
 
           for attempt in 1 2 3 4 5; do
             echo "Push attempt: ${attempt}"
@@ -153,21 +262,26 @@ jobs:
             git fetch origin "${GITHUB_REF_NAME}"
 
             if ! git rebase "origin/${GITHUB_REF_NAME}"; then
-              echo "Rebase conflict detected"
-
+              echo "Rebase conflict detected."
               git rebase --abort || true
-
               echo "Manual inspection required. No force push attempted."
               exit 1
             fi
 
             if git push origin "HEAD:${GITHUB_REF_NAME}"; then
-              echo "Market data successfully pushed"
+              echo "Market data and scanner state successfully pushed."
               exit 0
             fi
 
             sleep 3
           done
 
-          echo "Push failed after 5 attempts"
+          echo "Push failed after 5 attempts."
+          exit 1
+
+      - name: Mark scan as failed when scanner returned an error
+        if: always() && steps.scanner.outputs.exit_code != '0'
+        run: |
+          echo "The scanner returned exit code: ${{ steps.scanner.outputs.exit_code }}"
+          echo "The diagnostic report was sent to Telegram, if Telegram delivery succeeded."
           exit 1
