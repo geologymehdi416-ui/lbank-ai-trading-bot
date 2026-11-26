@@ -57,9 +57,9 @@ log = logging.getLogger("signal_scanner")
 # --------------------------------------------------------------------------
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
 DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
-                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,TON_USDT,"
+                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,"
                    "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT,"
-                   "TRX_USDT,HBAR_USDT,ICP_USDT,FIL_USDT,ETC_USDT,XLM_USDT,ALGO_USDT,EOS_USDT,AGT_USDT,AKE_USDT")
+                   "TRX_USDT,HBAR_USDT,ICP_USDT,FIL_USDT,ETC_USDT,XLM_USDT,ALGO_USDT,AGT_USDT,AKE_USDT")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -1686,6 +1686,32 @@ def trader_checklist(r: Dict[str, Any]) -> List[str]:
     ]
 
 
+def fib_read_fa(D: Dict[str, Dict[str, Any]], price: float, side: Optional[str]) -> str:
+    """Where price sits on the latest impulse (0.618-0.786 pullback zone is the entry area)."""
+    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"])
+    if imp is None:
+        return "فیبو: ایمپالس واضح نیست"
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    if imp["dir"] == "UP":
+        ret = (B - price) / d          # pullback down from the high
+        arrow, imp_side = "↑", "LONG"
+    else:
+        ret = (price - B) / d          # pullback up from the low
+        arrow, imp_side = "↓", "SHORT"
+    if 0.618 <= ret <= 0.786:
+        where = "داخل ناحیه‌ی ۰٫۶۱۸–۰٫۷۸۶"
+    elif 0.5 <= ret < 0.618:
+        where = "بین ۰٫۵ و ۰٫۶۱۸"
+    elif ret > 0.786:
+        where = "پولبک عمیق (بالاتر از ۰٫۷۸۶)"
+    elif ret < 0:
+        where = "خارج از ایمپالس (ادامه‌ی حرکت)"
+    else:
+        where = "پولبک کم (زیر ۰٫۵)"
+    align = "هم‌راستا با نظر" if side == imp_side else ("مخالف نظر" if side else "")
+    return "فیبو: %s — ایمپالس ۱H %s %s" % (where, arrow, align)
+
+
 def coin_view_fa(r: Dict[str, Any]) -> str:
     """One Persian line per coin: which side is better now, why, and the entry if any."""
     D = r["D"]
@@ -1717,8 +1743,9 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
         entry_txt = "نقطه‌ی فیبو مخالف نظر فعلی است (%s)" % plan["side"]
     else:
         entry_txt = "نقطه‌ی ورود ندارد"
-    return "<b>%s</b>: نظر <b>%s</b> (%s) | روند 4H/1H/15m: %s | موقعیت: %s | Sweep: %s | %s" % (
-        html.escape(r["symbol"]), bias, strength, trend, zone, sweep, html.escape(entry_txt))
+    fib_txt = fib_read_fa(D, price, side)
+    return "<b>%s</b>: نظر <b>%s</b> (%s) | روند 4H/1H/15m: %s | موقعیت: %s | Sweep: %s | %s | %s" % (
+        html.escape(r["symbol"]), bias, strength, trend, zone, sweep, html.escape(fib_txt), html.escape(entry_txt))
 
 
 def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
