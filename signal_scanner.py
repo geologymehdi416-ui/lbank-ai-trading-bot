@@ -99,7 +99,7 @@ CONFIRM_VOL = _env_float("CONFIRM_VOL", 1.2)     # 1m confirmation: volume >= th
 CONFIRM_BODY = _env_float("CONFIRM_BODY", 0.5)   # 1m confirmation: body >= this x avg body
 MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
 MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)
-CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting
+CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting  # targets beyond this net RR are unrealistic for the window and skipped
 EXPIRY_H = _env_float("EXPIRY_H", 4.0)  # hours a conditional opportunity stays valid
 TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)  # each structural target must have net RR >= this
 WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
@@ -390,6 +390,8 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
         "highs": highs, "lows": lows, "struct": st, "trend": trend,
         "atr_rank": atr_rank, "atr_list": at,
     }
+
+
 # --------------------------------------------------------------------------
 # Smart-money concepts
 # --------------------------------------------------------------------------
@@ -812,6 +814,8 @@ def fib_plan(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Optional[
     return {"entry": entry, "sl": sl, "stop_pct": risk_pct,
             "tp1": tps[0][0], "tp1_rr": tps[0][1], "tp2": tps[1][0], "tp2_rr": tps[1][1],
             "zone": (zlo, zhi), "status": status}
+
+
 def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
                  fee_pct: float) -> List[Tuple[float, float]]:
     """Nearest structural levels in the trade direction whose NET reward/risk is positive.
@@ -1190,6 +1194,8 @@ def _load_plans() -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
 def _save_plans(plans: Dict[str, Any]) -> None:
     try:
         with open(PLAN_FILE, "w", encoding="utf-8") as f:
@@ -1591,6 +1597,8 @@ def format_brief(res: Dict[str, Any]) -> List[str]:
     if p["state"] != "READY" and p["missing"]:
         lines.append("نواقص: " + html.escape(" | ".join(p["missing"][:2])))
     return lines
+
+
 def btc_corr(res: Dict[str, Any], btc: Dict[str, Any], n: int = 96) -> Optional[float]:
     """Pearson correlation of the last n 15m returns with BTC (None if not computable)."""
     a = res["D"]["15m"]["cs"].c[-n:]
@@ -1784,6 +1792,104 @@ def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
     return lines
 
 
+def _bias_side(r: Dict[str, Any]) -> Tuple[str, int]:
+    """Preferred side for a coin (same scoring as the market view)."""
+    D = r["D"]
+    price = r["price"]
+    score = 0
+    for tf, w in (("4h", 2), ("1h", 2), ("15m", 1)):
+        t = D[tf]["trend"]
+        score += w if t == "UP" else -w if t == "DOWN" else 0
+    pd_ = premium_discount(D, price)
+    if pd_:
+        score += 1 if pd_["pos"] < 50 else -1 if pd_["pos"] > 50 else 0
+    if score > 0:
+        side = "LONG"
+    elif score < 0:
+        side = "SHORT"
+    else:
+        side = "SHORT" if D["1h"]["trend"] == "DOWN" else "LONG"
+    return side, score
+
+
+def always_point_fa(r: Dict[str, Any]) -> List[str]:
+    """Every coin gets one concrete entry plan: side, entry, stop, two targets, and an explicit state.
+    Entry priority: OB/FVG zone -> 0.618 of the latest 1H impulse -> ATR fallback."""
+    D = r["D"]
+    price = r["price"]
+    side, _ = _bias_side(r)
+    long = side == "LONG"
+    atr15 = D["15m"]["atr"]
+    zone = pick_zone([D["15m"], D["5m"]], side, price, atr15)
+    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"])
+    if zone:
+        entry = (zone["bottom"] + zone["top"]) / 2.0
+        src = "%s در %s" % (zone["kind"], zone["tf"])
+    elif imp and ((imp["dir"] == "UP") == long):
+        B, d = imp["B"], imp["diff"]
+        entry = B - 0.618 * d if long else B + 0.618 * d
+        src = "فیبو ۰٫۶۱۸ ایمپالس ۱H"
+    else:
+        entry = price - 0.5 * atr15 if long else price + 0.5 * atr15
+        src = "ناحیه‌ی ساختاری پیدا نشد؛ مبنا ATR"
+    if zone:
+        ref = zone["bottom"] if long else zone["top"]
+    else:
+        ref = entry - 1.5 * atr15 if long else entry + 1.5 * atr15
+    sl = ref - 0.25 * atr15 if long else ref + 0.25 * atr15
+    risk = abs(entry - sl)
+    min_risk = max(MIN_STOP_PCT / 100.0 * entry, 0.5 * atr15)
+    if risk < min_risk:
+        risk = min_risk
+        sl = entry - risk if long else entry + risk
+    risk_pct = risk / entry * 100.0
+    cost = 2.0 * FEE_PCT
+
+    def rr(t: float) -> float:
+        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+
+    targets = pick_targets(collect_levels(D), entry, risk, long, FEE_PCT)
+    if len(targets) < 2 and imp:
+        A = imp["A"]
+        d = imp["diff"]
+        ext = A + 1.272 * d if long else A - 1.272 * d
+        if (ext > entry) if long else (ext < entry):
+            r_ext = rr(ext)
+            if r_ext >= TP_MIN_RR_NET and all(abs(ext - t) > 1e-12 for t, _ in targets):
+                targets.append((ext, r_ext))
+                targets.sort(key=lambda x: x[0], reverse=not long)
+    tp1, rr1 = targets[0] if targets else (None, None)
+    tp2, rr2 = targets[1] if len(targets) > 1 else (None, None)
+
+    c15 = D["15m"]["cs"]
+    last_bull = c15.c[-1] > c15.o[-1]
+    last_bear = c15.c[-1] < c15.o[-1]
+    if (price < sl) if long else (price > sl):
+        state = "باطل (حد ضرر خورده)"
+    elif (price > entry) if long else (price < entry):
+        state = "منتظر رسیدن قیمت به ورود (%s)" % ("پایین" if long else "بالا")
+    else:
+        rej = last_bull if long else last_bear
+        state = "آماده (کندل رد ۱۵m)" if rej else "در ناحیه‌ی ورود؛ منتظر کندل رد"
+    dist = (entry - price) / price * 100.0
+    lines = [
+        "<b>%s %s</b> | %s" % (html.escape(r["symbol"]), side, state),
+        "منبع ورود: %s" % html.escape(src),
+        "ورود: <code>%s</code> | حد ضرر: <code>%s</code> (%.2f%%) | فاصله تا ورود: %+.2f%%" % (
+            fmt_price(entry), fmt_price(sl), risk_pct, dist),
+    ]
+    t1s = ("<code>%s</code> (RR %.2f)" % (fmt_price(tp1), rr1)) if tp1 is not None else "—"
+    t2s = ("<code>%s</code> (RR %.2f)" % (fmt_price(tp2), rr2)) if tp2 is not None else "—"
+    lines.append("TP1: %s | TP2: %s" % (t1s, t2s))
+    if rr1 is None:
+        lines.append("⚠️ تارگت ساختاری با RR مثبت پیدا نشد")
+    elif rr1 < 1.0:
+        lines.append("⚠️ RR خالص TP1 کمتر از ۱ — ارزش ورود ندارد")
+    if risk_pct > MAX_STOP_PCT:
+        lines.append("⚠️ حد ضرر بیش از سقف %.1f%% — ورود پیشنهاد نمی‌شود" % MAX_STOP_PCT)
+    return lines
+
+
 def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     """Short Telegram message: only definite signals (limit layout), or one line saying there are none."""
     lines = ["📊 <b>گزارش اسکن</b> — %s" % local_now()]
@@ -1810,6 +1916,14 @@ def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str,
             lines.append(coin_view_fa(r))
         except Exception:
             lines.append("%s: تحلیل ناکامل" % html.escape(r["symbol"]))
+    lines.append("")
+    lines.append("🎯 <b>نقطه‌ی ورود هر ارز (همیشه)</b>")
+    for r in results:
+        try:
+            lines.extend(always_point_fa(r))
+        except Exception:
+            lines.append("%s: محاسبه‌ی نقطه ناکامل" % html.escape(r["symbol"]))
+        lines.append("")
     for r in sorted(conditional, key=lambda x: abs(x["fib_plan"]["dist_pct"]))[:3]:
         p = r["fib_plan"]
         lines.append("")
@@ -1986,6 +2100,8 @@ def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
     lines.append("")
     lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
+
+
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
@@ -2147,150 +2263,4 @@ def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
                 "PASS" if not any("حد ضرر" in b for b in sc["blockers"]) else "FAIL",
                 t["stop_pct"], MAX_STOP_PCT))
             out.append("    [RR net to TP2]    %s  (%.2f, min %.1f, fee %.2f%%/side)" % (
-                "PASS" if (t["rr2n"] or 0.0) >= MIN_RR2_NET else "FAIL", (t["rr2n"] or 0.0), MIN_RR2_NET, FEE_PCT))
-            out.append("    [HTF obstacle]     %s  (room in R: %s)" % (
-                "FAIL" if any("مانع HTF" in b for b in sc["blockers"]) else "PASS",
-                "see blockers"))
-        else:
-            out.append("    [trade levels]     FAIL  (no trade built)")
-        out.append("    [score>=min]       %s  (%d)" % ("PASS" if sc["score"] >= min_score else "FAIL", sc["score"]))
-        fb = sc.get("fib", {})
-        fz = fb.get("zone")
-        out.append("    [FIB] valid=%s retr=%s zone=%s overlap=%s in_zone=%s pts=%d (%s) targets=%s" % (
-            fb.get("valid"), ("%.2f" % fb["retr"]) if fb.get("retr") is not None else "-",
-            ("%s..%s" % (fmt_price(fz[0]), fmt_price(fz[1]))) if fz else "-",
-            fb.get("overlap"), fb.get("in_zone"), fb.get("pts", 0),
-            "APPLIED" if FIB_CONFIRM else "info only",
-            ", ".join("%.3f->%s" % (k, fmt_price(p)) for k, p in fb.get("targets", [])) or "-"))
-        ind = sc.get("ind", {})
-        if ind:
-            out.append("    [INDICATORS] %d/%d passed (ok=%s, mode=%s) failed=%s rsi=%.1f" % (
-                ind["passed"], ind["total"], ind["ok"],
-                "FILTER" if INDICATOR_FILTER else "info only",
-                ",".join(ind["failed"]) or "-", ind["rsi"]))
-        if sc["blockers"]:
-            out.append("    blockers: " + " | ".join(sc["blockers"]))
-    out.append("  global: " + (" | ".join(res["global_blockers"]) if res["global_blockers"] else "none"))
-    out.append("  => decision: %s" % (
-        ("SIGNAL " + res["signal"]["side"]) if res["signal"] else
-        ("WATCH " + res["watch"]["side"]) if res.get("watch") else
-        "NONE (" + no_signal_reason(res) + ")"))
-    return out
-
-
-def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
-    """Write the diagnostic report locally only (never sent to Telegram)."""
-    path = os.getenv("DIAG_FILE", DIAG_FILE)
-    if not path:
-        return
-    now = local_now()
-    lines = ["DIAGNOSTIC REPORT — %s" % now, ""]
-    for r in results:
-        lines.extend(gate_table(r, min_score))
-        lines.append("")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-    except OSError as e:
-        log.warning("could not write diag report %s: %s", path, e)
-
-
-def write_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], sent: int) -> None:
-    """Full analysis (watchlist, conditional plans, market summary) for local review only."""
-    path = os.getenv("DETAILS_FILE", "details_report.txt")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(to_plain(format_details(results, errors, sent)) + "\n")
-    except OSError as e:
-        log.warning("could not write details %s: %s", path, e)
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
-    ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
-    ap.add_argument("--min-score", type=float, default=MIN_SCORE)
-    ap.add_argument("--dry-run", action="store_true", help="print only, do not send to Telegram")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--diag", action="store_true", help="also write per-gate diagnostic report")
-    args = ap.parse_args(argv)
-
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if not symbols:
-        log.error("no symbols given")
-        return 2
-
-    results: List[Dict[str, Any]] = []
-    errors: List[Tuple[str, str]] = []
-    pairs = fetch_pairs()
-    if pairs:
-        for sym in [x for x in symbols if x.lower() not in pairs]:
-            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد؛ نادیده گرفته شد"))
-        symbols = [x for x in symbols if x.lower() in pairs]
-    for sym in symbols:
-        try:
-            results.append(analyze_symbol(sym, args.min_score))
-            log.info("%s scanned", sym)
-        except ScanError as e:
-            log.error("%s: %s", sym, e)
-            errors.append((sym, str(e)))
-        except Exception as e:  # keep the scan alive on unexpected per-symbol bugs
-            log.exception("%s: unexpected error", sym)
-            errors.append((sym, "unexpected error: %s" % e))
-
-    outbox: List[str] = []
-    base_send = (lambda t: print(t) or True) if args.dry_run else send_telegram
-
-    def send(t: str) -> bool:
-        outbox.append(to_plain(t))
-        return base_send(t)
-
-    if not results:
-        send("❗ <b>اسکن ناموفق بود</b>\n" + "\n".join(
-            "%s: %s" % (html.escape(s), html.escape(e[:150])) for s, e in errors))
-        write_report_file(outbox)
-        return 1
-
-    cnt = {"LONG": 0, "SHORT": 0}
-    for r in sorted([x for x in results if x["signal"]], key=lambda x: -x["signal"]["score"]):
-        sd = r["signal"]["side"]
-        if cnt[sd] >= MAX_SAME_DIR:
-            r["watch"] = make_watch(r, r["signal"], "سقف سیگنال هم‌جهت در یک اسکن")
-            r["reason_override"] = "سقف سیگنال هم‌جهت در یک اسکن"
-            r["signal"] = None
-        else:
-            cnt[sd] += 1
-
-    state = load_state()
-    sent = 0
-    for res in results:
-        sig = res["signal"]
-        if not sig:
-            continue
-        key = "%s:%s" % (res["symbol"], sig["side"])
-        if time.time() - state.get(key, 0.0) < COOLDOWN_H * 3600:
-            log.info("%s in cooldown, skipped", key)
-            res["signal"] = None
-            res["reason_override"] = "سیگنال مشابه اخیراً ارسال شده (cooldown)"
-            continue
-        if send(format_signal(res, sig)) or args.dry_run:
-            state[key] = time.time()
-            sent += 1
-    if not args.dry_run:
-        save_state(state)
-        append_scan_log(results)
-    if args.diag or args.dry_run:
-        write_diag(results, args.min_score)
-    write_details(results, errors, sent)
-    log_fib_signals(results)
-    send(format_report(results, errors, sent))
-    write_report_file(outbox)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+                "PASS" if (t["rr2n"] or 0.0) >= MIN_RR2_NET else "FAIL", (t["rr2n"] or 0.0), MIN_RR2
