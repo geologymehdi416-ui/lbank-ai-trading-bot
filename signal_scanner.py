@@ -7,7 +7,8 @@ Analysis-only crypto futures signal scanner (NO order execution).
 
 Pipeline per symbol:
   1. Fetch price + 5m / 15m / 1H / 4H candles from LBank (public API).
-  2. Higher-timeframe trend, EMA20/50/200, RSI, MACD, ATR, volume ratio.
+  2. Higher-timeframe STRUCTURE trend (HH/HL, LH/LL, CHoCH); ATR and volume
+     are used only as market filters. No EMA/RSI/MACD (pure price action).
   3. Swings, support/resistance, liquidity pools, liquidity sweep, MSS/BOS,
      FVG and Order Blocks.
   4. Score LONG and SHORT scenarios out of 100.
@@ -17,7 +18,7 @@ Pipeline per symbol:
 
 Environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   Telegram delivery (if missing -> stdout)
-  SYMBOLS            comma list, default BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT
+  SYMBOLS            comma list, default 15 liquid majors/alts (see DEFAULT_SYMBOLS)
   MIN_SCORE          default 75
   RISK_PCT           risk per trade in % of equity, default 0.5
   MAX_LEVERAGE       default 2
@@ -34,17 +35,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("signal_scanner")
@@ -53,7 +56,10 @@ log = logging.getLogger("signal_scanner")
 # Configuration
 # --------------------------------------------------------------------------
 LBANK_BASE = os.getenv("LBANK_BASE_URL", "https://api.lbkex.com").rstrip("/")
-DEFAULT_SYMBOLS = "BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT"
+DEFAULT_SYMBOLS = ("BTC_USDT,ETH_USDT,SOL_USDT,BNB_USDT,XRP_USDT,"
+                   "DOGE_USDT,ADA_USDT,AVAX_USDT,LINK_USDT,"
+                   "DOT_USDT,LTC_USDT,ATOM_USDT,NEAR_USDT,BCH_USDT,"
+                   "TRX_USDT,HBAR_USDT,ICP_USDT,FIL_USDT,ETC_USDT,XLM_USDT,ALGO_USDT,AGT_USDT,AKE_USDT")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -69,17 +75,48 @@ MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
+SCAN_LOG_FILE = os.getenv("SCAN_LOG_FILE", "scan_log.csv")   # empty string disables logging
+DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")        # per-gate diagnostic report (never sent to Telegram)
+
+INDICATOR_FILTER = os.getenv("INDICATOR_FILTER", "0").strip() == "1"  # 1 = indicator check can block signals; 0 = diagnostics only
+FIB_CONFIRM = os.getenv("FIB_CONFIRM", "0").strip() == "1"   # 1 = Fibonacci affects score/TP; 0 = diagnostics only
+SWING_MIN_AMP = _env_float("SWING_MIN_AMP", 0.0)              # 0 = off; else a swing needs a move >= this x ATR
+FIB_EXT_LEVELS = (1.272, 1.618)   # extension targets measured from the pullback point
+FIB_PTS_OVERLAP = 5               # fib pullback zone overlaps an OB/FVG and price is in it
+FIB_PTS_ZONE = 2                  # price inside the fib pullback zone only
 
 MAX_STOP_PCT = 3.0          # max stop distance, % of entry
 MAX_STOP_ATR = 3.0          # max stop distance in 15m ATR
 MIN_STOP_ATR = 0.5          # min stop distance in 15m ATR
-MIN_ATR_PCT = 0.0008        # 15m ATR / price below this -> dead market
+MIN_ATR_PCT = 0.0004        # 15m ATR / price below this -> dead market
 MAX_ATR_PCT = 0.03          # above this -> too volatile
 MIN_VOL_RATIO = 0.5
 MIN_CANDLES = 100
 
+MIN_STOP_PCT = 0.25         # minimum stop distance, % of entry (stop is widened to this)
+FEE_PCT = _env_float("FEE_PCT", 0.06)   # taker fee per side, % (set to your real fee)
+CONFIRM_VOL = _env_float("CONFIRM_VOL", 1.2)     # 1m confirmation: volume >= this x avg
+CONFIRM_BODY = _env_float("CONFIRM_BODY", 0.5)   # 1m confirmation: body >= this x avg body
+MIN_RR2_NET = 1.5           # min reward/risk to TP2 after round-trip fees (signal gate)
+MAX_TP_RR = _env_float("MAX_TP_RR", 5.0)
+CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)  # TP1 net RR needed to show a conditional plan as waiting
+EXPIRY_H = _env_float("EXPIRY_H", 4.0)  # hours a conditional opportunity stays valid
+TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)  # each structural target must have net RR >= this
+WATCH_MIN = 60              # minimum score for the Watchlist / conditional opportunities
+CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)  # display only: hide cards whose TP1 net RR is below this (0 = show all)
+STRUCT_CAP = 60             # max score when Sweep+MSS/BOS is not confirmed
+MAX_SAME_DIR = 2            # max signals in the same direction per scan
+MSS_MAX_DELAY = 8           # MSS must happen within N candles after the sweep
+MSS_MIN_BODY = 0.8          # MSS candle body >= this x ATR
+MIN_ATR_RANK = 0.10         # 15m ATR percentile (last 100 candles) below this = quiet market
+QUIET_RANGE_RANK = 0.10     # 20-candle 15m range percentile (vs last ~200 windows) below this = compression
+BREAKOUT_WINDOW = 20        # candles that define the compression range
+BREAKOUT_MAX_RANK = 0.30    # the range before a breakout must be in the lowest 30% of this symbol's own ranges
+BREAKOUT_MIN_VOL = 1.2      # breakout candle volume >= this x mean volume of the range
+
 # tf name -> (LBank type, seconds)
 TF_MAP: Dict[str, Tuple[str, int]] = {
+    "1m": ("minute1", 60),
     "5m": ("minute5", 300),
     "15m": ("minute15", 900),
     "1h": ("hour1", 3600),
@@ -87,6 +124,9 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
 }
 
 TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
+TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+DECISION_FA = {"ENTER": "ورود", "CONDITIONAL": "شرطی (هنوز ورود نکن)", "NO_ENTRY": "ورود نکن"}
+REGIME_FA = {"DEAD": "مرده", "QUIET": "فشرده", "NORMAL": "عادی", "WILD": "پرنوسان"}
 
 
 class ScanError(Exception):
@@ -220,53 +260,23 @@ def fetch_price(symbol: str) -> Optional[float]:
     return None
 
 
+def fetch_pairs() -> Optional[set]:
+    """Best-effort list of LBank spot pairs; None if unavailable (then no filtering)."""
+    try:
+        data = http_json(LBANK_BASE + "/v2/currencyPairs.do")
+    except ScanError as e:
+        log.warning("pair list unavailable: %s", e)
+        return None
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    pairs = {str(x).lower() for x in items if isinstance(x, str)}
+    return pairs if "btc_usdt" in pairs else None
+
+
 # --------------------------------------------------------------------------
-# Indicators
+# ATR / volume (filters only)
 # --------------------------------------------------------------------------
-def ema(values: List[float], n: int) -> List[float]:
-    if not values:
-        return []
-    k = 2.0 / (n + 1)
-    out = [values[0]]
-    for x in values[1:]:
-        out.append(x * k + out[-1] * (1 - k))
-    return out
-
-
-def _rsi_val(ag: float, al: float) -> float:
-    if al == 0:
-        return 100.0 if ag > 0 else 50.0
-    return 100.0 - 100.0 / (1.0 + ag / al)
-
-
-def rsi(closes: List[float], n: int = 14) -> List[float]:
-    if len(closes) <= n:
-        return [50.0] * len(closes)
-    gains = losses = 0.0
-    for i in range(1, n + 1):
-        d = closes[i] - closes[i - 1]
-        gains += max(d, 0.0)
-        losses += max(-d, 0.0)
-    ag, al = gains / n, losses / n
-    out = [50.0] * n
-    out.append(_rsi_val(ag, al))
-    for i in range(n + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        ag = (ag * (n - 1) + max(d, 0.0)) / n
-        al = (al * (n - 1) + max(-d, 0.0)) / n
-        out.append(_rsi_val(ag, al))
-    return out
-
-
-def macd(closes: List[float], fast: int = 12, slow: int = 26, sig: int = 9
-         ) -> Tuple[List[float], List[float], List[float]]:
-    ef, es = ema(closes, fast), ema(closes, slow)
-    line = [a - b for a, b in zip(ef, es)]
-    signal = ema(line, sig)
-    hist = [a - b for a, b in zip(line, signal)]
-    return line, signal, hist
-
-
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
     for i in range(1, len(c)):
@@ -327,31 +337,59 @@ def structure_dir(highs: List[Tuple[int, float]], lows: List[Tuple[int, float]])
     return 0
 
 
+def structure_trend(c: List[float], highs: List[Tuple[int, float]],
+                    lows: List[Tuple[int, float]]) -> str:
+    """Pure price-action trend: HH/HL = UP, LH/LL = DOWN; a close beyond the last
+    opposite swing (CHoCH) turns the trend into RANGE."""
+    if not highs or not lows:
+        return "RANGE"
+    st = structure_dir(highs, lows)
+    last = c[-1]
+    if st == 1:
+        return "RANGE" if last < lows[-1][1] else "UP"
+    if st == -1:
+        return "RANGE" if last > highs[-1][1] else "DOWN"
+    if last > highs[-1][1]:
+        return "UP"
+    if last < lows[-1][1]:
+        return "DOWN"
+    return "RANGE"
+
+
+def filter_swings_amp(h: List[float], l: List[float], highs, lows, at: List[float], min_amp: float):
+    """Keep only swings followed by a real move (>= min_amp x ATR) within 10 candles.
+    min_amp <= 0 disables the filter (default)."""
+    if min_amp <= 0:
+        return highs, lows
+
+    def amp_ok(i: int, price: float, is_high: bool) -> bool:
+        a = at[i] if i < len(at) else at[-1]
+        for j in range(i + 1, min(len(h), i + 11)):
+            if is_high and price - min(l[i:j + 1]) >= min_amp * a:
+                return True
+            if (not is_high) and max(h[i:j + 1]) - price >= min_amp * a:
+                return True
+        return False
+
+    return ([p for p in highs if amp_ok(p[0], p[1], True)],
+            [p for p in lows if amp_ok(p[0], p[1], False)])
+
+
 def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
     c, h, l = cs.c, cs.h, cs.l
-    e20, e50, e200 = ema(c, 20), ema(c, 50), ema(c, 200)
-    rs = rsi(c)
-    ml, ms, mh = macd(c)
     at = atr(h, l, c)
     highs, lows = find_swings(h, l, 2 if name == "4h" else 3)
+    highs, lows = filter_swings_amp(h, l, highs, lows, at, SWING_MIN_AMP)
     st = structure_dir(highs, lows)
-    pts = 0
-    pts += 1 if c[-1] > e50[-1] else -1
-    pts += 1 if e20[-1] > e50[-1] else -1
-    pts += 1 if c[-1] > e200[-1] else -1
-    pts += 2 * st
-    trend = "UP" if pts >= 3 else "DOWN" if pts <= -3 else "RANGE"
+    recent_atr = at[-100:]
+    atr_rank = sum(1 for x in recent_atr if x <= at[-1]) / float(len(recent_atr))
+    trend = structure_trend(c, highs, lows)
     return {
         "name": name, "cs": cs, "close": c[-1],
-        "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
-        "rsi": rs[-1], "macd": ml[-1], "macd_sig": ms[-1],
-        "hist": mh[-1], "hist_prev": mh[-2] if len(mh) > 1 else mh[-1],
         "atr": max(at[-1], c[-1] * 1e-6), "vol_ratio": volume_ratio(cs.v),
         "highs": highs, "lows": lows, "struct": st, "trend": trend,
-        "trend_pts": pts,
+        "atr_rank": atr_rank, "atr_list": at,
     }
-
-
 # --------------------------------------------------------------------------
 # Smart-money concepts
 # --------------------------------------------------------------------------
@@ -381,24 +419,26 @@ def detect_sweep(d: Dict[str, Any], side: str, lookback: int) -> Optional[Dict[s
 
 
 def detect_mss(d: Dict[str, Any], side: str, sweep: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Market structure shift after a sweep: close beyond the last opposite swing."""
+    """MSS: strong-bodied close beyond the last opposite swing, shortly after the sweep."""
     cs: Candles = d["cs"]
+    a = d["atr"]
     j = sweep["idx"]
+    end = min(len(cs), j + MSS_MAX_DELAY + 1)
     if side == "LONG":
         prior = [p for p in d["highs"] if p[0] < j]
         if not prior:
             return None
         lvl = prior[-1][1]
-        for k in range(j, len(cs)):
-            if cs.c[k] > lvl:
+        for k in range(j, end):
+            if cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     else:
         prior = [p for p in d["lows"] if p[0] < j]
         if not prior:
             return None
         lvl = prior[-1][1]
-        for k in range(j, len(cs)):
-            if cs.c[k] < lvl:
+        for k in range(j, end):
+            if cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
                 return {"idx": k, "level": lvl, "tf": d["name"]}
     return None
 
@@ -526,19 +566,272 @@ def liquidity_map(d: Dict[str, Any], price: float) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # Scenario evaluation
 # --------------------------------------------------------------------------
-def global_blockers(D: Dict[str, Dict[str, Any]], price: float) -> List[str]:
+def squeeze_info(d: Dict[str, Any], n: int = BREAKOUT_WINDOW) -> Dict[str, float]:
+    """Current n-candle range, in ATR and as a percentile of this symbol's own
+    recent n-candle ranges (adaptive: no fixed threshold shared by all coins)."""
+    cs: Candles = d["cs"]
+    total = len(cs)
+    hi, lo = max(cs.h[-n:]), min(cs.l[-n:])
+    cur = hi - lo
+    start = max(n, total - 200)
+    ranges = [max(cs.h[i - n:i]) - min(cs.l[i - n:i]) for i in range(start, total + 1)]
+    rank = sum(1 for x in ranges if x <= cur) / float(len(ranges))
+    return {"hi": hi, "lo": lo, "range_atr": cur / d["atr"], "range_rank": rank}
+
+
+def detect_breakout(d: Dict[str, Any], within: int = 3) -> Optional[Dict[str, Any]]:
+    """Valid breakout from a compression: strong-bodied close beyond the prior
+    20-candle range (which was tight vs this symbol's own history) with
+    above-average volume, still outside the range now."""
+    cs: Candles = d["cs"]
+    at: List[float] = d["atr_list"]
+    n = len(cs)
+    w = BREAKOUT_WINDOW
+    ranges: Dict[int, float] = {}
+    for j in range(max(w, n - 1 - within - 200), n):
+        ranges[j] = max(cs.h[j - w:j]) - min(cs.l[j - w:j])
+    for k in range(n - 1, n - 1 - within, -1):
+        if k - w < 1 or k not in ranges:
+            break
+        hi, lo = max(cs.h[k - w:k]), min(cs.l[k - w:k])
+        a = at[k - 1]
+        if a <= 0:
+            continue
+        hist = [v for j, v in ranges.items() if j <= k]
+        rank = sum(1 for v in hist if v <= ranges[k]) / float(len(hist))
+        if rank > BREAKOUT_MAX_RANK:
+            continue
+        vmean = sum(cs.v[k - w:k]) / float(w)
+        if vmean <= 0 or cs.v[k] < BREAKOUT_MIN_VOL * vmean:
+            continue
+        body = cs.c[k] - cs.o[k]
+        if cs.c[k] > hi and body >= MSS_MIN_BODY * a and cs.c[-1] > hi:
+            return {"dir": "UP", "idx": k, "level": hi, "range_hi": hi, "range_lo": lo}
+        if cs.c[k] < lo and -body >= MSS_MIN_BODY * a and cs.c[-1] < lo:
+            return {"dir": "DOWN", "idx": k, "level": lo, "range_hi": hi, "range_lo": lo}
+    return None
+
+
+def classify_regime(D: Dict[str, Dict[str, Any]], price: float) -> Dict[str, Any]:
+    """DEAD (untradable), QUIET (compressed: only a valid breakout may trade),
+    NORMAL, WILD (too volatile)."""
+    d15 = D["15m"]
+    atr_pct = d15["atr"] / price
+    sq = squeeze_info(d15)
+    bo = detect_breakout(d15)
+    quiet = d15["atr_rank"] < MIN_ATR_RANK or sq["range_rank"] < QUIET_RANGE_RANK
+    if atr_pct < MIN_ATR_PCT:
+        name = "DEAD"
+    elif atr_pct > MAX_ATR_PCT:
+        name = "WILD"
+    elif quiet:
+        name = "QUIET"
+    else:
+        name = "NORMAL"
+    return {"name": name, "breakout": bo, "squeeze": sq, "atr_pct": atr_pct}
+
+
+def global_blockers(D: Dict[str, Dict[str, Any]], price: float,
+                    regime: Dict[str, Any]) -> List[str]:
     out: List[str] = []
     d15, d5 = D["15m"], D["5m"]
-    atr_pct = d15["atr"] / price
-    if atr_pct < MIN_ATR_PCT:
-        out.append("نوسان بازار خیلی کم است")
-    elif atr_pct > MAX_ATR_PCT:
+    if regime["name"] == "DEAD":
+        out.append("نوسان بازار خیلی کم است (بازار مرده)")
+    elif regime["name"] == "WILD":
         out.append("نوسان بازار بیش‌ازحد زیاد است")
-    if d15["vol_ratio"] < MIN_VOL_RATIO:
+    if d15["vol_ratio"] < MIN_VOL_RATIO and not regime["breakout"]:
         out.append("حجم معاملات ضعیف است")
     cs5: Candles = d5["cs"]
-    if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"]:
-        out.append("کندل اسپایک اخیر در 5m؛ صبر برای آرام‌شدن بازار")
+    cs15: Candles = d15["cs"]
+    if (cs5.h[-1] - cs5.l[-1]) > 4.0 * d5["atr"] or (cs15.h[-1] - cs15.l[-1]) > 4.0 * d15["atr"]:
+        out.append("کندل اسپایک اخیر؛ صبر برای آرام‌شدن بازار")
+    return out
+
+
+def _ema(values: List[float], n: int) -> List[float]:
+    if not values:
+        return []
+    k = 2.0 / (n + 1)
+    out = [values[0]]
+    for x in values[1:]:
+        out.append(x * k + out[-1] * (1 - k))
+    return out
+
+
+def _rsi_last(closes: List[float], n: int = 14) -> float:
+    if len(closes) <= n:
+        return 50.0
+    gains = losses = 0.0
+    for i in range(1, n + 1):
+        d = closes[i] - closes[i - 1]
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    ag, al = gains / n, losses / n
+    for i in range(n + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        ag = (ag * (n - 1) + max(d, 0.0)) / n
+        al = (al * (n - 1) + max(-d, 0.0)) / n
+    if al == 0:
+        return 100.0 if ag > 0 else 50.0
+    return 100.0 - 100.0 / (1.0 + ag / al)
+
+
+def _macd_hist_pair(closes: List[float]) -> Tuple[float, float]:
+    ef, es = _ema(closes, 12), _ema(closes, 26)
+    line = [a - b for a, b in zip(ef, es)]
+    sig = _ema(line, 9)
+    hist = [a - b for a, b in zip(line, sig)]
+    return hist[-1], hist[-2] if len(hist) > 1 else hist[-1]
+
+
+def indicator_info(D: Dict[str, Dict[str, Any]], side: str) -> Dict[str, Any]:
+    """Optional confirmation layer (EMA, RSI, MACD on 15m; EMA on 1H). Price action stays
+    primary. Each check is reported; they block only when INDICATOR_FILTER=1."""
+    long = side == "LONG"
+    c15 = D["15m"]["cs"].c
+    c1 = D["1h"]["cs"].c
+    e20 = _ema(c15, 20)[-1]
+    e50 = _ema(c15, 50)[-1]
+    rsi = _rsi_last(c15)
+    h_now, h_prev = _macd_hist_pair(c15)
+    e1_50 = _ema(c1, 50)[-1]
+    checks = {
+        "EMA15": (c15[-1] > e50 and e20 > e50) if long else (c15[-1] < e50 and e20 < e50),
+        "RSI": (45 <= rsi <= 70) if long else (30 <= rsi <= 55),
+        "MACD": (h_now > 0 and h_now >= h_prev) if long else (h_now < 0 and h_now <= h_prev),
+        "EMA1H": (c1[-1] > e1_50) if long else (c1[-1] < e1_50),
+    }
+    passed = sum(1 for v in checks.values() if v)
+    failed = [k for k, v in checks.items() if not v]
+    return {"checks": checks, "passed": passed, "total": len(checks), "failed": failed,
+            "ok": passed >= 3, "rsi": rsi, "ema20": e20, "ema50": e50}
+
+
+def fib_info(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Dict[str, Any]:
+    """Fibonacci layer on the 1H impulse: pullback zone (0.618-0.786), extension
+    targets (1.272 / 1.618 from the pullback point) and overlap with 15m/5m OB/FVG.
+    Always computed; affects decisions only when FIB_CONFIRM=1."""
+    long = side == "LONG"
+    out: Dict[str, Any] = {"valid": False, "retr": None, "zone": None, "targets": [],
+                           "overlap": False, "in_zone": False, "pts": 0}
+    d1, d15, d5 = D["1h"], D["15m"], D["5m"]
+    if long:
+        if not d1["highs"] or not d1["lows"]:
+            return out
+        bi, bp = d1["highs"][-1]
+        prev = [p for p in d1["lows"] if p[0] < bi]
+        after = [p for p in d1["lows"] if p[0] > bi]
+        if not prev or not after:
+            return out
+        ap, cp = prev[-1][1], after[-1][1]
+        diff = bp - ap
+        if diff <= 0:
+            return out
+        retr = (bp - cp) / diff
+        zone = (bp - 0.786 * diff, bp - 0.618 * diff)
+        targets = [(k, cp + k * diff) for k in FIB_EXT_LEVELS if cp + k * diff > price]
+    else:
+        if not d1["lows"] or not d1["highs"]:
+            return out
+        bi, bp = d1["lows"][-1]
+        prev = [p for p in d1["highs"] if p[0] < bi]
+        after = [p for p in d1["highs"] if p[0] > bi]
+        if not prev or not after:
+            return out
+        ap, cp = prev[-1][1], after[-1][1]
+        diff = ap - bp
+        if diff <= 0:
+            return out
+        retr = (cp - bp) / diff
+        zone = (bp + 0.618 * diff, bp + 0.786 * diff)
+        targets = [(k, cp - k * diff) for k in FIB_EXT_LEVELS if cp - k * diff < price]
+    zlo, zhi = zone
+    valid = 0.3 <= retr <= 0.9
+    atr15 = d15["atr"]
+    overlap = any(max(z["bottom"], zlo) < min(z["top"], zhi)
+                  for z in _zones_for(d15, side) + _zones_for(d5, side))
+    in_zone = (zlo - 0.25 * atr15) <= price <= (zhi + 0.25 * atr15)
+    pts = 0
+    if valid and in_zone:
+        pts = FIB_PTS_OVERLAP if overlap else FIB_PTS_ZONE
+    out.update({"valid": valid, "retr": retr, "zone": zone, "targets": targets,
+                "overlap": overlap, "in_zone": in_zone, "pts": pts,
+                "impulse": (ap, bp, cp, diff)})
+    return out
+
+
+def fib_plan(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Optional[Dict[str, Any]]:
+    """Waiting plan from the 1H impulse (planning only, never creates a signal).
+    Entry at the 0.618 pullback; stop beyond the 0.786 level plus 0.25 ATR(15m);
+    TP1 = prior structural extreme of the impulse, TP2 = 1.272 extension of the impulse.
+    Each target must have positive net RR above TP_MIN_RR_NET."""
+    f = fib_info(D, side, price)
+    if not f.get("impulse") or not f["valid"]:
+        return None
+    long = side == "LONG"
+    a, b, c, diff = f["impulse"]
+    atr15 = D["15m"]["atr"]
+    zlo, zhi = f["zone"]
+    if long:
+        entry = b - 0.618 * diff
+        deep = b - 0.786 * diff
+        sl = deep - 0.25 * atr15
+        cand = [b, a + 1.272 * diff]
+    else:
+        entry = b + 0.618 * diff
+        deep = b + 0.786 * diff
+        sl = deep + 0.25 * atr15
+        cand = [b, a - 1.272 * diff]
+    if (long and not sl < entry) or ((not long) and not sl > entry):
+        return None
+    risk_pct = abs(sl - entry) / entry * 100.0
+    cost = 2.0 * FEE_PCT
+    tps: List[Tuple[float, float]] = []
+    for t in cand:
+        on_side = t > entry if long else t < entry
+        if not on_side:
+            tps.append((None, None))
+            continue
+        rr = (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+        tps.append((t, rr) if rr >= TP_MIN_RR_NET else (None, None))
+    margin = 0.25 * atr15
+    if long:
+        if price > zhi + margin:
+            status = "منتظر پولبک به ۰.۶۱۸ (فاصله %.2f%%)" % ((price - entry) / entry * 100.0)
+        elif price >= zlo - margin:
+            status = "در ناحیه‌ی ۰.۶۱۸ تا ۰.۷۸۶: منتظر تأیید 5m (MSS + کندل بدنه‌دار هم‌جهت)"
+        else:
+            status = "پولبک عمیق‌تر از ۰.۷۸۶: طرح باطل"
+    else:
+        if price < zlo - margin:
+            status = "منتظر پولبک به ۰.۶۱۸ (فاصله %.2f%%)" % ((entry - price) / entry * 100.0)
+        elif price <= zhi + margin:
+            status = "در ناحیه‌ی ۰.۶۱۸ تا ۰.۷۸۶: منتظر تأیید 5m (MSS + کندل بدنه‌دار هم‌جهت)"
+        else:
+            status = "پولبک عمیق‌تر از ۰.۷۸۶: طرح باطل"
+    return {"entry": entry, "sl": sl, "stop_pct": risk_pct,
+            "tp1": tps[0][0], "tp1_rr": tps[0][1], "tp2": tps[1][0], "tp2_rr": tps[1][1],
+            "zone": (zlo, zhi), "status": status}
+def pick_targets(levels: List[float], entry: float, risk: float, long: bool,
+                 fee_pct: float) -> List[Tuple[float, float]]:
+    """Nearest structural levels in the trade direction whose NET reward/risk is positive.
+    Returns up to two (price, rr_net). Invalid or negative-RR levels are skipped."""
+    cost = 2.0 * fee_pct
+    risk_pct = risk / entry * 100.0
+    pool = sorted([p for p in levels if (p > entry if long else p < entry)], reverse=not long)
+    out: List[Tuple[float, float]] = []
+    last = 0.0
+    for p in pool:
+        dist = abs(p - entry) / entry * 100.0
+        rr = (dist - cost) / (risk_pct + cost)
+        # the second target must sit at least 0.5R beyond the first (no near-duplicate TP2)
+        min_gap = 0.5 * risk_pct if out else 0.0
+        if rr < TP_MIN_RR_NET or rr > MAX_TP_RR or dist <= last or dist < last + min_gap:
+            continue
+        out.append((p, rr))
+        last = dist
+        if len(out) == 2:
+            break
     return out
 
 
@@ -549,9 +842,9 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     atr15 = d15["atr"]
     notes: List[str] = []
     blockers: List[str] = []
+    soft: List[str] = []
     parts: Dict[str, float] = {}
 
-    # 1) Higher-timeframe alignment (25)
     s4 = 12 if d4["trend"] == want else 4 if d4["trend"] == "RANGE" else 0
     s1 = 13 if d1["trend"] == want else 5 if d1["trend"] == "RANGE" else 0
     parts["htf"] = s4 + s1
@@ -562,14 +855,13 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     else:
         notes.append("روند 4H: %s | 1H: %s" % (TREND_FA[d4["trend"]], TREND_FA[d1["trend"]]))
 
-    # 2) Liquidity sweep (15) and 3) MSS / BOS (15)
     pairs = []
     sw15 = detect_sweep(d15, side, 12)
     sw5 = detect_sweep(d5, side, 24)
     if sw15:
         pairs.append((d15, sw15, 15))
     if sw5:
-        pairs.append((d5, sw5, 10))
+        pairs.append((d5, sw5, 8))
     chosen = None
     chosen_mss = None
     for d, sw, pts in pairs:
@@ -582,21 +874,34 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     sweep = chosen[1] if chosen else None
     parts["sweep"] = float(chosen[2]) if chosen else 0.0
     parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
+    if chosen and detect_sweep(d1, side, 4):
+        parts["sweep"] = min(15.0, parts["sweep"] + 5.0)
+        notes.append("Sweep هم‌زمان روی نقدینگی 1H")
     bos = None
     if sweep:
         notes.append("Liquidity Sweep در %s %s" % (sweep["tf"], "(نقدینگی فروش)" if long else "(نقدینگی خرید)"))
     if chosen_mss:
-        notes.append("MSS تأیید شد (%s)" % chosen_mss[0]["tf"])
+        notes.append("MSS قوی تأیید شد (%s)" % chosen_mss[0]["tf"])
+        lvl_mss = chosen_mss[0]["level"]
+        moved = (price - lvl_mss) if long else (lvl_mss - price)
+        if moved > 2.0 * atr15:
+            blockers.append("ورود دیرهنگام: قیمت بیش از 2 ATR از سطح MSS دور شده")
     elif aligned == 2:
         bos = detect_bos(d15, side, 6)
         if bos:
             parts["mss"] = 8.0
             notes.append("BOS ادامه‌دهنده در 15m")
+    if d15["struct"] == (-1 if long else 1):
+        blockers.append("ساختار 15m خلاف جهت سناریو است (ضد روند)")
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
     if not structure_ok:
-        blockers.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
+        soft.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
+    fib = fib_info(D, side, price)
+    ind = indicator_info(D, side)
+    if INDICATOR_FILTER and not ind["ok"]:
+        blockers.append("فیلتر اندیکاتور: %d از %d تأیید (ناموفق: %s)" % (
+            ind["passed"], ind["total"], "، ".join(ind["failed"])))
 
-    # 4) Zone (15) -> entry
     zone = pick_zone([d15, d5], side, price, atr15)
     if zone:
         inside = zone["bottom"] <= price <= zone["top"]
@@ -609,7 +914,6 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         entry = price
         parts["zone"] = 3.0 if structure_ok else 0.0
 
-    # 5) Stop / targets
     refs: List[float] = []
     if zone:
         refs.append(zone["bottom"] if long else zone["top"])
@@ -626,35 +930,45 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     buf = 0.25 * atr15
     sl = ref - buf if long else ref + buf
     risk = abs(entry - sl)
-    if risk < MIN_STOP_ATR * atr15:
-        risk = MIN_STOP_ATR * atr15
+    min_risk = max(MIN_STOP_ATR * atr15, MIN_STOP_PCT / 100.0 * entry, 0.2 * d1["atr"])
+    if risk < min_risk:
+        risk = min_risk
         sl = entry - risk if long else entry + risk
+        notes.append("حد ضرر به حداقل مجاز گسترش یافت (%.2f%%)" % (risk / entry * 100.0))
+    draft = {"entry": entry, "sl": sl, "stop_pct": risk / entry * 100.0}
     trade: Optional[Dict[str, Any]] = None
     if risk > MAX_STOP_ATR * atr15 or risk / entry * 100.0 > MAX_STOP_PCT:
         blockers.append("فاصله حد ضرر بیش از حد مجاز است (%.2f%%)" % (risk / entry * 100.0))
     else:
         levels = collect_levels(D)
-        cands = [p for p in levels if (p > entry if long else p < entry)]
-        if not long:
-            cands.sort(reverse=True)
-        sign = 1.0 if long else -1.0
-        tp1 = next((p for p in cands if 1.2 * risk <= sign * (p - entry) <= 2.2 * risk),
-                   entry + sign * 1.5 * risk)
-        tp2 = next((p for p in cands if 2.5 * risk <= sign * (p - entry) <= 4.0 * risk),
-                   entry + sign * 3.0 * risk)
-        rr1 = abs(tp1 - entry) / risk
-        rr2 = abs(tp2 - entry) / risk
-        stop_pct = risk / entry
-        notional_mult = (RISK_PCT / 100.0) / stop_pct
+        if FIB_CONFIRM and fib["valid"]:
+            levels = levels + [p for _, p in fib["targets"]]
+        targets = pick_targets(levels, entry, risk, long, FEE_PCT)
+        risk_pct = risk / entry * 100.0
+        cost = 2.0 * FEE_PCT
+        total_stop = (risk_pct + cost) / 100.0
+        notional_mult = (RISK_PCT / 100.0) / total_stop
         lev = min(MAX_LEVERAGE, notional_mult)
-        eff_risk = lev * stop_pct * 100.0
+        eff_risk = lev * total_stop * 100.0
         order_type = "LIMIT" if abs(entry - price) > 0.05 * atr15 else "MARKET"
-        trade = {
-            "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2,
-            "stop_pct": stop_pct * 100.0, "order_type": order_type,
-            "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
-        }
-        # room to HTF obstacle
+        if not targets:
+            blockers.append("تارگت معتبر با RR خالص مثبت پیدا نشد")
+        else:
+            tp1, rr1n = targets[0]
+            tp2, rr2n = targets[1] if len(targets) > 1 else (None, None)
+            trade = {
+                "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+                "rr1": abs(tp1 - entry) / risk,
+                "rr2": (abs(tp2 - entry) / risk) if tp2 is not None else None,
+                "rr1n": rr1n, "rr2n": rr2n, "cost_pct": cost,
+                "stop_pct": risk_pct, "order_type": order_type,
+                "notional_x": lev, "eff_risk_pct": eff_risk, "capped": notional_mult > MAX_LEVERAGE,
+                "tp2_ok": tp2 is not None,
+            }
+            if tp2 is None:
+                blockers.append("تارگت دوم معتبر پیدا نشد")
+            elif rr2n < MIN_RR2_NET:
+                blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
         htf = collect_levels(D, htf_only=True)
         obst = [p for p in htf if (p > entry if long else p < entry)]
         if obst:
@@ -668,63 +982,378 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         elif room_r < 1.2:
             notes.append("مانع HTF نسبتاً نزدیک است")
     parts.setdefault("room", 0.0)
-    if trade:
-        rr = trade["rr2"]
-        parts["rr"] = 10.0 if rr >= 3 else 8.0 if rr >= 2.5 else 6.0 if rr >= 2 else 3.0 if rr >= 1.5 else 0.0
+    if trade and trade["rr2n"] is not None:
+        rr = trade["rr2n"]
+        parts["rr"] = 10.0 if rr >= 2.5 else 8.0 if rr >= 2.0 else 6.0 if rr >= 1.5 else 3.0 if rr >= 1.0 else 0.0
     else:
         parts["rr"] = 0.0
 
-    # 6) Momentum (10)
+    cs15: Candles = d15["cs"]
+    n15 = len(cs15)
+    sgn = 1.0 if long else -1.0
     mom = 0.0
-    if (d15["ema20"] > d15["ema50"]) == long:
-        mom += 3
-    r = d15["rsi"]
-    if (long and 45 <= r <= 70) or (not long and 30 <= r <= 55):
-        mom += 3
-    hist, hprev = d15["hist"], d15["hist_prev"]
-    if long:
-        mom += 4 if hist > 0 and hist >= hprev else 2 if hist > 0 else 0
-    else:
-        mom += 4 if hist < 0 and hist <= hprev else 2 if hist < 0 else 0
+    if any(sgn * (cs15.c[k] - cs15.o[k]) >= 0.8 * atr15 for k in range(n15 - 6, n15)):
+        mom += 6
+    if sum(sgn * (cs15.c[k] - cs15.o[k]) for k in range(n15 - 3, n15)) >= 0.3 * atr15:
+        mom += 4
+    if d5["struct"] == (1 if long else -1):
+        mom += 5
+    if FIB_CONFIRM:
+        mom = min(mom, 10.0)
     parts["momentum"] = mom
-    if mom >= 7:
-        notes.append("مومنتوم 15m تأیید می‌کند (RSI %.0f)" % r)
-
-    # 7) Volume (5)
-    vr = d15["vol_ratio"]
-    parts["volume"] = 5.0 if vr >= 1.2 else 3.0 if vr >= 0.8 else 1.0 if vr >= MIN_VOL_RATIO else 0.0
-    if vr >= 1.2:
-        notes.append("حجم بالاتر از میانگین (x%.2f)" % vr)
+    if not (d5["struct"] == (1 if long else -1) and mom >= 10):
+        soft.append("تأیید ساختار 5m و مومنتوم کافی نیست")
+    parts["fib"] = float(fib["pts"]) if FIB_CONFIRM else 0.0
+    if mom >= 10:
+        notes.append("مومنتوم پرایس‌اکشن: جابه‌جایی هم‌جهت و ساختار 5m هم‌راستا")
+    if d15["vol_ratio"] >= 1.2:
+        notes.append("حجم بالاتر از میانگین (x%.2f)" % d15["vol_ratio"])
 
     score = int(round(sum(parts.values())))
+    if not structure_ok:
+        score = min(score, STRUCT_CAP)
     return {"side": side, "score": score, "parts": parts, "notes": notes,
-            "blockers": blockers, "trade": trade, "zone": zone, "sweep": sweep}
+            "blockers": blockers, "soft_blockers": soft, "trade": trade,
+            "zone": zone, "sweep": sweep, "fib": fib, "ind": ind, "draft": draft}
+
+
+PART_MAX = {"htf": 25, "sweep": 15, "mss": 15, "zone": 15,
+            "momentum": 10 if FIB_CONFIRM else 15, "rr": 10, "room": 5,
+            "fib": FIB_PTS_OVERLAP if FIB_CONFIRM else 0}
+PART_HINT = {
+    "htf": "هم‌راستاشدن روند 4H/1H",
+    "sweep": "Sweep نقدینگی",
+    "mss": "MSS قوی",
+    "zone": "برگشت قیمت به ناحیه OB/FVG",
+    "momentum": "کندل‌های جابه‌جایی هم‌جهت و ساختار 5m",
+    "rr": "RR خالص بهتر",
+    "room": "فضای بیشتر تا مانع HTF",
+    "fib": "تأیید فیبوناچی (ناحیه پولبک + OB/FVG)",
+}
+
+
+def make_watch(res: Dict[str, Any], sc: Dict[str, Any], extra: str = "") -> Dict[str, Any]:
+    liq = res["liq"]
+    if sc["soft_blockers"]:
+        if sc["side"] == "LONG":
+            lvl = liq["ssl"]
+            cond = ("جاروب زیر SSL≈%s، بسته‌شدن دوباره بالای آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                    if lvl is not None else "منتظر Sweep نقدینگی فروش + MSS قوی")
+        else:
+            lvl = liq["bsl"]
+            cond = ("جاروب بالای BSL≈%s، بسته‌شدن دوباره زیر آن، سپس MSS قوی در 5m/15m" % fmt_price(lvl)
+                    if lvl is not None else "منتظر Sweep نقدینگی خرید + MSS قوی")
+    elif sc["score"] >= MIN_SCORE:
+        cond = "امتیاز و ساختار برقرار است؛ فقط محدودیت‌های اسکن مانع صدور شده"
+    else:
+        soon = ("zone", "momentum", "rr", "room")
+        gaps = [(PART_MAX[k] - sc["parts"].get(k, 0.0), k) for k in soon]
+        gaps = sorted([g for g in gaps if g[0] > 0], reverse=True)[:2]
+        txt = ("، ".join("%s (−%d)" % (PART_HINT[k], round(g)) for g, k in gaps)
+               if gaps else "Sweep/MSS یا هم‌راستایی بهتر HTF")
+        cond = "ساختار تأیید شده؛ امتیاز %d از %d (کمبود %d). برای تکمیل: %s" % (
+            sc["score"], MIN_SCORE, MIN_SCORE - sc["score"], txt)
+    return {"side": sc["side"], "score": sc["score"], "trade": sc["trade"],
+            "condition": cond, "extra": extra}
+
+
+def confirm_1m_entry(side: str, entry: float, c1: Optional[Candles]) -> Tuple[bool, str]:
+    """1m trigger on closed candles: touch the entry, close back on the trade side,
+    body >= CONFIRM_BODY x avg body and volume >= CONFIRM_VOL x avg volume."""
+    if c1 is None or len(c1.c) < 25:
+        return False, "کندل ۱m دریافت نشد؛ تأیید ورود انجام نشد"
+    o, h, l, c, v = c1.o[-1], c1.h[-1], c1.l[-1], c1.c[-1], c1.v[-1]
+    avg_body = sum(abs(c1.c[i] - c1.o[i]) for i in range(-21, -1)) / 20.0
+    avg_vol = sum(c1.v[-21:-1]) / 20.0
+    body_ok = avg_body > 0 and abs(c - o) >= CONFIRM_BODY * avg_body
+    vol_ok = avg_vol > 0 and v >= CONFIRM_VOL * avg_vol
+    if side == "SHORT":
+        touched, rejected = h >= entry, (c < o and c < entry)
+    else:
+        touched, rejected = l <= entry, (c > o and c > entry)
+    if touched and rejected and body_ok and vol_ok:
+        return True, "تأیید ۱m: کندل رد بسته‌شده با بدنه و حجم کافی"
+    if not touched:
+        return False, "منتظر رسیدن قیمت به ورود %s (۱m هنوز لمس نکرده)" % fmt_price(entry)
+    return False, "در ناحیه‌ی ورود؛ منتظر کندل ۱m رد با بدنه و حجم کافی"
+
+
+PLAN_FILE = os.getenv("PLAN_FILE", "plans_state.json")
+PLAN_TTL_H = _env_float("PLAN_TTL_H", 12.0)   # a stored entry plan stays fixed for this long (or until it is invalid/hit)
+FIB_MIN_IMPULSE_ATR = _env_float("MIN_IMPULSE_ATR", 1.5)
+FIB_RECENT_BARS = int(_env_float("RECENT_BARS", 120))
+FIB_SL_BUF_ATR = 0.2
+
+
+def recent_impulse(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Last clear impulse (last swing high and low inside the recent window)."""
+    n = len(d["cs"])
+    lo_bar = n - FIB_RECENT_BARS
+    hs = [h for h in d["highs"] if h[0] >= lo_bar]
+    ls = [l for l in d["lows"] if l[0] >= lo_bar]
+    if not hs or not ls:
+        return None
+    hi_i, hi_v = hs[-1]
+    lo_i, lo_v = ls[-1]
+    if lo_i > hi_i:
+        A, B, direction = hi_v, lo_v, "DOWN"
+    else:
+        A, B, direction = lo_v, hi_v, "UP"
+    diff = abs(A - B)
+    if diff < FIB_MIN_IMPULSE_ATR * d["atr"]:
+        return None
+    return {"dir": direction, "A": A, "B": B, "diff": diff, "tf": d["name"]}
+
+
+def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
+    """Entry at 0.618 retrace of the latest impulse, stop beyond 0.786, targets at the
+    impulse extreme (TP1) and the 1.272 extension (TP2). Always produces a plan if an impulse exists."""
+    t1, t4 = D["1h"]["trend"], D["4h"]["trend"]
+    imp = None
+    for tf in ("1h", "4h"):
+        cand = recent_impulse(D[tf])
+        if cand is None:
+            continue
+        agrees = (cand["dir"] == "UP" and t4 != "DOWN" and (t1 == "UP" or (t1 == "RANGE" and t4 == "UP"))) or \
+                 (cand["dir"] == "DOWN" and t4 != "UP" and (t1 == "DOWN" or (t1 == "RANGE" and t4 == "DOWN")))
+        if agrees:
+            imp = cand
+            break
+    if imp is None:
+        return None  # no impulse that agrees with the trend: no point is shown
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    atr15 = D["15m"]["atr"]
+    cost = 2.0 * FEE_PCT
+    if imp["dir"] == "DOWN":
+        side = "SHORT"
+        entry = B + 0.618 * d
+        sl = B + 0.786 * d + FIB_SL_BUF_ATR * atr15
+        tp1, tp2 = B, A - 1.272 * d
+        if price > sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price >= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (بالا)"
+    else:
+        side = "LONG"
+        entry = B - 0.618 * d
+        sl = B - 0.786 * d - FIB_SL_BUF_ATR * atr15
+        tp1, tp2 = B, A + 1.272 * d
+        if price < sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price <= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (پایین)"
+
+    def net(t: float) -> float:
+        risk_pct = abs(sl - entry) / entry * 100.0
+        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+
+    risk_pct = abs(sl - entry) / entry * 100.0
+    confluence = False
+    for dd in (D["15m"], D["5m"]):
+        sw = detect_sweep(dd, side, 24)
+        if sw and detect_mss(dd, side, sw):
+            confluence = True
+            break
+    status = status + (" | تأیید: Sweep + MSS (نقدینگی گرفته شده)" if confluence else " | بدون Sweep+MSS (احتیاط)")
+    if risk_pct > MAX_STOP_PCT:
+        status = status + " | حد ضرر بیش از سقف %.1f%% — ورود معتبر نیست" % MAX_STOP_PCT
+    if risk_pct > MAX_STOP_PCT or abs(entry - price) / price > 0.10:
+        return None
+    return {"side": side, "tf": imp["tf"], "entry": entry, "sl": sl, "risk_pct": risk_pct,
+            "tp1": tp1, "rr1": net(tp1), "tp2": tp2, "rr2": net(tp2),
+            "dist_pct": (entry - price) / price * 100.0, "status": status,
+            "A": A, "B": B}
+
+
+def _plan_status(side: str, entry: float, sl: float, tp1: float, price: float) -> str:
+    if side == "SHORT":
+        if price > sl:
+            return "قیمت از حد ضرر گذشته؛ منقضی"
+        if price <= tp1:
+            return "تارگت اول لمس شده؛ منقضی"
+        return "در ناحیه‌ی ورود؛ منتظر کندل رد" if price >= entry else "منتظر رسیدن قیمت به ورود (بالا)"
+    if price < sl:
+        return "قیمت از حد ضرر گذشته؛ منقضی"
+    if price >= tp1:
+        return "تارگت اول لمس شده؛ منقضی"
+    return "در ناحیه‌ی ورود؛ منتظر کندل رد" if price <= entry else "منتظر رسیدن قیمت به ورود (پایین)"
+
+
+def _load_plans() -> Dict[str, Any]:
+    try:
+        with open(PLAN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+def _save_plans(plans: Dict[str, Any]) -> None:
+    try:
+        with open(PLAN_FILE, "w", encoding="utf-8") as f:
+            json.dump(plans, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log.warning("could not save plans: %s", e)
+
+
+def stable_plan(symbol: str, plan: Optional[Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
+    """Keep the entry/SL/TP of a symbol fixed while the stored plan is still valid.
+    A new plan is stored only when there is no valid one (same side, not hit, not expired)."""
+    if plan is None:
+        return None
+    now = time.time()
+    plans = _load_plans()
+    old = plans.get(symbol)
+    if (old and old.get("side") == plan["side"] and now < old.get("until", 0)
+            and _plan_status(old["side"], old["entry"], old["sl"], old["tp1"], price).find("منقضی") < 0):
+        keep = dict(old)
+        keep["status"] = _plan_status(old["side"], old["entry"], old["sl"], old["tp1"], price)
+        keep["dist_pct"] = (old["entry"] - price) / price * 100.0
+        keep["stored"] = True
+        return keep
+    fresh = dict(plan)
+    fresh["until"] = now + PLAN_TTL_H * 3600.0
+    fresh["since"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fresh["stored"] = False
+    if "منقضی" in fresh["status"]:
+        # an expired plan must not carry a confirmation label
+        fresh["status"] = fresh["status"].split(" | ")[0]
+    if "منقضی" not in _plan_status(plan["side"], plan["entry"], plan["sl"], plan["tp1"], price):
+        plans[symbol] = fresh
+        _save_plans(plans)
+    return fresh
+
+
+FIB_SIGNAL_MODE = os.getenv("FIB_SIGNAL_MODE", "reject").strip().lower()  # reject (default, stricter) | touch
+
+
+def fib_signal_ready(r: Dict[str, Any]) -> bool:
+    """Definite Fibonacci entry.
+    touch  (default): the last closed 15m candle reached the entry level, the plan is still valid
+                      (not stopped out, not expired) -> signal.
+    reject (stricter): price is in the entry zone and the last 15m candle rejected it."""
+    p = r.get("fib_plan")
+    if not p or "منقضی" in p["status"]:
+        return False
+    c15 = r["D"]["15m"]["cs"]
+    o, c, h, l = c15.o[-1], c15.c[-1], c15.h[-1], c15.l[-1]
+    if FIB_SIGNAL_MODE == "reject":
+        if p["side"] == "SHORT":
+            return r["price"] >= p["entry"] and c < o and c < p["entry"]
+        return r["price"] <= p["entry"] and c > o and c > p["entry"]
+    if p["side"] == "SHORT":
+        return h >= p["entry"] and r["price"] < p["sl"]
+    return l <= p["entry"] and r["price"] > p["sl"]
+
+
+SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
+
+
+def log_fib_signals(results: List[Dict[str, Any]]) -> None:
+    """Append every definite Fibonacci signal to a CSV so its outcome can be checked later."""
+    ready = [r for r in results if fib_signal_ready(r)]
+    if not ready:
+        return
+    new_file = (not os.path.exists(SIGNAL_LOG_FILE)) or os.path.getsize(SIGNAL_LOG_FILE) == 0
+    try:
+        with open(SIGNAL_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts_utc", "symbol", "side", "price", "entry", "sl", "tp1", "tp2",
+                            "rr1_net", "rr2_net", "result"])
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for r in ready:
+                p = r["fib_plan"]
+                w.writerow([ts, r["symbol"], p["side"], r["price"], p["entry"], p["sl"],
+                            p["tp1"], p["tp2"], round(p["rr1"], 3), round(p["rr2"], 3), "OPEN"])
+    except OSError as e:
+        log.warning("could not write signal log: %s", e)
+
+
+def format_limit_block(r: Dict[str, Any]) -> List[str]:
+    """Signal in the limit-order layout: id, symbol, side, limit entry, leverage, targets, stop."""
+    p = r["fib_plan"]
+    side_fa = "لانگ" if p["side"] == "LONG" else "شورت"
+    lev = min(MAX_LEVERAGE, RISK_PCT / (p["risk_pct"] + 2.0 * FEE_PCT))
+    trade_id = "TR-%s" % datetime.now(timezone.utc).strftime("%H%M%S")
+    return [
+        "⏳ <b>سفارش لیمیت در انتظار رسیدن قیمت</b>",
+        "شناسه معامله: %s" % trade_id,
+        "نماد: %s" % html.escape(r["symbol"]),
+        "جهت: %s" % side_fa,
+        "ورود لیمیت: <code>%s</code>" % fmt_price(p["entry"]),
+        "اهرم پیشنهادی: %.1fx (بر اساس ریسک %.2f%% و کارمزد)" % (lev, RISK_PCT),
+        "اهداف: 1️⃣ <code>%s</code> (RR %.2f) | 2️⃣ <code>%s</code> (RR %.2f)" % (
+            fmt_price(p["tp1"]), p["rr1"], fmt_price(p["tp2"]), p["rr2"]),
+        "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(p["sl"]), p["risk_pct"]),
+        "شاخص‌ها: %s" % _indicator_line(r, p["side"]),
+    ]
+
+
+def _indicator_line(r: Dict[str, Any], side: str) -> str:
+    ind = indicator_info(r["D"], side)
+    ok = [k for k, v in ind["checks"].items() if v]
+    return "RSI %.0f | تأیید %d از %d (%s)" % (ind["rsi"], ind["passed"], ind["total"],
+                                             "، ".join(ok) if ok else "هیچ‌کدام")
 
 
 def analyze_symbol(symbol: str, min_score: float) -> Dict[str, Any]:
-    D: Dict[str, Dict[str, Any]] = {}
-    for tf in ("4h", "1h", "15m", "5m"):
-        D[tf] = build_tf(fetch_klines(symbol, tf), tf)
+    C = {tf: fetch_klines(symbol, tf) for tf in ("4h", "1h", "15m", "5m")}
+    try:
+        C["1m"] = fetch_klines(symbol, "1m", size=120)
+    except ScanError:
+        C["1m"] = None
+    price = fetch_price(symbol) or C["5m"].c[-1]
+    return analyze_candles(symbol, C, price, min_score)
+
+
+def analyze_candles(symbol: str, C: Dict[str, Candles], price: float, min_score: float) -> Dict[str, Any]:
+    """Same decision logic as the live scan, but on any candle set (live or historical)."""
+    D: Dict[str, Dict[str, Any]] = {tf: build_tf(C[tf], tf) for tf in ("4h", "1h", "15m", "5m")}
     last_close = D["5m"]["close"]
-    price = fetch_price(symbol) or last_close
     if abs(price - last_close) / last_close > 0.02:
         log.warning("%s ticker %.6f deviates from last close %.6f; using close", symbol, price, last_close)
         price = last_close
-    gb = global_blockers(D, price)
+    regime = classify_regime(D, price)
+    gb = global_blockers(D, price, regime)
     scenarios = {s: evaluate_side(s, D, price) for s in ("LONG", "SHORT")}
+    bo = regime["breakout"]
+    for sc in scenarios.values():
+        want_dir = "UP" if sc["side"] == "LONG" else "DOWN"
+        if bo and bo["dir"] == want_dir:
+            sc["notes"].append("شکست معتبر از فشردگی (بدنه‌دار + حجم) بالای/زیر %s" % fmt_price(bo["level"]))
+        elif regime["name"] == "QUIET":
+            sc["blockers"].insert(0, "بازار فشرده؛ ورود فقط پس از شکست معتبر (بدنه‌دار + حجم)")
     signal = None
     for s in sorted(scenarios.values(), key=lambda x: -x["score"]):
-        if s["score"] >= min_score and not s["blockers"] and not gb and s["trade"]:
+        if (s["score"] >= min_score and not s["blockers"] and not s["soft_blockers"]
+                and not gb and s["trade"]):
             signal = s
             break
-    return {"symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
-            "global_blockers": gb, "signal": signal,
-            "liq": liquidity_map(D["15m"], price)}
+    one_min_msg = ""
+    if signal is not None:
+        ok1, one_min_msg = confirm_1m_entry(signal["side"], signal["trade"]["entry"], C.get("1m"))
+        if not ok1:
+            signal = None
+    age_min = (time.time() - (D["5m"]["cs"].t[-1] + TF_MAP["5m"][1])) / 60.0
+    res: Dict[str, Any] = {
+        "symbol": symbol, "price": price, "D": D, "scenarios": scenarios,
+        "global_blockers": gb, "signal": signal, "watch": None,
+        "reason_override": (one_min_msg or None), "data_age_min": age_min, "regime": regime,
+        "liq": liquidity_map(D["15m"], price),
+    }
+    res["fib_plan"] = stable_plan(symbol, fib_point_plan(D, price), price)
+    if not signal and not gb:
+        cands = [s for s in scenarios.values()
+                 if s["trade"] and not s["blockers"] and s["score"] >= WATCH_MIN
+                 and (s["trade"]["rr2n"] or 0.0) >= 1.5]
+        if cands:
+            res["watch"] = make_watch(res, max(cands, key=lambda x: x["score"]))
+    return res
 
 
-# --------------------------------------------------------------------------
-# Telegram formatting / delivery
-# --------------------------------------------------------------------------
 def fmt_price(p: float) -> str:
     if p >= 1000:
         return "%.2f" % p
@@ -740,15 +1369,16 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     long = sc["side"] == "LONG"
     icon = "🟢" if long else "🔴"
     lines = [
-        "%s <b>سیگنال %s — %s</b>" % (icon, sc["side"], html.escape(res["symbol"])),
+        "%s <b>سیگنال قطعی %s — %s</b>" % (icon, sc["side"], html.escape(res["symbol"])),
         "امتیاز: <b>%d/100</b>" % sc["score"],
         "",
         "ورود (%s): <code>%s</code>" % (t["order_type"], fmt_price(t["entry"])),
         "حد ضرر: <code>%s</code> (%.2f%%)" % (fmt_price(t["sl"]), t["stop_pct"]),
-        "TP1: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp1"]), t["rr1"]),
-        "TP2: <code>%s</code> (RR %.2f)" % (fmt_price(t["tp2"]), t["rr2"]),
+        "TP1: <code>%s</code> (RR %.2f | خالص %.2f)" % (fmt_price(t["tp1"]), t["rr1"], t["rr1n"]),
+        "TP2: <code>%s</code> (RR %.2f | خالص %.2f)" % (fmt_price(t["tp2"]), t["rr2"], t["rr2n"]),
+        "(RR خالص بعد از کارمزد رفت‌وبرگشت %.2f%%)" % t["cost_pct"],
         "",
-        "ریسک پیشنهادی: %.2f%% سرمایه | حداکثر اهرم: %.0fx" % (RISK_PCT, MAX_LEVERAGE),
+        "ریسک پیشنهادی: %.2f%% سرمایه (شامل کارمزد) | حداکثر اهرم: %.0fx" % (RISK_PCT, MAX_LEVERAGE),
         "اهرم مؤثر پیشنهادی: %.2fx" % t["notional_x"],
     ]
     if t["capped"]:
@@ -761,56 +1391,601 @@ def format_signal(res: Dict[str, Any], sc: Dict[str, Any]) -> str:
     for n in sc["notes"]:
         lines.append("• " + html.escape(n))
     lines.append("")
-    lines.append("قیمت فعلی: %s" % fmt_price(res["price"]))
+    lines.append("قیمت فعلی: %s | سن داده: %.0f دقیقه" % (fmt_price(res["price"]), max(res["data_age_min"], 0.0)))
     lines.append("اگر قبل از فعال‌شدن ورود، حد ضرر لمس شود سیگنال باطل است.")
     lines.append("⚠️ فقط تحلیل است؛ سفارشی به‌صورت خودکار ثبت نمی‌شود.")
     return "\n".join(lines)
 
 
+def no_signal_reason(res: Dict[str, Any]) -> str:
+    if res.get("reason_override"):
+        return res["reason_override"]
+    if res["global_blockers"]:
+        return res["global_blockers"][0]
+    lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+    best = lg if lg["score"] >= sh["score"] else sh
+    if best["blockers"]:
+        return best["blockers"][0]
+    if best["soft_blockers"]:
+        return best["soft_blockers"][0]
+    return "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
+
+
+def build_card(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Complete trade plan for the dominant side, taken from the scanner's own trade object.
+    Targets are structural and net-RR positive only; a second target is shown only if it is
+    valid. Incomplete confirmations never remove the plan: they are listed as missing items."""
+    ls, ss = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
+    dom = "SHORT" if ss["score"] >= ls["score"] else "LONG"
+    short = dom == "SHORT"
+    sc = ss if short else ls
+    price = res["price"]
+    t = sc["trade"]
+    missing: List[str] = []
+    for m in list(res.get("global_blockers", [])) + list(sc["soft_blockers"]) + list(sc["blockers"]):
+        if m not in missing:
+            missing.append(m)
+    if sc["score"] < MIN_SCORE:
+        missing.append("امتیاز %d از %d (کمبود %d)" % (sc["score"], MIN_SCORE, MIN_SCORE - sc["score"]))
+    if res.get("signal") and res["signal"]["side"] == dom:
+        status = "سیگنال صادر شد"
+    elif missing:
+        status = "در انتظار: " + missing[0]
+    else:
+        status = "شرط‌ها کامل؛ منتظر تأیید نهایی"
+    if res.get("signal") and res["signal"]["side"] == dom:
+        decision = "ENTER"
+    elif t is None:
+        decision = "NO_ENTRY"
+    else:
+        decision = "CONDITIONAL"
+    if t:
+        when = "ورود %s به %s" % ("لیمیت" if t["order_type"] == "LIMIT" else "بازار", fmt_price(t["entry"]))
+        retest = (short and t["entry"] > price) or ((not short) and t["entry"] < price)
+        if retest:
+            activation = ("پولبک به %s و رد سطح با کندل 15m هم‌جهت و حجم ≥ %.1f× میانگین (%s)"
+                          % (fmt_price(t["entry"]), BREAKOUT_MIN_VOL, when))
+        else:
+            side_word = "زیر" if short else "بالای"
+            activation = ("تأیید: کندل 15m بسته‌شده %s %s با حجم ≥ %.1f× میانگین (%s)"
+                          % (side_word, fmt_price(t["entry"]), BREAKOUT_MIN_VOL, when))
+    else:
+        activation = "—"
+    return {"side": dom, "score_short": ss["score"], "score_long": ls["score"], "status": status,
+            "trade": t, "missing": missing, "short": short, "activation": activation,
+            "price": price, "best_score": max(ls["score"], ss["score"]), "decision": decision}
+
+
+def plan_fields(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Standard scenario fields. Entry and SL are ALWAYS shown when a draft exists;
+    TP fields only when a valid structural target exists. Status is explicit:
+    READY / WAIT_CONFIRM / NO_TARGET / INVALID."""
+    c = build_card(res)
+    t = c["trade"]
+    short = c["short"]
+    sc = res["scenarios"]["SHORT" if short else "LONG"]
+    draft = sc.get("draft") or {}
+    atr15 = res["D"]["15m"]["atr"]
+    price = res["price"]
+    off = _env_float("TZ_OFFSET_HOURS", 3.5)
+    exp_t = datetime.now(timezone.utc) + timedelta(hours=off + EXPIRY_H)
+    expiry = exp_t.strftime("%Y-%m-%d %H:%M") + " (محلی)"
+    entry = t["entry"] if t else draft.get("entry")
+    sl = t["sl"] if t else draft.get("sl")
+    stop_pct = t["stop_pct"] if t else draft.get("stop_pct")
+    invalid = sl is not None and ((price < sl) if not short else (price > sl))
+    if invalid:
+        state, label = "INVALID", "طرح باطل (قیمت از حد ضرر گذشته)"
+    elif c["decision"] == "ENTER":
+        state, label = "READY", "آماده ورود (سیگنال قطعی)"
+    elif t is None:
+        state, label = "NO_TARGET", "نقطه‌ی ورود پیش‌نویس؛ تارگت معتبر ندارد"
+    else:
+        if t["rr1n"] < CONDITIONAL_MIN_RR:
+            state, label = "NO_TARGET", "تارگت نزدیک است (RR خالص TP1 کمتر از %.1f)" % CONDITIONAL_MIN_RR
+        else:
+            state, label = "WAIT_CONFIRM", "منتظر تأیید: " + (c["missing"][0] if c["missing"] else "کندل و حجم")
+    zone = None
+    if sc.get("zone"):
+        zone = (sc["zone"]["bottom"], sc["zone"]["top"])
+    if zone is None and entry is not None:
+        zone = (entry - 0.1 * atr15, entry + 0.1 * atr15)
+    side_word = "زیر" if short else "بالای"
+    f = {"side": c["side"], "decision": DECISION_FA[c["decision"]], "expiry": expiry,
+         "missing": c["missing"], "status": label, "state": state, "trade": t,
+         "activation": entry, "zone": zone, "sl": sl, "stop_pct": stop_pct,
+         "tp1": t["tp1"] if t else None, "tp2": (t["tp2"] if (t and t.get("tp2_ok")) else None),
+         "rr1": t["rr1n"] if t else None, "rr2": (t["rr2n"] if (t and t.get("tp2_ok")) else None),
+         "leverage": t["notional_x"] if t else None,
+         "confirmation": "کندل 15m بسته‌شده %s %s با حجم ≥ %.1f× میانگین" % (
+             side_word, fmt_price(entry), BREAKOUT_MIN_VOL) if entry is not None else "—",
+         "invalidation": "کندل 15m بسته‌شده %s %s (حد ضرر)" % (
+             "بالای" if short else "زیر", fmt_price(sl)) if sl is not None else "—"}
+    if entry is not None and ((short and entry > price) or ((not short) and entry < price)):
+        f["confirmation"] = "پولبک به %s و رد سطح با کندل 15m هم‌جهت و حجم ≥ %.1f× میانگین" % (
+            fmt_price(entry), BREAKOUT_MIN_VOL)
+    if t is not None and t["rr1n"] < 1.0:
+        f.update({"state": "NO_TARGET", "status": "هشدار: RR خالص TP1 کمتر از ۱ — ورود پیشنهاد نمی‌شود",
+                  "activation": None, "zone": None, "confirmation": "—", "invalidation": "—"})
+    if t is not None and (t["tp2"] is None or t["rr2n"] is None or t["rr2n"] < 1.5):
+        f["tp2"] = None
+        f["rr2"] = None
+    if t is not None and ((not short and price >= t["tp1"]) or (short and price <= t["tp1"])):
+        f.update({"state": "EXPIRED", "status": "تارگت اول لمس شده؛ طرح منقضی است",
+                  "activation": None, "zone": None, "confirmation": "—", "invalidation": "—"})
+    f["decision"] = {"READY": "ورود", "WAIT_CONFIRM": "منتظر تأیید", "NO_TARGET": "ورود نکن",
+                     "EXPIRED": "منقضی شد", "INVALID": "باطل شد"}.get(f["state"], f["decision"])
+    return f
+
+
+def format_card(res: Dict[str, Any]) -> List[str]:
+    """Standard field card (details / per-symbol view)."""
+    p = plan_fields(res)
+    f = fmt_price
+    lines = [
+        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"], p["decision"],
+                                           html.escape(p["expiry"])),
+    ]
+    if p["activation"] is not None:
+        lines.append("Activation Price: %s" % f(p["activation"]))
+        lines.append("Confirmation: %s" % html.escape(p["confirmation"]))
+        lines.append("Entry Zone: %s – %s" % (f(p["zone"][0]), f(p["zone"][1])))
+        lines.append("Invalidation: %s" % html.escape(p["invalidation"]))
+        lines.append("SL: %s (%.2f%%)" % (f(p["sl"]), p["stop_pct"]))
+        if p["tp1"] is not None:
+            tp2 = ("%s (Net RR %.2f)" % (f(p["tp2"]), p["rr2"])) if p["tp2"] is not None else "— (معتبر پیدا نشد)"
+            lines.append("TP1: %s (Net RR %.2f) | TP2: %s" % (f(p["tp1"]), p["rr1"], tp2))
+            lines.append("Leverage: ≤ %.2fx (ریسک %.2f%% ÷ فاصله‌ی حد ضرر + کارمزد)" % (p["leverage"], RISK_PCT))
+        else:
+            lines.append("TP1 / TP2: — (تارگت ساختاری با RR خالص معتبر پیدا نشد)")
+    lines.append("وضعیت: %s" % html.escape(p["status"]))
+    rest = p["missing"][1:]
+    if rest:
+        lines.append("نواقص دیگر: " + html.escape(" | ".join(rest)))
+    return lines
+
+
+def local_now() -> str:
+    """Report timestamp in the viewer's local time (TZ_OFFSET_HOURS, default +3.5 for Tehran)."""
+    off = _env_float("TZ_OFFSET_HOURS", 3.5)
+    t = datetime.now(timezone.utc) + timedelta(hours=off)
+    sign = "+" if off >= 0 else "-"
+    hh, mm = int(abs(off)), int(round((abs(off) - int(abs(off))) * 60))
+    return t.strftime("%Y-%m-%d %H:%M") + " (UTC%s%02d:%02d)" % (sign, hh, mm)
+
+
+def format_brief(res: Dict[str, Any]) -> List[str]:
+    """Compact Telegram card with the standard fields."""
+    p = plan_fields(res)
+    f = fmt_price
+    D = res["D"]
+    side_key = "LONG" if p["side"] == "LONG" else "SHORT"
+    sc = res["scenarios"][side_key]
+    read = [n for n in sc["notes"] if not n.startswith("حجم") and not n.startswith("مومنتوم")][:3]
+    lines = [
+        "<b>%s</b> | %s | %s | انقضا: %s" % (html.escape(res["symbol"]), p["side"],
+                                          p["decision"], html.escape(p["expiry"])),
+        "روند 4H/1H/15m: %s %s %s" % (TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]],
+                                     TREND_ARROW[D["15m"]["trend"]]),
+    ]
+    lines.insert(1, "قیمت لحظه‌ای: %s" % fmt_price(res["price"]))
+    if read:
+        lines.append("تحلیل: " + html.escape(" | ".join(read)))
+    if p["activation"] is not None:
+        lines.append("Activation: %s | Entry Zone: %s – %s" % (
+            f(p["activation"]), f(p["zone"][0]), f(p["zone"][1])))
+        lines.append("Confirmation: %s" % html.escape(p["confirmation"]))
+        lines.append("Invalidation: %s" % html.escape(p["invalidation"]))
+        if p["tp1"] is not None:
+            lines.append("SL: %s (%.2f%%) | TP1: %s | TP2: %s" % (
+                f(p["sl"]), p["stop_pct"], f(p["tp1"]),
+                f(p["tp2"]) if p["tp2"] is not None else "—"))
+            lines.append("Net RR: TP1 %.2f%s | Leverage ≤ %.2fx" % (
+                p["rr1"], (" / TP2 %.2f" % p["rr2"]) if p["rr2"] is not None else "", p["leverage"]))
+        else:
+            lines.append("SL: %s (%.2f%%) | TP: — (تارگت معتبر نیست)" % (f(p["sl"]), p["stop_pct"]))
+    lines.append("وضعیت: %s" % html.escape(p["status"]))
+    fp = fib_plan(D, side_key, res["price"]) if p["trade"] is None else None
+    if fp:
+        lines.append("پلن فیبو: %s" % html.escape(fp["status"]))
+    if p["state"] != "READY" and p["missing"]:
+        lines.append("نواقص: " + html.escape(" | ".join(p["missing"][:2])))
+    return lines
+def btc_corr(res: Dict[str, Any], btc: Dict[str, Any], n: int = 96) -> Optional[float]:
+    """Pearson correlation of the last n 15m returns with BTC (None if not computable)."""
+    a = res["D"]["15m"]["cs"].c[-n:]
+    b = btc["D"]["15m"]["cs"].c[-n:]
+    if len(a) < n or len(b) < n:
+        return None
+    ra = [a[i] / a[i - 1] - 1.0 for i in range(1, n)]
+    rb = [b[i] / b[i - 1] - 1.0 for i in range(1, n)]
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va = sum((x - ma) ** 2 for x in ra)
+    vb = sum((y - mb) ** 2 for y in rb)
+    if va <= 0 or vb <= 0:
+        return None
+    return cov / math.sqrt(va * vb)
+
+
+def premium_discount(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
+    """Where price sits inside the last 1H swing range: below 50% = discount (buy zone),
+    above 50% = premium (sell zone). Uses the last swing high and low of 1H."""
+    d1 = D["1h"]
+    if not d1["highs"] or not d1["lows"]:
+        return None
+    hi, lo = d1["highs"][-1][1], d1["lows"][-1][1]
+    if hi <= lo:
+        return None
+    pos = (price - lo) / (hi - lo) * 100.0
+    zone = "پریمیوم (بالا)" if pos > 50 else "دیسکانت (پایین)"
+    return {"pos": pos, "zone": zone, "eq": (hi + lo) / 2.0}
+
+
+def fake_breakout(D: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """A 15m close beyond the last 1H swing that returned inside within 3 candles = fake breakout."""
+    d1, c15 = D["1h"], D["15m"]["cs"]
+    if not d1["highs"] or not d1["lows"]:
+        return None
+    hi, lo = d1["highs"][-1][1], d1["lows"][-1][1]
+    n = len(c15)
+    for k in range(n - 4, n - 1):
+        if c15.c[k] > hi and c15.c[n - 1] < hi:
+            return "شکست فیک به بالای %s" % fmt_price(hi)
+        if c15.c[k] < lo and c15.c[n - 1] > lo:
+            return "شکست فیک به پایین %s" % fmt_price(lo)
+    return None
+
+
+def trader_checklist(r: Dict[str, Any]) -> List[str]:
+    """Step-by-step read of one setup, in the order a trader would check it."""
+    p = r["fib_plan"]
+    side = p["side"]
+    want = "UP" if side == "LONG" else "DOWN"
+    D = r["D"]
+    price = r["price"]
+    bias_ok = D["4h"]["trend"] == want and D["1h"]["trend"] in (want, "RANGE")
+    sw = detect_sweep(D["15m"], side, 24) or detect_sweep(D["5m"], side, 24)
+    liquidity_ok = sw is not None
+    structure_ok = False
+    for dd in (D["15m"], D["5m"]):
+        s_ = detect_sweep(dd, side, 24)
+        if s_ and detect_mss(dd, side, s_):
+            structure_ok = True
+            break
+    if not structure_ok:
+        structure_ok = detect_bos(D["15m"], side, 6) is not None
+    zone_ok = abs(p["dist_pct"]) <= 1.0
+    confirm_ok = fib_signal_ready(r)
+    risk_ok = p["rr1"] >= 1.0 and p["risk_pct"] <= MAX_STOP_PCT
+    mark = lambda ok: "✅" if ok else "❌"
+    pd_ = premium_discount(D, price)
+    fb = fake_breakout(D)
+    extra = []
+    if pd_:
+        good = (side == "LONG" and pd_["pos"] < 50) or (side == "SHORT" and pd_["pos"] > 50)
+        extra.append("  موقعیت در رنج ۱H: %.0f%% (%s) — %s" % (pd_["pos"], pd_["zone"], mark(good)))
+    if fb:
+        extra.append("  هشدار: %s" % fb)
+    return extra + [
+        "%s <b>%s %s</b>" % (mark(bias_ok and risk_ok), html.escape(r["symbol"]), side),
+        "  1) روند بزرگ (4H/1H) هم‌جهت: %s" % mark(bias_ok),
+        "  2) نقدینگی گرفته شده (Sweep): %s" % mark(liquidity_ok),
+        "  3) تغییر ساختار (MSS/BOS): %s" % mark(structure_ok),
+        "  4) قیمت نزدیک ناحیه‌ی ورود (%+.2f%%): %s" % (p["dist_pct"], mark(zone_ok)),
+        "  5) کندل ۱۵m رد داده (تأیید): %s" % mark(confirm_ok),
+        "  6) ریسک: RR خالص TP1 %.2f، حد ضرر %.2f%%: %s" % (p["rr1"], p["risk_pct"], mark(risk_ok)),
+    ]
+
+
+def fib_read_fa(D: Dict[str, Dict[str, Any]], price: float, side: Optional[str]) -> str:
+    """Where price sits on the latest impulse (0.618-0.786 pullback zone is the entry area)."""
+    imp = recent_impulse(D["1h"]) or recent_impulse(D["4h"])
+    if imp is None:
+        return "فیبو: ایمپالس واضح نیست"
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    if imp["dir"] == "UP":
+        ret = (B - price) / d          # pullback down from the high
+        arrow, imp_side = "↑", "LONG"
+    else:
+        ret = (price - B) / d          # pullback up from the low
+        arrow, imp_side = "↓", "SHORT"
+    if 0.618 <= ret <= 0.786:
+        where = "داخل ناحیه‌ی ۰٫۶۱۸–۰٫۷۸۶"
+    elif 0.5 <= ret < 0.618:
+        where = "بین ۰٫۵ و ۰٫۶۱۸"
+    elif ret > 0.786:
+        where = "پولبک عمیق (بالاتر از ۰٫۷۸۶)"
+    elif ret < 0:
+        where = "خارج از ایمپالس (ادامه‌ی حرکت)"
+    else:
+        where = "پولبک کم (زیر ۰٫۵)"
+    align = "هم‌راستا با نظر" if side == imp_side else ("مخالف نظر" if side else "")
+    return "فیبو: %s — ایمپالس ۱H %s %s" % (where, arrow, align)
+
+
+def coin_view_fa(r: Dict[str, Any]) -> str:
+    """One Persian line per coin: which side is better now, why, and the entry if any."""
+    D = r["D"]
+    price = r["price"]
+    arrow = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
+    score = 0
+    for tf, w in (("4h", 2), ("1h", 2), ("15m", 1)):
+        t = D[tf]["trend"]
+        score += w if t == "UP" else -w if t == "DOWN" else 0
+    pd_ = premium_discount(D, price)
+    if pd_:
+        score += 1 if pd_["pos"] < 50 else -1 if pd_["pos"] > 50 else 0
+    if score > 0:
+        bias = "لانگ"
+    elif score < 0:
+        bias = "شورت"
+    else:
+        bias = "خنثی"
+    strength = "قوی" if abs(score) >= 3 else "ضعیف" if abs(score) >= 1 else "بدون برتری"
+    side = "LONG" if bias == "لانگ" else "SHORT" if bias == "شورت" else None
+    sweep = "بله" if side and (
+        detect_sweep(D["15m"], side, 24) or detect_sweep(D["5m"], side, 24)) else "خیر"
+    zone = "دیسکانت" if pd_ and pd_["pos"] < 50 else "پریمیوم" if pd_ else "نامشخص"
+    trend = "%s%s%s" % (arrow[D["4h"]["trend"]], arrow[D["1h"]["trend"]], arrow[D["15m"]["trend"]])
+    plan = r.get("fib_plan")
+    if plan and side and plan["side"] == side:
+        entry_txt = "ورود %s (%s)" % (fmt_price(plan["entry"]), plan["status"])
+    elif plan:
+        entry_txt = "نقطه‌ی فیبو مخالف نظر فعلی است (%s)" % plan["side"]
+    else:
+        entry_txt = "نقطه‌ی ورود ندارد"
+    fib_txt = fib_read_fa(D, price, side)
+    return "<b>%s</b>: نظر <b>%s</b> (%s) | روند 4H/1H/15m: %s | موقعیت: %s | Sweep: %s | %s | %s" % (
+        html.escape(r["symbol"]), bias, strength, trend, zone, sweep, html.escape(fib_txt), html.escape(entry_txt))
+
+
+CAPITAL_USDT = _env_float("ACCOUNT_EQUITY_USDT", 1000.0)
+CAPITAL_RISK_PCT = _env_float("CAPITAL_RISK_PCT", 1.0)   # risk per trade as % of capital
+
+
+def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
+    """Complete trade card: side, entry, stop, three targets with net RR, and position size."""
+    p = r.get("fib_plan")
+    if not p:
+        return None
+    side = p["side"]
+    price = r["price"]
+    imp = recent_impulse(r["D"]["1h"]) or recent_impulse(r["D"]["4h"])
+    if imp is None:
+        return None
+    A, B = imp["A"], imp["B"]
+    d = imp["diff"]
+    entry, sl = p["entry"], p["sl"]
+    if side == "SHORT":
+        t1, t2, t3 = B, A - 1.272 * d, A - 1.618 * d
+    else:
+        t1, t2, t3 = B, A + 1.272 * d, A + 1.618 * d
+    cost = 2.0 * FEE_PCT
+    risk_pct = abs(sl - entry) / entry * 100.0
+
+    def rr(t: float) -> float:
+        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
+
+    risk_usdt = CAPITAL_USDT * CAPITAL_RISK_PCT / 100.0
+    notional = risk_usdt / (risk_pct / 100.0 + cost / 100.0)
+    how = "بازار" if abs(entry - price) / price * 100.0 <= 0.1 else "لیمیت"
+    lines = [
+        "<b>%s %s</b> (ورود %s)" % (html.escape(r["symbol"]), side, how),
+        "ورود: <code>%s</code> | حد ضرر: <code>%s</code> (%.2f%%)" % (
+            fmt_price(entry), fmt_price(sl), risk_pct),
+    ]
+    for i, t in enumerate((t1, t2, t3), start=1):
+        ratio = rr(t)
+        flag = "" if ratio >= 1.0 else " ⚠️ RR کمتر از ۱"
+        lines.append("TP%d: <code>%s</code> | RR خالص %.2f%s" % (i, fmt_price(t), ratio, flag))
+    lines.append("ریسک: %.2f%% سرمایه (%.2f واحد) | حجم پوزیشن: %.2f | اهرم پیشنهادی: %.1fx" % (
+        CAPITAL_RISK_PCT, risk_usdt, notional, min(MAX_LEVERAGE, notional / CAPITAL_USDT)))
+    return lines
+
+
+def format_minimal_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
+    """Short Telegram message: only definite signals (limit layout), or one line saying there are none."""
+    lines = ["📊 <b>گزارش اسکن</b> — %s" % local_now()]
+    ready = [r for r in results if fib_signal_ready(r)]
+    conditional = [r for r in results if r not in ready and r.get("fib_plan")
+                   and ("منتظر" in r["fib_plan"]["status"] or "در ناحیه" in r["fib_plan"]["status"])]
+    rejected = [r for r in results if r not in ready and r not in conditional]
+    lines.append("قطعی: %d | شرطی: %d | ردشده: %d" % (len(ready), len(conditional), len(rejected)))
+    full_cards = []
+    for r in results:
+        block = full_entry_block_fa(r)
+        if block:
+            full_cards.append(block)
+    if full_cards:
+        lines.append("")
+        lines.append("🎯 <b>نقطه‌ی ورود کامل (با فیبوناچی)</b>")
+        for block in full_cards[:5]:
+            lines.append("")
+            lines.extend(block)
+    lines.append("")
+    lines.append("🧭 <b>نظر تحلیلی هر ارز</b>")
+    for r in results:
+        try:
+            lines.append(coin_view_fa(r))
+        except Exception:
+            lines.append("%s: تحلیل ناکامل" % html.escape(r["symbol"]))
+    for r in sorted(conditional, key=lambda x: abs(x["fib_plan"]["dist_pct"]))[:3]:
+        p = r["fib_plan"]
+        lines.append("")
+        lines.append("شرطی: %s %s | ورود %s (%+.2f%%) | SL %s | TP1 %s" % (
+            html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), p["dist_pct"],
+            fmt_price(p["sl"]), fmt_price(p["tp1"])))
+        lines.extend(trader_checklist(r))
+    if ready:
+        for r in ready:
+            lines.append("")
+            lines.extend(format_limit_block(r))
+    else:
+        lines.append("⏸ سیگنال قطعی: ندارد")
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:120])))
+    return "\n".join(lines)
+
+
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
                   sent_signals: int) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    """Main Telegram output: signals or NO TRADE, plus compact entry/SL/TP and coin read
+    for the strongest symbols. Full analysis goes to details_report.txt."""
+    if os.getenv("REPORT_MODE", "minimal").strip().lower() == "minimal":
+        return format_minimal_report(results, errors)
+    now = local_now()
+    sigs = [r for r in results if r["signal"]]
+    lines = ["📊 <b>گزارش اسکن</b> — %s" % now]
+    if sigs:
+        lines.append("🎯 سیگنال قطعی: %d (جزئیات در پیام جداگانه)" % len(sigs))
+    else:
+        lines.append("NO TRADE — هیچ سیگنال قطعی صادر نشد (%d ارز بررسی شد)." % len(results))
+    top = sorted(results, key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
+    shown = [r for r in top if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
+             and not r["signal"]][:5]
+    if shown:
+        lines.append("")
+        lines.append("🧭 <b>طرح‌ها و تحلیل (امتیاز ≥ %d)</b>" % WATCH_MIN)
+        for r in shown:
+            lines.append("")
+            lines.extend(format_brief(r))
+    btc = next((r for r in results if r["symbol"] == "BTC_USDT"), None)
+    indep = []
+    if btc is not None:
+        for r in top:
+            if r["signal"] or r is btc or any(r is x for x in shown) or max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) < WATCH_MIN:
+                continue
+            c = btc_corr(r, btc)
+            if c is not None and abs(c) < 0.5:
+                indep.append((r, c))
+    if indep:
+        lines.append("")
+        lines.append("🧩 <b>ارزهای مستقل از BTC (|همبستگی| کمتر از 0.5)</b>")
+        for r, c in indep[:5]:
+            lines.append("")
+            lines.append("همبستگی 15m با BTC: %.2f" % c)
+            lines.extend(format_brief(r))
+    fib_ready = [r for r in results if fib_signal_ready(r)]
+    lines.append("")
+    if fib_ready:
+        lines.append("✅ <b>سیگنال قطعی فیبوناچی: %d</b>" % len(fib_ready))
+        for r in fib_ready:
+            lines.append("")
+            lines.extend(format_limit_block(r))
+    else:
+        lines.append("⏸ سیگنال قطعی فیبوناچی: ندارد (هیچ ارزی در ناحیه‌ی ورود با کندل ۱۵m رد نیست)")
+    lines.append("")
+    lines.append("🎯 <b>نقاط ورود (فیبوناچی ۰٫۶۱۸ / حد ضرر ۰٫۷۸۶)</b>")
+    for r in results:
+        p = r.get("fib_plan")
+        if not p:
+            lines.append("%s | نقطه‌ای نیست (ایمپالس با روند هم‌جهت نیست، یا حد ضرر/فاصله‌ی ورود نامناسب است)" % html.escape(r["symbol"]))
+            continue
+        lines.append(
+            "<b>%s</b> %s | ورود <code>%s</code> (%+.2f%%) | SL <code>%s</code> (%.2f%%) | "
+            "TP1 <code>%s</code> (RR %.2f) | TP2 <code>%s</code> (RR %.2f) | %s" % (
+                html.escape(r["symbol"]), p["side"], fmt_price(p["entry"]), p["dist_pct"],
+                fmt_price(p["sl"]), p["risk_pct"], fmt_price(p["tp1"]), p["rr1"],
+                fmt_price(p["tp2"]), p["rr2"], html.escape(p["status"]) + (" | ثابت از %s" % p.get("since", "قبل") if p.get("stored") else " | جدید")))
+    for sym, err in errors:
+        lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
+    lines.append("")
+    lines.append("حداقل امتیاز: %d | ترتیب روند: 4H/1H/15m" % MIN_SCORE)
+    return "\n".join(lines)
+
+
+def format_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]],
+                  sent_signals: int) -> str:
+    now = local_now()
     lines = ["📊 <b>گزارش اسکن</b> — %s" % now, ""]
-    for res in results:
-        sym = html.escape(res["symbol"])
-        D = res["D"]
-        lg, sh = res["scenarios"]["LONG"], res["scenarios"]["SHORT"]
-        lines.append("<b>%s</b> | قیمت: %s" % (sym, fmt_price(res["price"])))
-        lines.append("روند 4H/1H/15m: %s / %s / %s" % (
-            TREND_FA[D["4h"]["trend"]], TREND_FA[D["1h"]["trend"]], TREND_FA[D["15m"]["trend"]]))
-        lines.append("LONG: %d | SHORT: %d" % (lg["score"], sh["score"]))
-        sig = res["signal"]
-        if sig:
-            lines.append("✅ سیگنال %s صادر شد" % sig["side"])
+    sigs = [r for r in results if r["signal"]]
+    lines.append("🎯 سیگنال قطعی: %d" % len(sigs))
+    for r in sigs:
+        lines.append("• %s %s (امتیاز %d)" % (html.escape(r["symbol"]), r["signal"]["side"], r["signal"]["score"]))
+    watches = [r for r in results if r.get("watch") and not r["signal"]]
+    if watches:
+        lines.append("")
+        lines.append("👀 <b>Watchlist</b> — هنوز سیگنال نیست؛ ورود فقط بعد از تحقق شرط:")
+        for r in watches:
+            w = r["watch"]
+            t = w["trade"]
+            lines.append("")
+            lines.append("<b>%s %s</b> | امتیاز %d | قیمت %s" % (
+                html.escape(r["symbol"]), w["side"], w["score"], fmt_price(r["price"])))
+            lines.append("شرط فعال‌سازی: " + html.escape(w["condition"]))
+            lines.append("سناریو: ورود %s | SL %s | TP1 %s | TP2 %s | RR خالص %.2f" % (
+                fmt_price(t["entry"]), fmt_price(t["sl"]), fmt_price(t["tp1"]),
+                (fmt_price(t["tp2"]) if t.get("tp2_ok", True) else "—"), t["rr2n"]))
+            if w["extra"]:
+                lines.append("توضیح: " + html.escape(w["extra"]))
+    breakouts = [r for r in results if r["regime"]["breakout"]]
+    if breakouts:
+        lines.append("")
+        lines.append("🚀 <b>شکست معتبر از فشردگی</b>")
+        for r in breakouts:
+            b = r["regime"]["breakout"]
+            lines.append("%s | %s | سطح %s (رنج %s تا %s)" % (
+                html.escape(r["symbol"]), "صعودی" if b["dir"] == "UP" else "نزولی",
+                fmt_price(b["level"]), fmt_price(b["range_lo"]), fmt_price(b["range_hi"])))
+    squeezes = [r for r in results if r["regime"]["name"] == "QUIET" and not r["regime"]["breakout"]]
+    if squeezes:
+        lines.append("")
+        lines.append("⏳ <b>فشردگی نوسان</b> — منتظر شکست معتبر:")
+        for r in squeezes:
+            q = r["regime"]["squeeze"]
+            lines.append("%s | رنج ۲۰ کندل 15m: بالا %s | پایین %s (≈ %.1f ATR، صدک %.0f%%)" % (
+                html.escape(r["symbol"]), fmt_price(q["hi"]), fmt_price(q["lo"]),
+                q["range_atr"], q["range_rank"] * 100.0))
+        lines.append("شکست معتبر = کندل 15m با بدنه ≥ 0.8 ATR بیرون از رنج و بسته‌شدن بیرون آن، با حجم ≥ 1.2× میانگین رنج.")
+    def _card_ok(r: Dict[str, Any]) -> bool:
+        c = build_card(r)
+        if c["trade"] is None or CARD_MIN_RR <= 0:
+            return True
+        return c["trade"]["rr1n"] >= CARD_MIN_RR
+
+    cards = sorted([r for r in results
+                    if max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]) >= WATCH_MIN
+                    and _card_ok(r)],
+                   key=lambda r: -max(r["scenarios"]["LONG"]["score"], r["scenarios"]["SHORT"]["score"]))
+    lines.append("")
+    lines.append("🧭 <b>فرصت‌های شرطی (امتیاز ≥ %d)</b>" % WATCH_MIN)
+    lines.append("این‌ها سیگنال نیستند؛ اعداد از داده‌ی بازار محاسبه شده‌اند و پیش‌بینی نیستند.")
+    if not cards:
+        lines.append("در این اسکن فرصت شرطی وجود ندارد.")
+    for r in cards[:10]:
+        lines.append("")
+        lines.extend(format_card(r))
+    lines.append("")
+    lines.append("🔎 <b>خلاصه‌ی بازار</b>")
+    for r in results:
+        D = r["D"]
+        lg, sh = r["scenarios"]["LONG"], r["scenarios"]["SHORT"]
+        if r["signal"]:
+            status = "✅ سیگنال %s" % r["signal"]["side"]
+        elif r.get("watch"):
+            status = "👀 Watchlist"
         else:
-            best = lg if lg["score"] >= sh["score"] else sh
-            if res["global_blockers"]:
-                reason = res["global_blockers"][0]
-            elif best["blockers"]:
-                reason = best["blockers"][0]
-            else:
-                reason = "امتیاز %d کمتر از حداقل %d است" % (best["score"], MIN_SCORE)
-            lines.append("⛔ بدون سیگنال: %s" % html.escape(reason))
-            bt = best["trade"]
-            if bt:
-                lines.append("سناریوی %s (غیرفعال): ورود %s | SL %s | TP1 %s | TP2 %s" % (
-                    best["side"], fmt_price(bt["entry"]), fmt_price(bt["sl"]),
-                    fmt_price(bt["tp1"]), fmt_price(bt["tp2"])))
-        liq = res["liq"]
+            status = "⛔ " + html.escape(no_signal_reason(r))
+        age = max(r["data_age_min"], 0.0)
+        stale = " ⚠️ داده قدیمی" if age > 20 else ""
+        liq = r["liq"]
         pool = []
         if liq["bsl"] is not None:
             pool.append("BSL%s %s" % ("(EQH)" if liq["bsl_eq"] else "", fmt_price(liq["bsl"])))
         if liq["ssl"] is not None:
             pool.append("SSL%s %s" % ("(EQL)" if liq["ssl_eq"] else "", fmt_price(liq["ssl"])))
+        lines.append("<b>%s</b> %s | %s%s%s | L%d S%d | نوسان %s | %s | داده %.0fد" % (
+            html.escape(r["symbol"]), fmt_price(r["price"]),
+            TREND_ARROW[D["4h"]["trend"]], TREND_ARROW[D["1h"]["trend"]], TREND_ARROW[D["15m"]["trend"]],
+            lg["score"], sh["score"], REGIME_FA[r["regime"]["name"]], status, age) + stale)
         if pool:
-            lines.append("نقدینگی نزدیک: " + " | ".join(pool))
-        lines.append("")
+            lines.append("   نقدینگی: " + " | ".join(pool))
     for sym, err in errors:
         lines.append("❗ %s: %s" % (html.escape(sym), html.escape(err[:150])))
-    lines.append("تعداد سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
+    lines.append("")
+    lines.append("ترتیب روند: 4H/1H/15m | سیگنال ارسال‌شده: %d | حداقل امتیاز: %d" % (sent_signals, MIN_SCORE))
     return "\n".join(lines)
-
-
 def split_message(text: str, limit: int = 3800) -> List[str]:
     chunks: List[str] = []
     cur = ""
@@ -878,12 +2053,165 @@ def save_state(state: Dict[str, float]) -> None:
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
+def to_plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def write_report_file(parts: List[str]) -> None:
+    path = os.getenv("REPORT_FILE", "report.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(parts).strip() + "\n")
+    except OSError as e:
+        log.warning("could not write %s: %s", path, e)
+
+
+SCAN_LOG_FIELDS = [
+    "ts_utc", "symbol", "price", "last_candle_utc", "trend_4h", "trend_1h", "trend_15m",
+    "long_score", "short_score", "regime", "status", "side", "entry", "sl", "tp1", "tp2",
+    "rr2_net", "stop_pct", "reason", "fib_valid", "fib_overlap",
+]
+
+
+def append_scan_log(results: List[Dict[str, Any]]) -> None:
+    """Append one row per symbol so Watchlist/Signal outcomes can be reviewed later."""
+    path = os.getenv("SCAN_LOG_FILE", SCAN_LOG_FILE)
+    if not path:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        new_file = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=SCAN_LOG_FIELDS)
+            if new_file:
+                w.writeheader()
+            for r in results:
+                D = r["D"]
+                lg, sh = r["scenarios"]["LONG"], r["scenarios"]["SHORT"]
+                if r["signal"]:
+                    status, sc = "SIGNAL", r["signal"]
+                elif r.get("watch"):
+                    status, sc = "WATCH", r["scenarios"][r["watch"]["side"]]
+                else:
+                    status, sc = "NONE", (lg if lg["score"] >= sh["score"] else sh)
+                t = sc["trade"] or {}
+                last_t = D["5m"]["cs"].t[-1] + TF_MAP["5m"][1]
+                row = {
+                    "ts_utc": now, "symbol": r["symbol"], "price": r["price"],
+                    "last_candle_utc": datetime.fromtimestamp(last_t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "trend_4h": D["4h"]["trend"], "trend_1h": D["1h"]["trend"], "trend_15m": D["15m"]["trend"],
+                    "long_score": lg["score"], "short_score": sh["score"],
+                    "regime": r["regime"]["name"], "status": status, "side": sc["side"],
+                    "entry": t.get("entry", ""), "sl": t.get("sl", ""),
+                    "tp1": t.get("tp1", ""), "tp2": t.get("tp2", ""),
+                    "rr2_net": round(t["rr2n"], 3) if (t and t.get("rr2n") is not None) else "",
+                    "stop_pct": round(t["stop_pct"], 3) if t else "",
+                    "reason": "" if r["signal"] else no_signal_reason(r),
+                    "fib_valid": sc.get("fib", {}).get("valid", ""),
+                    "fib_overlap": sc.get("fib", {}).get("overlap", ""),
+                }
+                w.writerow(row)
+    except OSError as e:
+        log.warning("could not write scan log %s: %s", path, e)
+
+
+def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
+    """One line per gate for each side: PASS / FAIL with the measured value.
+    Diagnostic only; does not change any decision."""
+    D = res["D"]
+    out: List[str] = []
+    out.append("=" * 70)
+    out.append("%s | price %s | regime %s | min_score %d" % (
+        res["symbol"], fmt_price(res["price"]), res["regime"]["name"], min_score))
+    out.append("  trend 4H=%s 1H=%s 15m=%s 5m=%s | struct 15m=%d 5m=%d" % (
+        D["4h"]["trend"], D["1h"]["trend"], D["15m"]["trend"], D["5m"]["trend"],
+        D["15m"]["struct"], D["5m"]["struct"]))
+    out.append("  vol_ratio 15m=%.2f | atr_rank 15m=%.2f | atr%% 15m=%.3f%%" % (
+        D["15m"]["vol_ratio"], D["15m"]["atr_rank"], res["regime"]["atr_pct"] * 100.0))
+    for name in ("LONG", "SHORT"):
+        sc = res["scenarios"][name]
+        t = sc["trade"]
+        out.append("  --- %s score=%d parts=%s" % (name, sc["score"],
+                   ", ".join("%s=%d" % (k, round(v)) for k, v in sc["parts"].items())))
+        want = "UP" if name == "LONG" else "DOWN"
+        aligned_ok = D["4h"]["trend"] == want or D["1h"]["trend"] == want
+        against = D["4h"]["trend"] == ("DOWN" if name == "LONG" else "UP") or \
+            D["1h"]["trend"] == ("DOWN" if name == "LONG" else "UP")
+        out.append("    [HTF aligned]      %s  (4H=%s 1H=%s)" % (
+            "PASS" if aligned_ok and not against else "FAIL", D["4h"]["trend"], D["1h"]["trend"]))
+        out.append("    [structure]        %s  (sweep=%s mss=%s)" % (
+            "PASS" if not sc["soft_blockers"] else "FAIL",
+            "yes" if sc["sweep"] else "no", "yes" if sc["parts"].get("mss") else "no"))
+        if t:
+            out.append("    [stop distance]    %s  (%.3f%%, max %.1f%%)" % (
+                "PASS" if not any("حد ضرر" in b for b in sc["blockers"]) else "FAIL",
+                t["stop_pct"], MAX_STOP_PCT))
+            out.append("    [RR net to TP2]    %s  (%.2f, min %.1f, fee %.2f%%/side)" % (
+                "PASS" if (t["rr2n"] or 0.0) >= MIN_RR2_NET else "FAIL", (t["rr2n"] or 0.0), MIN_RR2_NET, FEE_PCT))
+            out.append("    [HTF obstacle]     %s  (room in R: %s)" % (
+                "FAIL" if any("مانع HTF" in b for b in sc["blockers"]) else "PASS",
+                "see blockers"))
+        else:
+            out.append("    [trade levels]     FAIL  (no trade built)")
+        out.append("    [score>=min]       %s  (%d)" % ("PASS" if sc["score"] >= min_score else "FAIL", sc["score"]))
+        fb = sc.get("fib", {})
+        fz = fb.get("zone")
+        out.append("    [FIB] valid=%s retr=%s zone=%s overlap=%s in_zone=%s pts=%d (%s) targets=%s" % (
+            fb.get("valid"), ("%.2f" % fb["retr"]) if fb.get("retr") is not None else "-",
+            ("%s..%s" % (fmt_price(fz[0]), fmt_price(fz[1]))) if fz else "-",
+            fb.get("overlap"), fb.get("in_zone"), fb.get("pts", 0),
+            "APPLIED" if FIB_CONFIRM else "info only",
+            ", ".join("%.3f->%s" % (k, fmt_price(p)) for k, p in fb.get("targets", [])) or "-"))
+        ind = sc.get("ind", {})
+        if ind:
+            out.append("    [INDICATORS] %d/%d passed (ok=%s, mode=%s) failed=%s rsi=%.1f" % (
+                ind["passed"], ind["total"], ind["ok"],
+                "FILTER" if INDICATOR_FILTER else "info only",
+                ",".join(ind["failed"]) or "-", ind["rsi"]))
+        if sc["blockers"]:
+            out.append("    blockers: " + " | ".join(sc["blockers"]))
+    out.append("  global: " + (" | ".join(res["global_blockers"]) if res["global_blockers"] else "none"))
+    out.append("  => decision: %s" % (
+        ("SIGNAL " + res["signal"]["side"]) if res["signal"] else
+        ("WATCH " + res["watch"]["side"]) if res.get("watch") else
+        "NONE (" + no_signal_reason(res) + ")"))
+    return out
+
+
+def write_diag(results: List[Dict[str, Any]], min_score: float) -> None:
+    """Write the diagnostic report locally only (never sent to Telegram)."""
+    path = os.getenv("DIAG_FILE", DIAG_FILE)
+    if not path:
+        return
+    now = local_now()
+    lines = ["DIAGNOSTIC REPORT — %s" % now, ""]
+    for r in results:
+        lines.extend(gate_table(r, min_score))
+        lines.append("")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        log.warning("could not write diag report %s: %s", path, e)
+
+
+def write_details(results: List[Dict[str, Any]], errors: List[Tuple[str, str]], sent: int) -> None:
+    """Full analysis (watchlist, conditional plans, market summary) for local review only."""
+    path = os.getenv("DETAILS_FILE", "details_report.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(to_plain(format_details(results, errors, sent)) + "\n")
+    except OSError as e:
+        log.warning("could not write details %s: %s", path, e)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Crypto futures signal scanner (analysis only)")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
     ap.add_argument("--min-score", type=float, default=MIN_SCORE)
     ap.add_argument("--dry-run", action="store_true", help="print only, do not send to Telegram")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--diag", action="store_true", help="also write per-gate diagnostic report")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -895,6 +2223,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     results: List[Dict[str, Any]] = []
     errors: List[Tuple[str, str]] = []
+    pairs = fetch_pairs()
+    if pairs:
+        for sym in [x for x in symbols if x.lower() not in pairs]:
+            errors.append((sym, "جفت‌ارز در اسپات LBank پیدا نشد؛ نادیده گرفته شد"))
+        symbols = [x for x in symbols if x.lower() in pairs]
     for sym in symbols:
         try:
             results.append(analyze_symbol(sym, args.min_score))
@@ -906,12 +2239,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.exception("%s: unexpected error", sym)
             errors.append((sym, "unexpected error: %s" % e))
 
-    send = (lambda t: print(t) or True) if args.dry_run else send_telegram
+    outbox: List[str] = []
+    base_send = (lambda t: print(t) or True) if args.dry_run else send_telegram
+
+    def send(t: str) -> bool:
+        outbox.append(to_plain(t))
+        return base_send(t)
 
     if not results:
         send("❗ <b>اسکن ناموفق بود</b>\n" + "\n".join(
             "%s: %s" % (html.escape(s), html.escape(e[:150])) for s, e in errors))
+        write_report_file(outbox)
         return 1
+
+    cnt = {"LONG": 0, "SHORT": 0}
+    for r in sorted([x for x in results if x["signal"]], key=lambda x: -x["signal"]["score"]):
+        sd = r["signal"]["side"]
+        if cnt[sd] >= MAX_SAME_DIR:
+            r["watch"] = make_watch(r, r["signal"], "سقف سیگنال هم‌جهت در یک اسکن")
+            r["reason_override"] = "سقف سیگنال هم‌جهت در یک اسکن"
+            r["signal"] = None
+        else:
+            cnt[sd] += 1
 
     state = load_state()
     sent = 0
@@ -923,14 +2272,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if time.time() - state.get(key, 0.0) < COOLDOWN_H * 3600:
             log.info("%s in cooldown, skipped", key)
             res["signal"] = None
-            res["global_blockers"] = list(res["global_blockers"]) + ["سیگنال مشابه اخیراً ارسال شده (cooldown)"]
+            res["reason_override"] = "سیگنال مشابه اخیراً ارسال شده (cooldown)"
             continue
         if send(format_signal(res, sig)) or args.dry_run:
             state[key] = time.time()
             sent += 1
     if not args.dry_run:
         save_state(state)
+        append_scan_log(results)
+    if args.diag or args.dry_run:
+        write_diag(results, args.min_score)
+    write_details(results, errors, sent)
+    log_fib_signals(results)
     send(format_report(results, errors, sent))
+    write_report_file(outbox)
     return 0
 
 
