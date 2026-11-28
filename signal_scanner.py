@@ -4,8 +4,8 @@
 signal_scanner.py
 -----------------
 Analysis-only crypto futures signal scanner (NO order execution).
-Real-time Price Action + Liquidity Hunt (Sweep + MSS) + Active OB/FVG + Fibonacci (0.618-0.786).
-Produces chart-aligned Entry, Stop Loss, and structural/Fibonacci Targets (TP1, TP2, TP3).
+Combines ICT concepts (BSL/SSL, EQH/EQL, Sweep, Displacement/MSS, FVG, OB, OTE 0.618-0.705-0.786)
+with live chart structure, Entry, Stop Loss, and multi-target plans (TP1, TP2, TP3).
 """
 from __future__ import annotations
 
@@ -50,12 +50,9 @@ TARGET_LEVERAGE = _env_float("TARGET_LEVERAGE", _env_float("DEFAULT_LEVERAGE", 5
 MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 10.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 
-# Real-time chart alignment parameters
-MAX_ENTRY_DIST_PCT = _env_float("MAX_ENTRY_DIST_PCT", 1.5)   # max distance from live price to entry
-MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 2.2)               # max SL distance %
-MIN_STOP_PCT = _env_float("MIN_STOP_PCT", 0.25)              # min SL distance %
-MAX_STOP_ATR = 2.8
-MIN_STOP_ATR = 0.45
+MAX_ENTRY_DIST_PCT = _env_float("MAX_ENTRY_DIST_PCT", 1.8)
+MAX_STOP_PCT = _env_float("MAX_STOP_PCT", 2.2)
+MIN_STOP_PCT = _env_float("MIN_STOP_PCT", 0.25)
 MIN_ATR_PCT = 0.0004
 MAX_ATR_PCT = 0.03
 MIN_VOL_RATIO = 0.5
@@ -66,11 +63,9 @@ MIN_RR1_NET = _env_float("MIN_RR1_NET", 1.1)
 MAX_TP_RR = _env_float("MAX_TP_RR", 10.0)
 MSS_MAX_DELAY = 8
 MSS_MIN_BODY = 0.75
-ACTIVE_SWING_BARS = int(_env_float("ACTIVE_SWING_BARS", 48))  # focus on recent active chart leg
+ACTIVE_SWING_BARS = int(_env_float("ACTIVE_SWING_BARS", 48))
 
 CAPITAL_USDT = _env_float("ACCOUNT_EQUITY_USDT", 1000.0)
-PLAN_FILE = os.getenv("PLAN_FILE", "plans_state.json")
-PLAN_TTL_H = _env_float("PLAN_TTL_H", 0.0)  # 0 = always live chart calculation
 
 TF_MAP: Dict[str, Tuple[str, int]] = {
     "1m": ("minute1", 60),
@@ -80,7 +75,6 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
     "4h": ("hour4", 14400),
 }
 
-TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
 
 
@@ -112,7 +106,7 @@ def http_json(
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     data = None
-    headers = {"User-Agent": "signal-scanner/2.0", "Accept": "application/json"}
+    headers = {"User-Agent": "signal-scanner-ict/3.0", "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -127,8 +121,7 @@ def http_json(
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s" % e.code
             if e.code == 429 or e.code >= 500:
-                delay = min(float(2 ** attempt), 25.0)
-                time.sleep(delay)
+                time.sleep(min(float(2 ** attempt), 25.0))
                 continue
             raise ScanError(last_err)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
@@ -216,7 +209,7 @@ def fetch_pairs() -> Optional[set]:
 
 
 # --------------------------------------------------------------------------
-# Technical & Structure Primitives
+# Technical & Market Structure Primitives
 # --------------------------------------------------------------------------
 def atr(h: List[float], l: List[float], c: List[float], n: int = 14) -> List[float]:
     trs = [h[0] - l[0]]
@@ -315,14 +308,37 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Liquidity Hunt, OB/FVG & Active Chart Leg
+# ICT Engine: BSL/SSL, EQH/EQL, Sweep, Displacement/MSS, FVG, OB, OTE
 # --------------------------------------------------------------------------
-def detect_sweep(d: Dict[str, Any], side: str, lookback: int = 20) -> Optional[Dict[str, Any]]:
+def ict_liquidity_pools(d: Dict[str, Any], price: float) -> Dict[str, Any]:
+    """Identifies Buy-Side Liquidity (BSL), Sell-Side Liquidity (SSL),
+    Equal Highs (EQH), and Equal Lows (EQL)."""
+    tol = 0.15 * d["atr"]
+    above = [p for _, p in d["highs"] if p > price]
+    below = [p for _, p in d["lows"] if p < price]
+
+    bsl = min(above) if above else None
+    ssl = max(below) if below else None
+    eqh = bool(bsl is not None and sum(1 for _, p in d["highs"] if abs(p - bsl) <= tol) >= 2)
+    eql = bool(ssl is not None and sum(1 for _, p in d["lows"] if abs(p - ssl) <= tol) >= 2)
+
+    return {
+        "bsl": bsl,
+        "ssl": ssl,
+        "eqh": eqh,
+        "eql": eql,
+        "tf": d["name"],
+    }
+
+
+def detect_sweep(d: Dict[str, Any], side: str, lookback: int = 24) -> Optional[Dict[str, Any]]:
+    """Detects ICT liquidity sweep: wick pierces SSL (for LONG) or BSL (for SHORT)
+    and candle body closes back inside the range."""
     cs: Candles = d["cs"]
     n = len(cs)
     a = d["atr"]
     long = side == "LONG"
-    pts = [p for p in (d["lows"] if long else d["highs"]) if p[0] >= n - 100]
+    pts = [p for p in (d["lows"] if long else d["highs"]) if p[0] >= n - 120]
     for j in range(n - 1, max(n - 1 - lookback, 2), -1):
         for si, lvl in reversed(pts):
             if si >= j - 1:
@@ -349,14 +365,15 @@ def detect_sweep(d: Dict[str, Any], side: str, lookback: int = 20) -> Optional[D
                     "extreme": ext,
                     "age": n - 1 - j,
                     "tf": d["name"],
-                    "eq_pool": is_eq,
+                    "pool_type": ("SSL" if long else "BSL") + ("+EQ" if is_eq else ""),
                 }
     return None
 
 
-def detect_mss(
+def detect_displacement_mss(
     d: Dict[str, Any], side: str, sweep: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
+    """Detects ICT Market Structure Shift (MSS) accompanied by strong displacement candle."""
     cs: Candles = d["cs"]
     a = d["atr"]
     j = sweep["idx"]
@@ -367,39 +384,43 @@ def detect_mss(
             return None
         lvl = prior[-1][1]
         for k in range(j, end):
-            if cs.c[k] > lvl and (cs.c[k] - cs.o[k]) >= MSS_MIN_BODY * a:
-                return {"idx": k, "level": lvl, "tf": d["name"]}
+            body = cs.c[k] - cs.o[k]
+            if cs.c[k] > lvl and body >= MSS_MIN_BODY * a:
+                return {"idx": k, "level": lvl, "tf": d["name"], "disp_atr": body / a}
     else:
         prior = [p for p in d["lows"] if p[0] < j]
         if not prior:
             return None
         lvl = prior[-1][1]
         for k in range(j, end):
-            if cs.c[k] < lvl and (cs.o[k] - cs.c[k]) >= MSS_MIN_BODY * a:
-                return {"idx": k, "level": lvl, "tf": d["name"]}
+            body = cs.o[k] - cs.c[k]
+            if cs.c[k] < lvl and body >= MSS_MIN_BODY * a:
+                return {"idx": k, "level": lvl, "tf": d["name"], "disp_atr": body / a}
     return None
 
 
-def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 40) -> List[Dict[str, float]]:
+def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 45) -> List[Dict[str, float]]:
+    """ICT Fair Value Gap (3-candle imbalance)."""
     n = len(cs)
     out: List[Dict[str, float]] = []
     for i in range(max(2, n - lookback), n):
         if side == "LONG":
             lo, hi = cs.h[i - 2], cs.l[i]
-            if hi > lo and hi - lo >= 0.1 * atr_v:
+            if hi > lo and (hi - lo) >= 0.12 * atr_v:
                 later = min(cs.l[i + 1:]) if i + 1 < n else float("inf")
                 if later > lo:
                     out.append({"bottom": lo, "top": hi})
         else:
             hi, lo = cs.l[i - 2], cs.h[i]
-            if hi > lo and hi - lo >= 0.1 * atr_v:
+            if hi > lo and (hi - lo) >= 0.12 * atr_v:
                 later = max(cs.h[i + 1:]) if i + 1 < n else float("-inf")
                 if later < hi:
                     out.append({"bottom": lo, "top": hi})
     return out
 
 
-def find_obs(cs: Candles, atr_v: float, side: str, lookback: int = 50) -> List[Dict[str, float]]:
+def find_obs(cs: Candles, atr_v: float, side: str, lookback: int = 55) -> List[Dict[str, float]]:
+    """ICT Order Block (last opposite-colored candle before impulsive displacement)."""
     n = len(cs)
     out: List[Dict[str, float]] = []
     for i in range(max(1, n - lookback), n - 3):
@@ -423,10 +444,9 @@ def _zones_for(d: Dict[str, Any], side: str) -> List[Dict[str, Any]]:
     return zs
 
 
-def pick_active_zone(
+def pick_ict_zone(
     ds: List[Dict[str, Any]], side: str, price: float, atr15: float
 ) -> Optional[Dict[str, Any]]:
-    """Finds the nearest valid OB, FVG, or OB+FVG overlap on the active chart."""
     long = side == "LONG"
     allz: List[Dict[str, Any]] = []
     for d in ds:
@@ -441,8 +461,8 @@ def pick_active_zone(
         if z["top"] <= z["bottom"]:
             return False
         if long:
-            return z["top"] <= price + 0.15 * atr15 and z["bottom"] < price and dist(z) <= 2.2 * atr15
-        return z["bottom"] >= price - 0.15 * atr15 and z["top"] > price and dist(z) <= 2.2 * atr15
+            return z["top"] <= price + 0.15 * atr15 and z["bottom"] < price and dist(z) <= 2.4 * atr15
+        return z["bottom"] >= price - 0.15 * atr15 and z["top"] > price and dist(z) <= 2.4 * atr15
 
     cands: List[Tuple[int, float, Dict[str, Any]]] = []
     fvgs = [z for z in allz if z["kind"] == "FVG"]
@@ -456,16 +476,14 @@ def pick_active_zone(
                     cands.append((0, dist(z), z))
     for z in allz:
         if valid(z):
-            cands.append((1, dist(z), z))
+            cands.append((1 if z["kind"] == "FVG" else 2, dist(z), z))
     if not cands:
         return None
     cands.sort(key=lambda x: (x[0], x[1]))
     return cands[0][2]
 
 
-def active_chart_leg(d: Dict[str, Any], price: float) -> Optional[Dict[str, Any]]:
-    """Extracts the LIVE active swing leg (A -> B) currently containing or adjacent to price,
-    so Fibonacci levels match what the trader actually sees on the current chart."""
+def active_chart_leg(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cs: Candles = d["cs"]
     n = len(cs)
     start = max(0, n - ACTIVE_SWING_BARS)
@@ -473,26 +491,18 @@ def active_chart_leg(d: Dict[str, Any], price: float) -> Optional[Dict[str, Any]
     ls = [p for p in d["lows"] if p[0] >= start]
     if not hs or not ls:
         return None
-
     hi_i, hi_v = max(hs, key=lambda x: x[1])
     lo_i, lo_v = min(ls, key=lambda x: x[1])
     diff = hi_v - lo_v
     if diff < 1.2 * d["atr"]:
         return None
-
-    # Determine whether the active leg is bullish (low -> high) or bearish (high -> low)
     if lo_i < hi_i:
-        direction = "UP"
-        A, B = lo_v, hi_v
-    else:
-        direction = "DOWN"
-        A, B = hi_v, lo_v
-
-    return {"dir": direction, "A": A, "B": B, "diff": diff, "tf": d["name"]}
+        return {"dir": "UP", "A": lo_v, "B": hi_v, "diff": diff, "tf": d["name"]}
+    return {"dir": "DOWN", "A": hi_v, "B": lo_v, "diff": diff, "tf": d["name"]}
 
 
 def premium_discount(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
-    leg = active_chart_leg(D["1h"], price) or active_chart_leg(D["15m"], price)
+    leg = active_chart_leg(D["1h"]) or active_chart_leg(D["15m"])
     if not leg:
         return None
     hi = max(leg["A"], leg["B"])
@@ -501,21 +511,30 @@ def premium_discount(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dic
         return None
     pos = max(0.0, min(100.0, (price - lo) / (hi - lo) * 100.0))
     zone = "پریمیوم (بالا)" if pos > 50 else "دیسکانت (پایین)"
-    return {"pos": pos, "zone": zone, "hi": hi, "lo": lo}
+    return {"pos": pos, "zone": zone, "eq": (hi + lo) / 2.0}
+
+
+def current_session_fa() -> str:
+    utc_h = datetime.now(timezone.utc).hour
+    if 0 <= utc_h < 7:
+        return "سشن آسیا (Asian Range)"
+    if 7 <= utc_h < 12:
+        return "سشن لندن (London KZ)"
+    if 12 <= utc_h < 17:
+        return "هم‌پوشانی لندن/نیویورک (NY Killzone)"
+    return "سشن نیویورک / اواخر روز"
 
 
 # --------------------------------------------------------------------------
-# Real-Time Setup Builder (Entry, SL, TP1/TP2/TP3)
+# ICT Setup Builder (OTE + FVG/OB + Liquidity Targets)
 # --------------------------------------------------------------------------
-def _structural_targets(
+def _ict_targets(
     D: Dict[str, Dict[str, Any]],
     side: str,
     entry: float,
     sl: float,
-    leg: Optional[Dict[str, Any]],
+    leg: Dict[str, Any],
 ) -> List[Tuple[str, float, float]]:
-    """Generates clean targets strictly beyond entry in the trade direction,
-    combining live swing liquidity pools and Fibonacci levels."""
     risk_pct = abs(sl - entry) / entry * 100.0
     cost = 2.0 * FEE_PCT
     if risk_pct <= 0:
@@ -529,29 +548,27 @@ def _structural_targets(
         dist_pct = abs(t - entry) / entry * 100.0
         return (dist_pct - cost) / (risk_pct + cost)
 
+    A, B, diff = leg["A"], leg["B"], leg["diff"]
     cands: List[Tuple[str, float]] = []
-    if leg:
-        A, B, d = leg["A"], leg["B"], leg["diff"]
-        if side == "LONG" and leg["dir"] == "UP":
-            cands.append(("سقف موج فعال (1.0)", B))
-            cands.append(("اکستنشن فیبو 1.272", A + 1.272 * d))
-            cands.append(("اکستنشن فیبو 1.618", A + 1.618 * d))
-        elif side == "SHORT" and leg["dir"] == "DOWN":
-            cands.append(("کف موج فعال (1.0)", B))
-            cands.append(("اکستنشن فیبو 1.272", A - 1.272 * d))
-            cands.append(("اکستنشن فیبو 1.618", A - 1.618 * d))
 
-    # Add real swing highs/lows from 15m and 1h
-    for tf_name, lbl in (("15m", "نقدینگی 15m"), ("1h", "ساختار 1H")):
-        d_tf = D[tf_name]
-        pts = [p for _, p in (d_tf["highs"] if side == "LONG" else d_tf["lows"])]
-        for p in pts:
-            if (side == "LONG" and p > entry) or (side == "SHORT" and p < entry):
-                cands.append((lbl, p))
+    if side == "LONG" and leg["dir"] == "UP":
+        cands.append(("BSL / سقف موج (1.0)", B))
+        cands.append(("فیبو اکستنشن 1.272", A + 1.272 * diff))
+        cands.append(("فیبو اکستنشن 1.618", A + 1.618 * diff))
+        for tf_name, lbl in (("15m", "BSL 15m"), ("1h", "BSL 1H")):
+            for _, p in D[tf_name]["highs"]:
+                if p > entry:
+                    cands.append((lbl, p))
+    elif side == "SHORT" and leg["dir"] == "DOWN":
+        cands.append(("SSL / کف موج (1.0)", B))
+        cands.append(("فیبو اکستنشن 1.272", A - 1.272 * diff))
+        cands.append(("فیبو اکستنشن 1.618", A - 1.618 * diff))
+        for tf_name, lbl in (("15m", "SSL 15m"), ("1h", "SSL 1H")):
+            for _, p in D[tf_name]["lows"]:
+                if p < entry:
+                    cands.append((lbl, p))
 
-    # Sort nearest-first in trade direction
     cands.sort(key=lambda x: abs(x[1] - entry))
-
     min_step_pct = max(0.35, 0.55 * risk_pct)
     selected: List[Tuple[str, float, float]] = []
     last_dist = 0.0
@@ -571,19 +588,13 @@ def _structural_targets(
     return selected
 
 
-def build_realtime_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
-    """Constructs a chart-authentic trade plan anchored to the active 15m/1H leg,
-    OB/FVG zone, and Liquidity Sweep/MSS."""
+def build_ict_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
     d15, d1, d4 = D["15m"], D["1h"], D["4h"]
     atr15 = d15["atr"]
-
-    leg15 = active_chart_leg(d15, price)
-    leg1h = active_chart_leg(d1, price)
-    leg = leg15 or leg1h
+    leg = active_chart_leg(d15) or active_chart_leg(d1)
     if not leg:
         return None
 
-    # Determine bias from active leg + HTF confirmation
     t4, t1, t15 = d4["trend"], d1["trend"], d15["trend"]
     bull_votes = (t4 == "UP") + (t1 == "UP") + (t15 == "UP") + (leg["dir"] == "UP")
     bear_votes = (t4 == "DOWN") + (t1 == "DOWN") + (t15 == "DOWN") + (leg["dir"] == "DOWN")
@@ -604,10 +615,10 @@ def build_realtime_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[
     sweep_obj = None
     mss_obj = None
     for dd in (d15, D["5m"]):
-        sw = detect_sweep(dd, side, 20)
+        sw = detect_sweep(dd, side, 24)
         if sw:
             sweep_obj = sw
-            m = detect_mss(dd, side, sw)
+            m = detect_displacement_mss(dd, side, sw)
             if m:
                 mss_obj = m
                 break
@@ -616,49 +627,45 @@ def build_realtime_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[
         return None
 
     A, B, diff = leg["A"], leg["B"], leg["diff"]
-    zone = pick_active_zone([d15, D["5m"]], side, price, atr15)
+    zone = pick_ict_zone([d15, D["5m"]], side, price, atr15)
 
+    # ICT Optimal Trade Entry (OTE = 0.705 sweet spot inside 0.618 - 0.786)
     if side == "SHORT":
-        fib_618 = B + 0.618 * diff
-        fib_786 = B + 0.786 * diff
+        ote_entry = B + 0.705 * diff
+        ote_sl = B + 0.786 * diff + 0.25 * atr15
         if zone:
             z_mid = (zone["bottom"] + zone["top"]) / 2.0
-            # Anchor entry to the active OB/FVG zone, blended with 0.618 if close
-            if abs(fib_618 - z_mid) <= 0.7 * atr15:
-                entry = (fib_618 + z_mid) / 2.0
-                src = "فیبو ۰.۶۱۸ + %s (%s)" % (zone["kind"], zone["tf"])
+            if abs(ote_entry - z_mid) <= 0.75 * atr15:
+                entry = (ote_entry + z_mid) / 2.0
+                model_tag = "ICT OTE (0.705) + %s" % zone["kind"]
             else:
                 entry = z_mid
-                src = "ناحیه عرضه %s (%s)" % (zone["kind"], zone["tf"])
-            sl_base = max(zone["top"], fib_786 if abs(fib_786 - entry) <= 1.5 * atr15 else zone["top"])
+                model_tag = "ICT %s (%s)" % (zone["kind"], zone["tf"])
+            sl = max(ote_sl, zone["top"] + 0.25 * atr15)
         else:
-            entry = fib_618
-            sl_base = fib_786
-            src = "فیبو ۰.۶۱۸ موج فعال (%s)" % leg["tf"]
-
-        sl = sl_base + 0.25 * atr15
+            entry = ote_entry
+            sl = ote_sl
+            model_tag = "ICT OTE (0.705)"
         if sweep_obj and sweep_obj["extreme"] > entry:
             sl = max(sl, sweep_obj["extreme"] + 0.2 * atr15)
         if price >= sl:
             return None
     else:
-        fib_618 = B - 0.618 * diff
-        fib_786 = B - 0.786 * diff
+        ote_entry = B - 0.705 * diff
+        ote_sl = B - 0.786 * diff - 0.25 * atr15
         if zone:
             z_mid = (zone["bottom"] + zone["top"]) / 2.0
-            if abs(fib_618 - z_mid) <= 0.7 * atr15:
-                entry = (fib_618 + z_mid) / 2.0
-                src = "فیبو ۰.۶۱۸ + %s (%s)" % (zone["kind"], zone["tf"])
+            if abs(ote_entry - z_mid) <= 0.75 * atr15:
+                entry = (ote_entry + z_mid) / 2.0
+                model_tag = "ICT OTE (0.705) + %s" % zone["kind"]
             else:
                 entry = z_mid
-                src = "ناحیه تقاضا %s (%s)" % (zone["kind"], zone["tf"])
-            sl_base = min(zone["bottom"], fib_786 if abs(fib_786 - entry) <= 1.5 * atr15 else zone["bottom"])
+                model_tag = "ICT %s (%s)" % (zone["kind"], zone["tf"])
+            sl = min(ote_sl, zone["bottom"] - 0.25 * atr15)
         else:
-            entry = fib_618
-            sl_base = fib_786
-            src = "فیبو ۰.۶۱۸ موج فعال (%s)" % leg["tf"]
-
-        sl = sl_base - 0.25 * atr15
+            entry = ote_entry
+            sl = ote_sl
+            model_tag = "ICT OTE (0.705)"
         if sweep_obj and sweep_obj["extreme"] < entry:
             sl = min(sl, sweep_obj["extreme"] - 0.2 * atr15)
         if price <= sl:
@@ -672,7 +679,7 @@ def build_realtime_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[
     if risk_pct < MIN_STOP_PCT or risk_pct > MAX_STOP_PCT:
         return None
 
-    targets = _structural_targets(D, side, entry, sl, leg)
+    targets = _ict_targets(D, side, entry, sl, leg)
     if not targets:
         return None
 
@@ -680,19 +687,18 @@ def build_realtime_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[
     tp2_lbl, tp2, rr2 = targets[1] if len(targets) > 1 else ("", None, None)
     tp3_lbl, tp3, rr3 = targets[2] if len(targets) > 2 else ("", None, None)
 
-    in_zone = abs(dist_pct) <= 0.15
-    if in_zone:
-        status = "قیمت در ناحیه ورود؛ آماده واکنش کندلی"
-    elif side == "SHORT":
-        status = "منتظر پولبک به محدوده ورود (%+.2f%%)" % dist_pct
-    else:
-        status = "منتظر اصلاح به محدوده ورود (%+.2f%%)" % dist_pct
-
     confluence = bool(sweep_obj and mss_obj)
+    if abs(dist_pct) <= 0.15:
+        status = "داخل ناحیه ICT؛ منتظر کندل تأیید"
+    elif side == "SHORT":
+        status = "منتظر اصلاح به ناحیه عرضه/OTE (%+.2f%%)" % dist_pct
+    else:
+        status = "منتظر اصلاح به ناحیه تقاضا/OTE (%+.2f%%)" % dist_pct
+
     return {
         "side": side,
         "entry": entry,
-        "entry_src": src,
+        "model_tag": model_tag,
         "sl": sl,
         "risk_pct": risk_pct,
         "tp1": tp1,
@@ -748,13 +754,18 @@ def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
     actual_risk_pct = (actual_risk_usdt / CAPITAL_USDT) * 100.0 if CAPITAL_USDT > 0 else 0.0
 
     how = "بازار" if abs(p["dist_pct"]) <= 0.15 else "لیمیت"
-    badge = "🟢 Sweep + MSS" if p.get("confluence") else ("🟡 Sweep" if p.get("sweep") else "🔵 MSS")
+    if p.get("confluence"):
+        badge = "🟢 ICT Sweep + MSS"
+    elif p.get("sweep"):
+        badge = "🟡 ICT %s" % p["sweep"]["pool_type"]
+    else:
+        badge = "🔵 ICT MSS"
 
     lines = [
         "<b>%s</b> (قیمت: <code>%s</code>) | <b>%s</b> (%s) | %s"
-        % (html.escape(r["symbol"]), fmt_price(r["price"]), side, how, badge),
-        "• نقطه ورود: <code>%s</code> (%+.2f%%) — %s"
-        % (fmt_price(entry), p["dist_pct"], html.escape(p["entry_src"])),
+        % (html.escape(r["symbol"]), fmt_price(r["price"]), side, how, html.escape(badge)),
+        "• مدل ورود: %s" % html.escape(p["model_tag"]),
+        "• نقطه ورود: <code>%s</code> (%+.2f%%)" % (fmt_price(entry), p["dist_pct"]),
         "• حد ضرر (SL): <code>%s</code> (%.2f%%)" % (fmt_price(sl), risk_pct),
     ]
     for idx, (tp_key, lbl_key, rr_key) in enumerate(
@@ -780,6 +791,7 @@ def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
 def coin_view_fa(r: Dict[str, Any]) -> str:
     D = r["D"]
     price = r["price"]
+    liq = r["liq"]
     score = 0
     for tf, w in (("4h", 2), ("1h", 2), ("15m", 1)):
         t = D[tf]["trend"]
@@ -792,24 +804,26 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
     strength = "قوی" if abs(score) >= 3 else "ضعیف" if abs(score) >= 1 else "خنثی"
     side = "LONG" if bias == "لانگ" else "SHORT" if bias == "شورت" else None
     sw_obj = (
-        (detect_sweep(D["15m"], side, 20) or detect_sweep(D["5m"], side, 20))
+        (detect_sweep(D["15m"], side, 24) or detect_sweep(D["5m"], side, 24))
         if side
         else None
     )
-    sweep_txt = "بله (EQ)" if (sw_obj and sw_obj.get("eq_pool")) else ("بله" if sw_obj else "خیر")
+    sweep_txt = sw_obj["pool_type"] if sw_obj else "خیر"
     zone = "دیسکانت" if pd_ and pd_["pos"] < 50 else "پریمیوم" if pd_ else "نامشخص"
     trend = "%s%s%s" % (
         TREND_ARROW[D["4h"]["trend"]],
         TREND_ARROW[D["1h"]["trend"]],
         TREND_ARROW[D["15m"]["trend"]],
     )
+    bsl_txt = fmt_price(liq["bsl"]) + ("(EQH)" if liq["eqh"] else "") if liq.get("bsl") else "-"
+    ssl_txt = fmt_price(liq["ssl"]) + ("(EQL)" if liq["eql"] else "") if liq.get("ssl") else "-"
     plan = r.get("plan")
     if plan:
         entry_txt = "ورود %s | SL %s | TP1 %s" % (
             fmt_price(plan["entry"]), fmt_price(plan["sl"]), fmt_price(plan["tp1"])
         )
     else:
-        entry_txt = "بدون ستاپ نزدیک چارت"
+        entry_txt = "BSL:%s / SSL:%s" % (bsl_txt, ssl_txt)
     return (
         "<b>%s</b> (%s): <b>%s</b> (%s) | روند: %s | %s | Sweep: %s | %s"
         % (
@@ -819,7 +833,7 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
             strength,
             trend,
             zone,
-            sweep_txt,
+            html.escape(sweep_txt),
             html.escape(entry_txt),
         )
     )
@@ -828,8 +842,9 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
 def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) -> str:
     lev = max(1.0, min(MAX_LEVERAGE, TARGET_LEVERAGE))
     lines = [
-        "📊 <b>تحلیل زنده پرایس‌اکشن، نقدینگی و فیبوناچی</b> — %s" % local_now(),
-        "اهرم تنظیم‌شده: <b>%.0fx</b> | حداکثر فاصله ورود: %.1f%%" % (lev, MAX_ENTRY_DIST_PCT),
+        "📊 <b>تحلیل زنده ICT، نقدینگی و فیبوناچی</b> — %s" % local_now(),
+        "%s | اهرم: <b>%.0fx</b> | سقف فاصله ورود: %.1f%%"
+        % (current_session_fa(), lev, MAX_ENTRY_DIST_PCT),
     ]
     setups: List[Tuple[int, List[str]]] = []
     for r in results:
@@ -842,19 +857,19 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
             setups.append((rank_val, block))
     setups.sort(key=lambda x: -x[0])
 
-    lines.append("ارزهای بررسی‌شده: %d | ستاپ‌های دقیق و هم‌راستا: %d" % (len(results), len(setups)))
+    lines.append("ارزهای بررسی‌شده: %d | ستاپ‌های ICT معتبر: %d" % (len(results), len(setups)))
     if setups:
         lines.append("")
-        lines.append("🎯 <b>نقاط ورود، حد ضرر و تارگت‌های مشخص</b>")
+        lines.append("🎯 <b>نقاط ورود، حد ضرر و تارگت‌های مشخص (ICT)</b>")
         for _, block in setups[:6]:
             lines.append("")
             lines.extend(block)
     else:
         lines.append("")
-        lines.append("⏸ در این لحظه هیچ ارزی هم‌زمان شرایط شکار نقدینگی + ناحیه ورود نزدیک را ندارد.")
+        lines.append("⏸ در این لحظه ستاپ ICT با هم‌پوشانی نقدینگی + OTE/FVG/OB نزدیک چارت ثبت نشد.")
 
     lines.append("")
-    lines.append("🧭 <b>نمای کلی بازار</b>")
+    lines.append("🧭 <b>نمای کلی بازار و نقدینگی BSL/SSL</b>")
     for r in results:
         try:
             lines.append(coin_view_fa(r))
@@ -876,8 +891,9 @@ def analyze_symbol(symbol: str) -> Dict[str, Any]:
     last_close = D["5m"]["close"]
     if abs(price - last_close) / last_close > 0.02:
         price = last_close
-    plan = build_realtime_plan(D, price)
-    return {"symbol": symbol, "price": price, "D": D, "plan": plan}
+    plan = build_ict_plan(D, price)
+    liq = ict_liquidity_pools(D["15m"], price)
+    return {"symbol": symbol, "price": price, "D": D, "plan": plan, "liq": liq}
 
 
 def to_plain(text: str) -> str:
@@ -940,7 +956,7 @@ def send_telegram(text: str) -> bool:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Real-time Price Action & Fibonacci Scanner")
+    ap = argparse.ArgumentParser(description="Live ICT, Liquidity & Fibonacci Futures Scanner")
     ap.add_argument("--symbols", default=os.getenv("SYMBOLS", DEFAULT_SYMBOLS))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
