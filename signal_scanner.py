@@ -2277,4 +2277,4 @@ def gate_table(res: Dict[str, Any], min_score: float) -> List[str]:
     out: List[str] = []
     out.append("=" * 70)
     out.append("%s | price %s | regime %s | min_score %d" % (
-      
+     
