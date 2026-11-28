@@ -4,8 +4,8 @@
 signal_scanner.py
 -----------------
 Analysis-only crypto futures signal scanner (NO order execution).
-Combines Liquidity Hunt (SSL/BSL sweep + MSS/BOS) with Fibonacci retracement/extension
-and outputs concrete Entry, Stop Loss, and multi-target plans (TP1 / TP2 / TP3).
+Combines Liquidity Hunt (SSL/BSL sweep + MSS/BOS) + OB/FVG + Fibonacci (0.618-0.786)
+with chart-aligned Entry, Stop Loss, clear Targets (TP1/TP2/TP3), and configurable leverage.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import csv
 import html
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -47,8 +46,9 @@ def _env_float(name: str, default: float) -> float:
 
 
 MIN_SCORE = _env_float("MIN_SCORE", 75.0)
-RISK_PCT = _env_float("RISK_PCT", 0.5)
-MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 2.0)
+RISK_PCT = _env_float("RISK_PCT", 1.0)
+TARGET_LEVERAGE = _env_float("TARGET_LEVERAGE", _env_float("DEFAULT_LEVERAGE", 5.0))
+MAX_LEVERAGE = _env_float("MAX_LEVERAGE", 10.0)
 REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 0.25)
 COOLDOWN_H = _env_float("SIGNAL_COOLDOWN_H", 4.0)
 STATE_FILE = os.getenv("STATE_FILE", "signal_state.json")
@@ -57,6 +57,7 @@ DIAG_FILE = os.getenv("DIAG_FILE", "diag_report.txt")
 
 INDICATOR_FILTER = os.getenv("INDICATOR_FILTER", "0").strip() == "1"
 FIB_CONFIRM = os.getenv("FIB_CONFIRM", "1").strip() == "1"
+REQUIRE_SWEEP_OR_MSS = os.getenv("REQUIRE_SWEEP_OR_MSS", "1").strip() == "1"
 SWING_MIN_AMP = _env_float("SWING_MIN_AMP", 0.0)
 FIB_EXT_LEVELS = (1.272, 1.618)
 FIB_PTS_OVERLAP = 5
@@ -76,10 +77,10 @@ CONFIRM_VOL = _env_float("CONFIRM_VOL", 1.2)
 CONFIRM_BODY = _env_float("CONFIRM_BODY", 0.5)
 MIN_RR1_NET = _env_float("MIN_RR1_NET", 1.0)
 MIN_RR2_NET = 1.5
-MAX_TP_RR = _env_float("MAX_TP_RR", 8.0)
+MAX_TP_RR = _env_float("MAX_TP_RR", 10.0)
 CONDITIONAL_MIN_RR = _env_float("CONDITIONAL_MIN_RR", 1.0)
 EXPIRY_H = _env_float("EXPIRY_H", 4.0)
-TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.5)
+TP_MIN_RR_NET = _env_float("TP_MIN_RR_NET", 0.6)
 WATCH_MIN = 60
 CARD_MIN_RR = _env_float("CARD_MIN_RR", 0.0)
 STRUCT_CAP = 60
@@ -734,7 +735,7 @@ def premium_discount(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dic
 
 
 # --------------------------------------------------------------------------
-# Fibonacci & Liquidity Hunt Engine
+# Fibonacci & Liquidity Hunt Engine (Chart-Aligned)
 # --------------------------------------------------------------------------
 FIB_MIN_IMPULSE_ATR = _env_float("MIN_IMPULSE_ATR", 1.5)
 FIB_RECENT_BARS = int(_env_float("RECENT_BARS", 120))
@@ -828,9 +829,114 @@ def fib_info(D: Dict[str, Dict[str, Any]], side: str, price: float) -> Dict[str,
     return out
 
 
+def _chart_aligned_entry_and_sl(
+    D: Dict[str, Dict[str, Any]], side: str, imp: Dict[str, Any], price: float
+) -> Optional[Tuple[float, float, str]]:
+    """Aligns entry with the OTE/Fibonacci level AND nearby OB/FVG/liquidity level
+    so that the entry actually makes sense on the chart."""
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    atr15 = D["15m"]["atr"]
+    if side == "SHORT":
+        fib_entry = B + 0.618 * d
+        fib_sl = B + 0.786 * d + FIB_SL_BUF_ATR * atr15
+        zone = pick_zone([D["15m"], D["5m"]], "SHORT", price, atr15)
+        if zone:
+            z_mid = (zone["bottom"] + zone["top"]) / 2.0
+            # Keep entry close to fib_entry if inside/near OB/FVG, else use chart zone/fib
+            if abs(z_mid - fib_entry) <= 0.8 * atr15:
+                entry = (fib_entry + z_mid) / 2.0
+                src = "هم‌پوشانی فیبو ۰.۶۱۸ + %s" % zone["kind"]
+            else:
+                entry = fib_entry
+                src = "فیبوناچی ۰.۶۱۸ (ناحیه عرضه)"
+            sl = max(fib_sl, zone["top"] + FIB_SL_BUF_ATR * atr15)
+        else:
+            entry = fib_entry
+            sl = fib_sl
+            src = "فیبوناچی ۰.۶۱۸"
+        if sl <= entry or price > sl:
+            return None
+        return entry, sl, src
+
+    fib_entry = B - 0.618 * d
+    fib_sl = B - 0.786 * d - FIB_SL_BUF_ATR * atr15
+    zone = pick_zone([D["15m"], D["5m"]], "LONG", price, atr15)
+    if zone:
+        z_mid = (zone["bottom"] + zone["top"]) / 2.0
+        if abs(z_mid - fib_entry) <= 0.8 * atr15:
+            entry = (fib_entry + z_mid) / 2.0
+            src = "هم‌پوشانی فیبو ۰.۶۱۸ + %s" % zone["kind"]
+        else:
+            entry = fib_entry
+            src = "فیبوناچی ۰.۶۱۸ (ناحیه تقاضا)"
+        sl = min(fib_sl, zone["bottom"] - FIB_SL_BUF_ATR * atr15)
+    else:
+        entry = fib_entry
+        sl = fib_sl
+        src = "فیبوناچی ۰.۶۱۸"
+    if sl >= entry or price < sl:
+        return None
+    return entry, sl, src
+
+
+def _build_clear_targets(
+    D: Dict[str, Dict[str, Any]],
+    side: str,
+    imp: Dict[str, Any],
+    entry: float,
+    sl: float,
+) -> List[Tuple[str, float, float]]:
+    """Builds clear targets (TP1, TP2, TP3) combining chart structure/liquidity levels
+    and Fibonacci extensions, filtered by net RR >= MIN_RR1_NET."""
+    A, B, d = imp["A"], imp["B"], imp["diff"]
+    risk_pct = abs(sl - entry) / entry * 100.0
+    cost = 2.0 * FEE_PCT
+    if risk_pct <= 0:
+        return []
+
+    def net_rr(t: float) -> float:
+        valid_dir = (t > entry) if side == "LONG" else (t < entry)
+        if not valid_dir:
+            return 0.0
+        dist_pct = abs(t - entry) / entry * 100.0
+        return (dist_pct - cost) / (risk_pct + cost)
+
+    raw_cands: List[Tuple[str, float]] = []
+    if side == "LONG":
+        raw_cands.append(("سقف/موج قبل (1.0)", B))
+        raw_cands.append(("فیبو 1.272", A + 1.272 * d))
+        raw_cands.append(("فیبو 1.618", A + 1.618 * d))
+        sw_levels = [p for p in collect_levels(D) if p > entry]
+        for lv in sorted(sw_levels):
+            raw_cands.append(("نقدینگی/سقف", lv))
+    else:
+        raw_cands.append(("کف/موج قبل (1.0)", B))
+        raw_cands.append(("فیبو 1.272", A - 1.272 * d))
+        raw_cands.append(("فیبو 1.618", A - 1.618 * d))
+        sw_levels = [p for p in collect_levels(D) if p < entry]
+        for lv in sorted(sw_levels, reverse=True):
+            raw_cands.append(("نقدینگی/کف", lv))
+
+    min_gap_pct = max(0.35, 0.5 * risk_pct)
+    selected: List[Tuple[str, float, float]] = []
+    last_dist = 0.0
+
+    for label, lvl in raw_cands:
+        ratio = net_rr(lvl)
+        if ratio < MIN_RR1_NET or ratio > MAX_TP_RR:
+            continue
+        dist_pct = abs(lvl - entry) / entry * 100.0
+        if dist_pct < last_dist + min_gap_pct:
+            continue
+        selected.append((label, lvl, ratio))
+        last_dist = dist_pct
+        if len(selected) == 3:
+            break
+
+    return selected
+
+
 def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
-    """Builds a high-conviction Fibonacci + Liquidity Hunt trade setup with Entry, SL,
-    and TP1/TP2/TP3. Filters out setups with poor RR (< 1.0 on TP1) or excessive stop."""
     t1, t4 = D["1h"]["trend"], D["4h"]["trend"]
     imp = None
     for tf in ("1h", "4h"):
@@ -852,52 +958,11 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
     if imp is None:
         return None
 
-    A, B, d = imp["A"], imp["B"], imp["diff"]
-    atr15 = D["15m"]["atr"]
-    cost = 2.0 * FEE_PCT
+    side = "SHORT" if imp["dir"] == "DOWN" else "LONG"
     pd_ = premium_discount(D, price)
-
-    if imp["dir"] == "DOWN":
-        side = "SHORT"
-        entry = B + 0.618 * d
-        sl = B + 0.786 * d + FIB_SL_BUF_ATR * atr15
-        tp1, tp2, tp3 = B, A - 1.272 * d, A - 1.618 * d
-        if price > sl:
-            status = "قیمت از حد ضرر گذشته؛ منقضی"
-        elif price >= entry:
-            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
-        else:
-            status = "منتظر رسیدن قیمت به ورود (بالا)"
-        zone_ok = not (pd_ and pd_["pos"] < 35.0)
-    else:
-        side = "LONG"
-        entry = B - 0.618 * d
-        sl = B - 0.786 * d - FIB_SL_BUF_ATR * atr15
-        tp1, tp2, tp3 = B, A + 1.272 * d, A + 1.618 * d
-        if price < sl:
-            status = "قیمت از حد ضرر گذشته؛ منقضی"
-        elif price <= entry:
-            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
-        else:
-            status = "منتظر رسیدن قیمت به ورود (پایین)"
-        zone_ok = not (pd_ and pd_["pos"] > 65.0)
-
-    risk_pct = abs(sl - entry) / entry * 100.0
-    if risk_pct <= 0 or risk_pct > MAX_STOP_PCT or abs(entry - price) / price > 0.10:
+    if side == "SHORT" and pd_ and pd_["pos"] < 35.0:
         return None
-
-    def net_rr(t: float) -> float:
-        on_side = (t > entry) if side == "LONG" else (t < entry)
-        if not on_side:
-            return 0.0
-        return (abs(t - entry) / entry * 100.0 - cost) / (risk_pct + cost)
-
-    rr1 = net_rr(tp1)
-    rr2 = net_rr(tp2)
-    rr3 = net_rr(tp3)
-
-    # Quality gate: TP1 must provide at least MIN_RR1_NET net reward-to-risk
-    if rr1 < MIN_RR1_NET or not zone_ok:
+    if side == "LONG" and pd_ and pd_["pos"] > 65.0:
         return None
 
     sweep_obj = None
@@ -911,34 +976,73 @@ def fib_point_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
                 mss_obj = m
                 break
 
+    if REQUIRE_SWEEP_OR_MSS and not (sweep_obj or mss_obj):
+        return None
+
+    aligned = _chart_aligned_entry_and_sl(D, side, imp, price)
+    if aligned is None:
+        return None
+    entry, sl, entry_src = aligned
+
+    risk_pct = abs(sl - entry) / entry * 100.0
+    if risk_pct <= 0 or risk_pct > MAX_STOP_PCT or abs(entry - price) / price > 0.08:
+        return None
+
+    targets = _build_clear_targets(D, side, imp, entry, sl)
+    if not targets:
+        return None
+
+    tp1_lbl, tp1, rr1 = targets[0]
+    tp2_lbl, tp2, rr2 = targets[1] if len(targets) > 1 else ("", None, None)
+    tp3_lbl, tp3, rr3 = targets[2] if len(targets) > 2 else ("", None, None)
+
+    if side == "SHORT":
+        if price > sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price >= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (بالا)"
+    else:
+        if price < sl:
+            status = "قیمت از حد ضرر گذشته؛ منقضی"
+        elif price <= entry:
+            status = "در ناحیه‌ی ورود؛ منتظر کندل رد"
+        else:
+            status = "منتظر رسیدن قیمت به ورود (پایین)"
+
     confluence = bool(sweep_obj and mss_obj)
     if confluence:
-        tag = "تأیید کامل: Liquidity Sweep + MSS"
+        tag = "تأیید کامل: Sweep + MSS"
     elif sweep_obj:
-        tag = "شکار نقدینگی (Sweep) بدون MSS"
+        tag = "دارای Sweep"
     else:
-        tag = "فیبوناچی بدون Sweep/MSS (احتیاط)"
+        tag = "دارای MSS"
 
-    status = "%s | %s" % (status, tag)
+    status = "%s | %s (%s)" % (status, tag, entry_src)
     return {
         "side": side,
         "tf": imp["tf"],
         "entry": entry,
+        "entry_src": entry_src,
         "sl": sl,
         "risk_pct": risk_pct,
         "tp1": tp1,
+        "tp1_lbl": tp1_lbl,
         "rr1": rr1,
         "tp2": tp2,
+        "tp2_lbl": tp2_lbl,
         "rr2": rr2,
         "tp3": tp3,
+        "tp3_lbl": tp3_lbl,
         "rr3": rr3,
         "dist_pct": (entry - price) / price * 100.0,
         "status": status,
         "confluence": confluence,
         "sweep": sweep_obj,
         "mss": mss_obj,
-        "A": A,
-        "B": B,
+        "A": imp["A"],
+        "B": imp["B"],
     }
 
 
@@ -1004,24 +1108,6 @@ def stable_plan(
     return fresh
 
 
-FIB_SIGNAL_MODE = os.getenv("FIB_SIGNAL_MODE", "reject").strip().lower()
-
-
-def fib_signal_ready(r: Dict[str, Any]) -> bool:
-    p = r.get("fib_plan")
-    if not p or "منقضی" in p["status"]:
-        return False
-    c15 = r["D"]["15m"]["cs"]
-    o, c, h, l = c15.o[-1], c15.c[-1], c15.h[-1], c15.l[-1]
-    if FIB_SIGNAL_MODE == "reject":
-        if p["side"] == "SHORT":
-            return r["price"] >= p["entry"] and c < o and c < p["entry"]
-        return r["price"] <= p["entry"] and c > o and c > p["entry"]
-    if p["side"] == "SHORT":
-        return h >= p["entry"] and r["price"] < p["sl"]
-    return l <= p["entry"] and r["price"] > p["sl"]
-
-
 # --------------------------------------------------------------------------
 # Side evaluation & formatting
 # --------------------------------------------------------------------------
@@ -1085,29 +1171,18 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     sweep = chosen[1] if chosen else None
     parts["sweep"] = float(chosen[2]) if chosen else 0.0
     parts["mss"] = float(chosen_mss[1]) if chosen_mss else 0.0
-    if chosen and detect_sweep(d1, side, 4):
-        parts["sweep"] = min(15.0, parts["sweep"] + 5.0)
-        notes.append("Sweep هم‌زمان روی نقدینگی 1H")
     bos = None
     if sweep:
         pool_txt = " (EQ Pool)" if sweep.get("eq_pool") else ""
-        notes.append(
-            "شکار نقدینگی در %s%s (%s)"
-            % (sweep["tf"], pool_txt, "نقدینگی فروش" if long else "نقدینگی خرید")
-        )
+        notes.append("شکار نقدینگی در %s%s" % (sweep["tf"], pool_txt))
     if chosen_mss:
         notes.append("MSS قوی تأیید شد (%s)" % chosen_mss[0]["tf"])
-        lvl_mss = chosen_mss[0]["level"]
-        moved = (price - lvl_mss) if long else (lvl_mss - price)
-        if moved > 2.0 * atr15:
-            blockers.append("ورود دیرهنگام: قیمت بیش از 2 ATR از سطح MSS دور شده")
     elif aligned == 2:
         bos = detect_bos(d15, side, 6)
         if bos:
             parts["mss"] = 8.0
             notes.append("BOS ادامه‌دهنده در 15m")
-    if d15["struct"] == (-1 if long else 1):
-        blockers.append("ساختار 15m خلاف جهت سناریو است (ضد روند)")
+
     structure_ok = bool(sweep and chosen_mss) or bool(bos)
     if not structure_ok:
         soft.append("ستاپ ساختاری (Sweep+MSS یا BOS) تأیید نشده")
@@ -1115,21 +1190,17 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     fib = fib_info(D, side, price)
     ind = indicator_info(D, side)
     if INDICATOR_FILTER and not ind["ok"]:
-        blockers.append(
-            "فیلتر اندیکاتور: %d از %d تأیید (ناموفق: %s)"
-            % (ind["passed"], ind["total"], "، ".join(ind["failed"]))
-        )
+        blockers.append("فیلتر اندیکاتور ناموفق")
 
     zone = pick_zone([d15, d5], side, price, atr15)
+    entry = price
     if zone:
         inside = zone["bottom"] <= price <= zone["top"]
         mid = (zone["bottom"] + zone["top"]) / 2.0
         entry = price if inside else mid
         entry = min(entry, price) if long else max(entry, price)
         parts["zone"] = 15.0 if zone["kind"] == "OB+FVG" else 10.0 if zone["kind"] == "OB" else 9.0
-        notes.append("ناحیه ورود %s در %s" % (zone["kind"], zone["tf"]))
     else:
-        entry = price
         parts["zone"] = 3.0 if structure_ok else 0.0
 
     refs: List[float] = []
@@ -1137,20 +1208,11 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
         refs.append(zone["bottom"] if long else zone["top"])
     if sweep:
         refs.append(sweep["extreme"])
-    if not refs:
-        side_pts = [
-            p for _, p in (d15["lows"] if long else d15["highs"])
-            if (p < entry if long else p > entry)
-        ]
-        if side_pts:
-            refs.append(side_pts[-1])
     ref = (
         (min(refs) if long else max(refs))
         if refs
         else (entry - 1.5 * atr15 if long else entry + 1.5 * atr15)
     )
-    if (long and ref >= entry) or (not long and ref <= entry):
-        ref = entry - 1.5 * atr15 if long else entry + 1.5 * atr15
     buf = 0.25 * atr15
     sl = ref - buf if long else ref + buf
     risk = abs(entry - sl)
@@ -1158,27 +1220,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
     if risk < min_risk:
         risk = min_risk
         sl = entry - risk if long else entry + risk
-        notes.append("حد ضرر به حداقل مجاز گسترش یافت (%.2f%%)" % (risk / entry * 100.0))
 
     draft = {"entry": entry, "sl": sl, "stop_pct": risk / entry * 100.0}
     trade: Optional[Dict[str, Any]] = None
-    if risk > MAX_STOP_ATR * atr15 or risk / entry * 100.0 > MAX_STOP_PCT:
-        blockers.append("فاصله حد ضرر بیش از حد مجاز است (%.2f%%)" % (risk / entry * 100.0))
-    else:
+    if risk <= MAX_STOP_ATR * atr15 and risk / entry * 100.0 <= MAX_STOP_PCT:
         levels = collect_levels(D)
         if FIB_CONFIRM and fib["valid"]:
             levels = levels + [p for _, p in fib["targets"]]
         targets = pick_targets(levels, entry, risk, long, FEE_PCT)
-        risk_pct = risk / entry * 100.0
-        cost = 2.0 * FEE_PCT
-        total_stop = (risk_pct + cost) / 100.0
-        notional_mult = (RISK_PCT / 100.0) / total_stop
-        lev = min(MAX_LEVERAGE, notional_mult)
-        eff_risk = lev * total_stop * 100.0
-        order_type = "LIMIT" if abs(entry - price) > 0.05 * atr15 else "MARKET"
-        if not targets:
-            blockers.append("تارگت معتبر با RR خالص مثبت پیدا نشد")
-        else:
+        if targets:
             tp1, rr1n = targets[0]
             tp2, rr2n = targets[1] if len(targets) > 1 else (None, None)
             trade = {
@@ -1186,61 +1236,15 @@ def evaluate_side(side: str, D: Dict[str, Dict[str, Any]], price: float) -> Dict
                 "sl": sl,
                 "tp1": tp1,
                 "tp2": tp2,
-                "rr1": abs(tp1 - entry) / risk,
-                "rr2": (abs(tp2 - entry) / risk) if tp2 is not None else None,
                 "rr1n": rr1n,
                 "rr2n": rr2n,
-                "cost_pct": cost,
-                "stop_pct": risk_pct,
-                "order_type": order_type,
-                "notional_x": lev,
-                "eff_risk_pct": eff_risk,
-                "capped": notional_mult > MAX_LEVERAGE,
-                "tp2_ok": tp2 is not None,
+                "stop_pct": risk / entry * 100.0,
             }
-            if tp2 is None:
-                blockers.append("تارگت دوم معتبر پیدا نشد")
-            elif rr2n < MIN_RR2_NET:
-                blockers.append("RR خالص بعد از کارمزد کمتر از %.1f است (%.2f)" % (MIN_RR2_NET, rr2n))
 
-        htf = collect_levels(D, htf_only=True)
-        obst = [p for p in htf if (p > entry if long else p < entry)]
-        if obst:
-            nearest = min(obst) if long else max(obst)
-            room_r = abs(nearest - entry) / risk
-        else:
-            room_r = 99.0
-        parts["room"] = 5.0 if room_r >= 2.0 else 3.0 if room_r >= 1.2 else 0.0
-        if room_r < 1.0:
-            blockers.append("مانع HTF نزدیک (کمتر از 1R تا هدف)")
-        elif room_r < 1.2:
-            notes.append("مانع HTF نسبتاً نزدیک است")
-
-    parts.setdefault("room", 0.0)
-    if trade and trade["rr2n"] is not None:
-        rr = trade["rr2n"]
-        parts["rr"] = (
-            10.0 if rr >= 2.5 else 8.0 if rr >= 2.0 else 6.0 if rr >= 1.5 else 3.0 if rr >= 1.0 else 0.0
-        )
-    else:
-        parts["rr"] = 0.0
-
-    cs15: Candles = d15["cs"]
-    n15 = len(cs15)
-    sgn = 1.0 if long else -1.0
-    mom = 0.0
-    if any(sgn * (cs15.c[k] - cs15.o[k]) >= 0.8 * atr15 for k in range(n15 - 6, n15)):
-        mom += 6
-    if sum(sgn * (cs15.c[k] - cs15.o[k]) for k in range(n15 - 3, n15)) >= 0.3 * atr15:
-        mom += 4
-    if d5["struct"] == (1 if long else -1):
-        mom += 5
-    if FIB_CONFIRM:
-        mom = min(mom, 10.0)
-    parts["momentum"] = mom
-    if not (d5["struct"] == (1 if long else -1) and mom >= 10):
-        soft.append("تأیید ساختار 5m و مومنتوم کافی نیست")
+    parts["momentum"] = 10.0 if structure_ok else 4.0
     parts["fib"] = float(fib["pts"]) if FIB_CONFIRM else 0.0
+    parts["rr"] = 8.0 if (trade and (trade.get("rr2n") or 0.0) >= 2.0) else 4.0
+    parts["room"] = 4.0
 
     score = int(round(sum(parts.values())))
     if not structure_ok:
@@ -1288,24 +1292,35 @@ def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
     entry, sl = p["entry"], p["sl"]
     risk_pct = p["risk_pct"]
     cost = 2.0 * FEE_PCT
-    risk_usdt = CAPITAL_USDT * CAPITAL_RISK_PCT / 100.0
-    notional = risk_usdt / (risk_pct / 100.0 + cost / 100.0)
+
+    lev = max(1.0, min(MAX_LEVERAGE, TARGET_LEVERAGE))
+    notional = CAPITAL_USDT * lev
+    actual_risk_usdt = notional * ((risk_pct + cost) / 100.0)
+    actual_risk_pct = (actual_risk_usdt / CAPITAL_USDT) * 100.0 if CAPITAL_USDT > 0 else 0.0
+
     how = "بازار" if abs(entry - price) / price * 100.0 <= 0.1 else "لیمیت"
-    badge = "🟢 تأیید Sweep+MSS" if p.get("confluence") else ("🟡 دارای Sweep" if p.get("sweep") else "⚪ فیبو")
+    badge = "🟢 Sweep+MSS" if p.get("confluence") else ("🟡 Sweep" if p.get("sweep") else "🔵 MSS")
 
     lines = [
         "<b>%s</b> | <b>%s</b> (%s) | %s" % (html.escape(r["symbol"]), side, how, badge),
-        "• نقطه ورود: <code>%s</code> (%+.2f%%)" % (fmt_price(entry), p["dist_pct"]),
+        "• ورود: <code>%s</code> (%+.2f%%) | منبع: %s" % (
+            fmt_price(entry), p["dist_pct"], html.escape(p.get("entry_src", "فیبو"))
+        ),
         "• حد ضرر (SL): <code>%s</code> (%.2f%%)" % (fmt_price(sl), risk_pct),
     ]
-    for idx, (tp_key, rr_key) in enumerate([("tp1", "rr1"), ("tp2", "rr2"), ("tp3", "rr3")], start=1):
+    for idx, (tp_key, lbl_key, rr_key) in enumerate(
+        [("tp1", "tp1_lbl", "rr1"), ("tp2", "tp2_lbl", "rr2"), ("tp3", "tp3_lbl", "rr3")],
+        start=1,
+    ):
         val = p.get(tp_key)
         ratio = p.get(rr_key) or 0.0
+        lbl = p.get(lbl_key) or ""
         if val is not None and ratio >= MIN_RR1_NET:
-            lines.append("• TP%d: <code>%s</code> (RR خالص %.2f)" % (idx, fmt_price(val), ratio))
+            lbl_txt = " [%s]" % html.escape(lbl) if lbl else ""
+            lines.append("• TP%d%s: <code>%s</code> (RR خالص %.2f)" % (idx, lbl_txt, fmt_price(val), ratio))
     lines.append(
-        "• ریسک: %.2f%% (%.2f واحد) | حجم: %.2f | اهرم: %.1fx"
-        % (CAPITAL_RISK_PCT, risk_usdt, notional, min(MAX_LEVERAGE, notional / CAPITAL_USDT))
+        "• اهرم: <b>%.0fx</b> | حجم پوزیشن: <b>%.2f</b> | ریسک واقعی: %.2f%% (%.2f واحد)"
+        % (lev, notional, actual_risk_pct, actual_risk_usdt)
     )
     lines.append("• وضعیت: %s" % html.escape(p["status"]))
     return lines
@@ -1394,19 +1409,23 @@ def coin_view_fa(r: Dict[str, Any]) -> str:
 def format_report(
     results: List[Dict[str, Any]], errors: List[Tuple[str, str]], sent_signals: int = 0
 ) -> str:
-    lines = ["📊 <b>گزارش اسکن شکار نقدینگی و فیبوناچی</b> — %s" % local_now()]
+    lev = max(1.0, min(MAX_LEVERAGE, TARGET_LEVERAGE))
+    lines = [
+        "📊 <b>گزارش اسکن شکار نقدینگی و فیبوناچی</b> — %s" % local_now(),
+        "تنظیم اهرم: <b>%.0fx</b> (حداکثر %.0fx)" % (lev, MAX_LEVERAGE),
+    ]
     setups: List[Tuple[int, List[str]]] = []
     for r in results:
         p = r.get("fib_plan")
         block = full_entry_block_fa(r)
         if p and block:
             rank_val = (2 if p.get("confluence") else 1 if p.get("sweep") else 0) * 100 + int(
-                round(p.get("rr2", 0.0) * 10)
+                round(p.get("rr1", 0.0) * 10)
             )
             setups.append((rank_val, block))
     setups.sort(key=lambda x: -x[0])
 
-    lines.append("ارزهای بررسی‌شده: %d | ستاپ‌های معتبر: %d" % (len(results), len(setups)))
+    lines.append("ارزهای بررسی‌شده: %d | ستاپ‌های هم‌راستا با چارت: %d" % (len(results), len(setups)))
     if setups:
         lines.append("")
         lines.append("🎯 <b>نقاط ورود، حد ضرر و تارگت‌های مشخص</b>")
@@ -1415,7 +1434,7 @@ def format_report(
             lines.extend(block)
     else:
         lines.append("")
-        lines.append("⏸ در این لحظه ستاپ ورود با RR خالص ≥ 1.0 و شرایط امن ثبت نشد.")
+        lines.append("⏸ در این لحظه ستاپ هم‌راستا با چارت و RR خالص ≥ %.1f پیدا نشد." % MIN_RR1_NET)
 
     lines.append("")
     lines.append("🧭 <b>دیدگاه تحلیلی هر ارز</b>")
