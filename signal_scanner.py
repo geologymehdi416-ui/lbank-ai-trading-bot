@@ -5,7 +5,8 @@ signal_scanner.py
 -----------------
 Analysis-only crypto futures signal scanner (NO order execution).
 Combines ICT concepts (BSL/SSL, EQH/EQL, Sweep, Displacement/MSS, FVG, OB, OTE 0.618-0.705-0.786)
-with live chart structure, Entry, Stop Loss, and multi-target plans (TP1, TP2, TP3).
+with live chart structure, Entry, Stop Loss, multi-target plans (TP1, TP2, TP3),
+and a concise analytical explanation for every setup.
 """
 from __future__ import annotations
 
@@ -75,6 +76,7 @@ TF_MAP: Dict[str, Tuple[str, int]] = {
     "4h": ("hour4", 14400),
 }
 
+TREND_FA = {"UP": "صعودی", "DOWN": "نزولی", "RANGE": "رنج"}
 TREND_ARROW = {"UP": "↑", "DOWN": "↓", "RANGE": "↔"}
 
 
@@ -106,7 +108,7 @@ def http_json(
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     data = None
-    headers = {"User-Agent": "signal-scanner-ict/3.0", "Accept": "application/json"}
+    headers = {"User-Agent": "signal-scanner-ict/3.1", "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -311,8 +313,6 @@ def build_tf(cs: Candles, name: str) -> Dict[str, Any]:
 # ICT Engine: BSL/SSL, EQH/EQL, Sweep, Displacement/MSS, FVG, OB, OTE
 # --------------------------------------------------------------------------
 def ict_liquidity_pools(d: Dict[str, Any], price: float) -> Dict[str, Any]:
-    """Identifies Buy-Side Liquidity (BSL), Sell-Side Liquidity (SSL),
-    Equal Highs (EQH), and Equal Lows (EQL)."""
     tol = 0.15 * d["atr"]
     above = [p for _, p in d["highs"] if p > price]
     below = [p for _, p in d["lows"] if p < price]
@@ -332,8 +332,6 @@ def ict_liquidity_pools(d: Dict[str, Any], price: float) -> Dict[str, Any]:
 
 
 def detect_sweep(d: Dict[str, Any], side: str, lookback: int = 24) -> Optional[Dict[str, Any]]:
-    """Detects ICT liquidity sweep: wick pierces SSL (for LONG) or BSL (for SHORT)
-    and candle body closes back inside the range."""
     cs: Candles = d["cs"]
     n = len(cs)
     a = d["atr"]
@@ -373,7 +371,6 @@ def detect_sweep(d: Dict[str, Any], side: str, lookback: int = 24) -> Optional[D
 def detect_displacement_mss(
     d: Dict[str, Any], side: str, sweep: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Detects ICT Market Structure Shift (MSS) accompanied by strong displacement candle."""
     cs: Candles = d["cs"]
     a = d["atr"]
     j = sweep["idx"]
@@ -400,7 +397,6 @@ def detect_displacement_mss(
 
 
 def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 45) -> List[Dict[str, float]]:
-    """ICT Fair Value Gap (3-candle imbalance)."""
     n = len(cs)
     out: List[Dict[str, float]] = []
     for i in range(max(2, n - lookback), n):
@@ -420,7 +416,6 @@ def find_fvgs(cs: Candles, atr_v: float, side: str, lookback: int = 45) -> List[
 
 
 def find_obs(cs: Candles, atr_v: float, side: str, lookback: int = 55) -> List[Dict[str, float]]:
-    """ICT Order Block (last opposite-colored candle before impulsive displacement)."""
     n = len(cs)
     out: List[Dict[str, float]] = []
     for i in range(max(1, n - lookback), n - 3):
@@ -526,7 +521,7 @@ def current_session_fa() -> str:
 
 
 # --------------------------------------------------------------------------
-# ICT Setup Builder (OTE + FVG/OB + Liquidity Targets)
+# ICT Setup Builder (OTE + FVG/OB + Liquidity Targets + Analytical Summary)
 # --------------------------------------------------------------------------
 def _ict_targets(
     D: Dict[str, Dict[str, Any]],
@@ -588,6 +583,48 @@ def _ict_targets(
     return selected
 
 
+def _build_setup_analysis(
+    D: Dict[str, Dict[str, Any]],
+    side: str,
+    model_tag: str,
+    sweep_obj: Optional[Dict[str, Any]],
+    mss_obj: Optional[Dict[str, Any]],
+    tp1_lbl: str,
+    sl: float,
+) -> str:
+    d4, d1, d15 = D["4h"], D["1h"], D["15m"]
+    dir_fa = "صعودی (خرید/لانگ)" if side == "LONG" else "نزولی (فروش/شورت)"
+    trend_txt = "روند 4H %s، 1H %s و 15m %s است" % (
+        TREND_FA[d4["trend"]],
+        TREND_FA[d1["trend"]],
+        TREND_FA[d15["trend"]],
+    )
+
+    parts: List[str] = ["سناریوی %s؛ %s." % (dir_fa, trend_txt)]
+
+    if sweep_obj and mss_obj:
+        parts.append(
+            "نقدینگی %s در %s جاروب شد و با تغییر ساختار همراه با Displacement (%.1f× ATR) تأیید گردید."
+            % (sweep_obj["pool_type"], sweep_obj["tf"], mss_obj["disp_atr"])
+        )
+    elif sweep_obj:
+        parts.append(
+            "نقدینگی %s در %s شکار شده و قیمت به دنبال واکنش در محدوده %s است."
+            % (sweep_obj["pool_type"], sweep_obj["tf"], model_tag)
+        )
+    elif mss_obj:
+        parts.append(
+            "تغییر ساختار (MSS) با Displacement در %s رخ داده و پولبک به %s مدنظر است."
+            % (mss_obj["tf"], model_tag)
+        )
+
+    parts.append(
+        "مسیر اصلی تارگت‌ها به سمت %s چیده شده و با تثبیت کندلی فراتر از SL (%s) سناریو باطل می‌شود."
+        % (tp1_lbl, fmt_price(sl))
+    )
+    return " ".join(parts)
+
+
 def build_ict_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[str, Any]]:
     d15, d1, d4 = D["15m"], D["1h"], D["4h"]
     atr15 = d15["atr"]
@@ -629,7 +666,6 @@ def build_ict_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
     A, B, diff = leg["A"], leg["B"], leg["diff"]
     zone = pick_ict_zone([d15, D["5m"]], side, price, atr15)
 
-    # ICT Optimal Trade Entry (OTE = 0.705 sweet spot inside 0.618 - 0.786)
     if side == "SHORT":
         ote_entry = B + 0.705 * diff
         ote_sl = B + 0.786 * diff + 0.25 * atr15
@@ -695,6 +731,8 @@ def build_ict_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
     else:
         status = "منتظر اصلاح به ناحیه تقاضا/OTE (%+.2f%%)" % dist_pct
 
+    analysis_fa = _build_setup_analysis(D, side, model_tag, sweep_obj, mss_obj, tp1_lbl, sl)
+
     return {
         "side": side,
         "entry": entry,
@@ -712,6 +750,7 @@ def build_ict_plan(D: Dict[str, Dict[str, Any]], price: float) -> Optional[Dict[
         "rr3": rr3,
         "dist_pct": dist_pct,
         "status": status,
+        "analysis_fa": analysis_fa,
         "confluence": confluence,
         "sweep": sweep_obj,
         "mss": mss_obj,
@@ -784,6 +823,7 @@ def full_entry_block_fa(r: Dict[str, Any]) -> Optional[List[str]]:
         "• اهرم: <b>%.0fx</b> | حجم پوزیشن: <b>%.2f</b> | ریسک کل: %.2f%% (%.2f واحد)"
         % (lev, notional, actual_risk_pct, actual_risk_usdt)
     )
+    lines.append("• تحلیل ستاپ: %s" % html.escape(p["analysis_fa"]))
     lines.append("• وضعیت: %s" % html.escape(p["status"]))
     return lines
 
@@ -860,7 +900,7 @@ def format_report(results: List[Dict[str, Any]], errors: List[Tuple[str, str]]) 
     lines.append("ارزهای بررسی‌شده: %d | ستاپ‌های ICT معتبر: %d" % (len(results), len(setups)))
     if setups:
         lines.append("")
-        lines.append("🎯 <b>نقاط ورود، حد ضرر و تارگت‌های مشخص (ICT)</b>")
+        lines.append("🎯 <b>نقاط ورود، حد ضرر، تارگت‌ها و تحلیل هر ستاپ</b>")
         for _, block in setups[:6]:
             lines.append("")
             lines.extend(block)
